@@ -417,6 +417,23 @@ void ThreadTxAdmission()
 
                 if (!TxAlreadyHave(inv))
                 {
+
+                    #if LOG_TRANSACTIONS
+                    logFile(tx, pfrom->GetAddrName());
+                    #endif
+                    #if FALAFEL_RECEIVER
+                                // check if one of the missing transactions that we care about is received
+                                auto findRes = std::find(falafel_missing_invs.begin(),
+                                                        falafel_missing_invs.end(),
+                                                        inv.hash.ToString());
+                                // if transaction is received, log to appropriate file
+                                if(findRes != falafel_missing_invs.end())
+                                {
+                                    logFile(inv.hash.ToString(), "missingInvResTrack.txt");
+                                    falafel_missing_invs.erase(findRes);
+                                }
+                    #endif
+
                     std::vector<COutPoint> vCoinsToUncache;
                     bool isRespend = false;
                     if (ParallelAcceptToMemoryPool(txHandlerSnap, mempool, state, tx, true, &fMissingInputs, false,

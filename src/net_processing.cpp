@@ -25,6 +25,11 @@
 #include "validationinterface.h"
 #include "version.h"
 #include "xversionkeys.h"
+#include "logFile.h"
+
+#if FALAFEL_RECEIVER
+    std::vector<std::string> falafel_missing_invs;
+#endif
 
 extern std::atomic<int64_t> nTimeBestReceived;
 extern std::atomic<int> nPreferredDownload;
@@ -917,6 +922,21 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
         if (pfrom->fWhitelisted && GetBoolArg("-whitelistrelay", DEFAULT_WHITELISTRELAY))
             fBlocksOnly = false;
 
+        
+        #if FALAFEL_RECEIVER
+        // check whether received inv message is from MempoolSync sender
+        bool correctInv = false;
+        int loggerCount;
+        if(vInv[0].hash.ToString() == "0fa1afe10fa1afe10fa1afe10fa1afe10fa1afe10fa1afe10fa1afe10fa1afe1")
+        {
+            correctInv = true;
+            loggerCount = logFile(vInv, FALAFEL_RECEIVED);
+            // dump state of mempool to file
+            logFile("mempool", FALAFEL_RECEIVED, BEFORE, loggerCount);
+            vInv.erase(vInv.begin());
+        }
+        #endif
+
         for (unsigned int nInv = 0; nInv < vInv.size(); nInv++)
         {
             if (shutdown_threads.load() == true)
@@ -964,6 +984,9 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
             }
             else // If we get here then inv.type must == MSG_TX.
             {
+                #if LOG_TRANSACTION_INVS
+                    logFile(inv, pfrom->GetAddrName());
+                #endif
                 bool fAlreadyHaveTx = TxAlreadyHave(inv);
                 // LOG(NET, "got inv: %s  %d peer=%s\n", inv.ToString(), fAlreadyHaveTx ? "have" : "new",
                 // pfrom->GetLogName());
@@ -979,6 +1002,11 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
                 // likely be included in blocks that we IBD download anyway.  This is especially important as
                 // transaction volumes increase.
                 else if (!fAlreadyHaveTx && !IsInitialBlockDownload())
+                    #if FALAFEL_RECEIVER
+                        // keep record of missing transactions
+                        if(correctInv)
+                            falafel_missing_invs.push_back(inv.hash.ToString());
+                    #endif
                     requester.AskFor(inv, pfrom);
             }
 
@@ -991,6 +1019,16 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
                 return error("send buffer size() = %u", pfrom->nSendSize);
             }
         }
+        #if FALAFEL_RECEIVER
+        // this does not seem to be working; will look into this later
+        #if 0
+            if(correctInv)
+            {
+                correctInv = false;
+                logFile("mempool", FALAFEL_RECEIVED, AFTER, loggerCount);
+            }
+        #endif
+        #endif
     }
 
 
@@ -1028,6 +1066,7 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
             {
                 if (!requester.CheckForRequestDOS(pfrom, chainparams))
                     return false;
+                logFile(("GETDATARECV - Received request for %s with hash %s from peer %s", ((inv.type == MSG_CMPCT_BLOCK)?"compact block" : "xthin block"), inv.hash.ToString(), pfrom->addr.ToStringIP()));
             }
 
             invDeque.push_back(inv);
@@ -1519,6 +1558,7 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
             }
             else
             {
+                logFile(("GETXTHINRECV - Received request for xthin block %s from peer %s",inv.hash.ToString(),pfrom->addr.ToStringIP()));
                 SendXThinBlock(MakeBlockRef(block), pfrom, inv);
             }
         }
@@ -1554,9 +1594,12 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
         }
         else
         {
+            logFile(("GETTHINRECV - Received request for thin block %s from peer %s",inv.hash.ToString(),pfrom->addr.ToStringIP()));
             SendXThinBlock(MakeBlockRef(block), pfrom, inv);
         }
     }
+    
+    //Indicates that a node wishes to receive new block announcements and transactions without invs
     else if (strCommand == NetMsgType::XPEDITEDREQUEST)
     {
         return HandleExpeditedRequest(vRecv, pfrom);
@@ -1575,18 +1618,18 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
     else if (strCommand == NetMsgType::XTHINBLOCK && !fImporting && !fReindex && !IsInitialBlockDownload() &&
              IsThinBlocksEnabled())
     {
+        logFile("xthinblock", "blockType.txt");
         LOCK(pfrom->cs_xthinblock);
         return CXThinBlock::HandleMessage(vRecv, pfrom, strCommand, 0);
     }
 
-
     else if (strCommand == NetMsgType::THINBLOCK && !fImporting && !fReindex && !IsInitialBlockDownload() &&
              IsThinBlocksEnabled())
     {
+        logFile("thinblock", "blockType.txt");
         LOCK(pfrom->cs_xthinblock);
         return CThinBlock::HandleMessage(vRecv, pfrom);
     }
-
 
     else if (strCommand == NetMsgType::GET_XBLOCKTX && !fImporting && !fReindex && !IsInitialBlockDownload() &&
              IsThinBlocksEnabled())
@@ -1597,7 +1640,6 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
         LOCK(pfrom->cs_xthinblock);
         return CXRequestThinBlockTx::HandleMessage(vRecv, pfrom);
     }
-
 
     else if (strCommand == NetMsgType::XBLOCKTX && !fImporting && !fReindex && !IsInitialBlockDownload() &&
              IsThinBlocksEnabled())
@@ -1620,6 +1662,7 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
     else if (strCommand == NetMsgType::GRAPHENEBLOCK && !fImporting && !fReindex && !IsInitialBlockDownload() &&
              IsGrapheneBlockEnabled() && grapheneVersionCompatible)
     {
+        logFile("grapheneblock", "blockType.txt");
         LOCK(pfrom->cs_graphene);
         return CGrapheneBlock::HandleMessage(vRecv, pfrom, strCommand, 0);
     }
@@ -1635,7 +1678,8 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
         return CRequestGrapheneBlockTx::HandleMessage(vRecv, pfrom);
     }
 
-
+    //If the node that requested the graphene block does not have all of hte transactions in its mempool to reform the block it requests the missing transactions from its peer
+    //If it still does not have all of the transactions required after this step it will fallbak to xthin or cmpct blocks
     else if (strCommand == NetMsgType::GRAPHENETX && !fImporting && !fReindex && !IsInitialBlockDownload() &&
              IsGrapheneBlockEnabled() && grapheneVersionCompatible)
     {
@@ -1678,6 +1722,9 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
             // this could be an attack block of some kind.
             DbgAssert(nCheckBlockSize == pblock->GetBlockSize(), return true);
         }
+
+        //LOGFILE: logging a normal block coming in
+        logFile("normalblock", "blockType.txt");
 
         CInv inv(MSG_BLOCK, pblock->GetHash());
         LOG(BLK, "received block %s peer=%d\n", inv.hash.ToString(), pfrom->id);

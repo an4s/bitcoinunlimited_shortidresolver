@@ -10,6 +10,7 @@
 #include "serialize.h"
 #include "uint256.h"
 #include "util.h"
+#include "logFile.h"
 
 #include <cmath>
 #include <numeric>
@@ -293,8 +294,10 @@ std::vector<uint64_t> CGrapheneSet::Reconcile(std::set<uint64_t> &receiverSet, c
     std::set<std::pair<uint64_t, std::vector<uint8_t> > > senderHas;
     std::set<std::pair<uint64_t, std::vector<uint8_t> > > receiverHas;
 
-    if (!((*pSetIblt) - localIblt).listEntries(senderHas, receiverHas))
+    if (!((*pSetIblt) - localIblt).listEntries(senderHas, receiverHas)){
+        logFile("IBLTDECODEFAIL - IBLT decode faiilure in graphene block");
         throw std::runtime_error("Graphene set IBLT did not decode");
+    }
 
     LOG(GRAPHENE, "senderHas: %d, receiverHas: %d\n", senderHas.size(), receiverHas.size());
 

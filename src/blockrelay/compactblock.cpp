@@ -36,6 +36,7 @@
 #include "util.h"
 #include "utiltime.h"
 #include "validation/validation.h"
+#include "logFile.h"
 
 
 static bool ReconstructBlock(CNode *pfrom,
@@ -140,9 +141,12 @@ bool CompactBlock::HandleMessage(CDataStream &vRecv, CNode *pfrom)
 
     // Is there a previous block or header to connect with?
     CBlockIndex *pprev = LookupBlockIndex(compactBlock.header.hashPrevBlock);
-    if (!pprev)
+    if (!pprev){
         return error("compact block from peer %s will not connect, unknown previous block %s", pfrom->GetLogName(),
             compactBlock.header.hashPrevBlock.ToString());
+
+        logFile("INVALID - invalid cmpctblock recvied, IGNORE LAST BLOCK");
+    }
 
     CValidationState state;
     if (!ContextualCheckBlockHeader(compactBlock.header, state, pprev))
@@ -153,6 +157,13 @@ bool CompactBlock::HandleMessage(CDataStream &vRecv, CNode *pfrom)
             "compact block from peer %s contextual error: %s", pfrom->GetLogName(), state.GetRejectReason().c_str());
     }
 
+    //LOGFILE: logging a cmpctblock coming in, use this and the normalblock logfile call to see
+    //ratio of cmpctblock to normalblock
+    logFile("cmpctblock", "blockType.txt");
+
+    //if we get here that means its a valid cmpctblock
+    int inc;
+
     CInv inv(MSG_BLOCK, compactBlock.header.GetHash());
     LOG(CMPCT, "received compact block %s from peer %s of %d bytes\n", inv.hash.ToString(), pfrom->GetLogName(),
         compactBlock.GetSize());
@@ -160,6 +171,7 @@ bool CompactBlock::HandleMessage(CDataStream &vRecv, CNode *pfrom)
     // Ban a node for sending unrequested compact blocks
     if (!thinrelay.IsBlockInFlight(pfrom, NetMsgType::CMPCTBLOCK))
     {
+        inc = logFile(compactBlock, pfrom->addrName); //logging compact block
         dosMan.Misbehaving(pfrom, 100);
         return error("unrequested compact block from peer %s", pfrom->GetLogName());
     }
@@ -167,6 +179,7 @@ bool CompactBlock::HandleMessage(CDataStream &vRecv, CNode *pfrom)
     // Check if we've already received this block and have it on disk
     if (AlreadyHaveBlock(inv))
     {
+        inc = logFile(compactBlock, pfrom->addrName); //logging compact block
         requester.AlreadyReceived(pfrom, inv);
         thinrelay.ClearAllBlockData(pfrom, pblock);
 
@@ -198,6 +211,8 @@ bool CompactBlock::process(CNode *pfrom, std::shared_ptr<CBlockThinRelay> &pbloc
     // Also, create the mapMissingTx from all the supplied tx's in the compact block
 
     // Reconstruct the list of shortid's and in the correct order taking into account the prefilled txns.
+    int inc = logFile(*this, pfrom->addrName); //logging compact block
+
     if (prefilledtxn.empty())
     {
         pblock->cmpctblock->vTxHashes = shorttxids;
@@ -365,6 +380,7 @@ bool CompactBlock::process(CNode *pfrom, std::shared_ptr<CBlockThinRelay> &pbloc
 
     // If there are any missing hashes or transactions then we request them here.
     // This must be done outside of the mempool.cs lock or may deadlock.
+    CompactReRequest compactReRequest;
     if (setHashesToRequest.size() > 0)
     {
         nWaitingForTxns = setHashesToRequest.size();
@@ -378,7 +394,6 @@ bool CompactBlock::process(CNode *pfrom, std::shared_ptr<CBlockThinRelay> &pbloc
                 vIndexesToRequest.push_back(nIndex);
             nIndex++;
         }
-        CompactReRequest compactReRequest;
         compactReRequest.blockhash = header.GetHash();
         compactReRequest.indexes = vIndexesToRequest;
         pfrom->PushMessage(NetMsgType::GETBLOCKTXN, compactReRequest);
@@ -386,12 +401,14 @@ bool CompactBlock::process(CNode *pfrom, std::shared_ptr<CBlockThinRelay> &pbloc
         // Update run-time statistics of compact block bandwidth savings
         compactdata.UpdateInBoundReRequestedTx(nWaitingForTxns);
         return true;
-    }
+    } else // Else there are no missing transactions
+        logFile("SUCCESSCMPCT - no missing transactions for cmpctblock #" + std::to_string(inc));
 
     // If there are still any missing transactions then we must clear out the compactblock data
     // and re-request a full block (This should never happen because we just checked the various pools).
     if (missingCount > 0)
     {
+        logFile(compactReRequest);
         // Since we can't process this compactblock then clear out the data from memory
         thinrelay.ClearAllBlockData(pfrom, pblock);
 
@@ -542,6 +559,7 @@ bool CompactReReqResponse::HandleMessage(CDataStream &vRecv, CNode *pfrom)
         thinrelay.ClearAllBlockData(pfrom, pblock);
 
         dosMan.Misbehaving(pfrom, 100);
+        logFile("TXNFILLFAIL - blocktxn message recived but unsuccessful, now preforming getdata RT\'s");
         return error("Merkle root for %s does not match computed merkle root, peer=%s", inv.hash.ToString(),
             pfrom->GetLogName());
     }

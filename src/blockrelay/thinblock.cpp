@@ -30,6 +30,7 @@
 #include "utiltime.h"
 #include "validation/validation.h"
 #include "xversionkeys.h"
+#include "logFile.h"
 
 static bool ReconstructBlock(CNode *pfrom,
     int &missingCount,
@@ -117,6 +118,7 @@ bool CThinBlock::HandleMessage(CDataStream &vRecv, CNode *pfrom)
         return true;
     }
 
+    logFile(("received thinblock %s from peer %s", inv.hash.ToString(), pfrom->addr.ToStringIP()));
     return thinBlock.process(pfrom, pblock);
 }
 
@@ -173,7 +175,7 @@ bool CThinBlock::process(CNode *pfrom, std::shared_ptr<CBlockThinRelay> &pblock)
             nCompressionRatio = (float)blockSize / (float)this->GetSize();
         LOG(THIN, "Reassembled thinblock for %s (%d bytes). Message was %d bytes, compression ratio %3.2f peer=%s\n",
             pblock->GetHash().ToString(), blockSize, this->GetSize(), nCompressionRatio, pfrom->GetLogName());
-
+        logFile(("THINSUCCESS - Reassembled thinblock %s from peer %s successfully", pblock->GetHash().ToString(), pfrom->addr.ToStringIP()));
         // Update run-time statistics of thin block bandwidth savings
         thindata.UpdateInBound(this->GetSize(), blockSize);
         LOG(THIN, "thin block stats: %s\n", thindata.ToString());
@@ -188,8 +190,10 @@ bool CThinBlock::process(CNode *pfrom, std::shared_ptr<CBlockThinRelay> &pblock)
         // finish reassembling the block, we need to re-request the full regular block
         LOG(THIN, "Missing %d Thinblock transactions, re-requesting a regular block from peer=%s\n", nWaitingForTxns,
             pfrom->GetLogName());
-        thinrelay.RequestBlock(pfrom, header.GetHash());
+        
+        logFile(("THINFAIL - Not able to reassemble thinblock %s from peer %s successfully. %s txs missing", pblock->GetHash().ToString(), pfrom->addr.ToStringIP(),std::to_string(nWaitingForTxns)));
 
+        thinrelay.RequestBlock(pfrom, header.GetHash());
         thindata.UpdateInBoundReRequestedTx(nWaitingForTxns);
         thinrelay.ClearAllBlockData(pfrom, pblock);
     }
@@ -264,6 +268,7 @@ CXThinBlockTx::CXThinBlockTx(uint256 blockHash, std::vector<CTransaction> &vTx)
     vMissingTx = vTx;
 }
 
+//Receive a xthintxblock
 bool CXThinBlockTx::HandleMessage(CDataStream &vRecv, CNode *pfrom)
 {
     std::string strCommand = NetMsgType::XBLOCKTX;
@@ -310,7 +315,8 @@ bool CXThinBlockTx::HandleMessage(CDataStream &vRecv, CNode *pfrom)
             inv.hash.ToString(), pfrom->GetLogName());
         return true;
     }
-
+    
+    logFile(("XTHINTXBLOCKRECV - Received xblocktx for block %s from peer %s",inv.hash.ToString(), pfrom->addr.ToStringIP()));
     // Create the mapMissingTx from all the supplied tx's in the xthinblock
     for (const CTransaction &tx : thinBlockTx.vMissingTx)
         pblock->xthinblock->mapMissingTx[tx.GetHash().GetCheapHash()] = MakeTransactionRef(tx);
@@ -344,6 +350,8 @@ bool CXThinBlockTx::HandleMessage(CDataStream &vRecv, CNode *pfrom)
         thinrelay.ClearAllBlockData(pfrom, pblock);
 
         dosMan.Misbehaving(pfrom, 100);
+        logFile(("XTHINTXMERKFAIL - Merkle root for %s does not match compter merkle root from peer %s",inv.hash.ToString(),pfrom->addr.ToStringIP()));
+        
         return error("Merkle root for %s does not match computed merkle root, peer=%s", inv.hash.ToString(),
             pfrom->GetLogName());
     }
@@ -368,6 +376,7 @@ bool CXThinBlockTx::HandleMessage(CDataStream &vRecv, CNode *pfrom)
         thinrelay.ClearAllBlockData(pfrom, pblock);
 
         thinrelay.RequestBlock(pfrom, inv.hash);
+        logFile(("XTHINFAILBACK - Still missing transactions after reconstruction of block %s from peer %s. Requesting full block instead",inv.hash.ToString(), pfrom->addr.ToStringIP()));
         return error("Still missing transactions after reconstructing block, peer=%s: re-requesting a full block",
             pfrom->GetLogName());
     }
@@ -393,6 +402,10 @@ bool CXThinBlockTx::HandleMessage(CDataStream &vRecv, CNode *pfrom)
         // create a non-deleting shared pointer to wrap pblock->  We know that thinBlock will outlast the
         // thread because the thread has a node reference.
         PV->HandleBlockMessage(pfrom, strCommand, pblock, inv2);
+
+        //Add a file containing the transactions that we were sent. Just itterate through thinBlockTx.vMissingTx and print transactions to a file
+        logFile(("XTHINTXBLOCKSUCCESS - Got %d Re-requested txs, used %d of them to reconstruct block %s from peer %s", thinBlockTx.vMissingTx.size(), count, inv.hash.ToString() ,pfrom->addr.ToStringIP()));
+
     }
 
     return true;
@@ -404,6 +417,7 @@ CXRequestThinBlockTx::CXRequestThinBlockTx(uint256 blockHash, std::set<uint64_t>
     setCheapHashesToRequest = setHashesToRequest;
 }
 
+//Get xthin_block_tx
 bool CXRequestThinBlockTx::HandleMessage(CDataStream &vRecv, CNode *pfrom)
 {
     CXRequestThinBlockTx thinRequestBlockTx;
@@ -420,7 +434,6 @@ bool CXRequestThinBlockTx::HandleMessage(CDataStream &vRecv, CNode *pfrom)
     // how many xblocktx requests we make in case of DOS
     CInv inv(MSG_TX, thinRequestBlockTx.blockhash);
     LOG(THIN, "received get_xblocktx for %s peer=%s\n", inv.hash.ToString(), pfrom->GetLogName());
-
     std::vector<CTransaction> vTx;
     CBlockIndex *hdr = LookupBlockIndex(inv.hash);
     if (!hdr)
@@ -444,6 +457,7 @@ bool CXRequestThinBlockTx::HandleMessage(CDataStream &vRecv, CNode *pfrom)
         }
         else
         {
+            logFile(("GETXTHINBLOCKTXRECV - received get_xthin_block_tx for %d txs, in block %s, from peer %s", block.vtx.size(),inv.hash.ToString(), pfrom->GetLogName()));
             for (unsigned int i = 0; i < block.vtx.size(); i++)
             {
                 uint64_t cheapHash = block.vtx[i]->GetHash().GetCheapHash();
@@ -556,11 +570,15 @@ bool CXThinBlock::HandleMessage(CDataStream &vRecv, CNode *pfrom, std::string st
             if (!thinrelay.AddBlockInFlight(pfrom, inv.hash, NetMsgType::XTHINBLOCK))
                 return true;
 
+            logFile(("XPEDITEDXTHINRECV - Received new expedited %s %s from peer %s", strCommand,inv.hash.ToString(), pfrom->GetLogName()));
+
             LOG(THIN, "Received new expedited %s %s from peer %s hop %d size %d bytes\n", strCommand,
                 inv.hash.ToString(), pfrom->GetLogName(), nHops, thinBlock.GetSize());
         }
         else
         {
+            logFile(("XTHINRECV - Received %s %s from peer %s", strCommand, inv.hash.ToString(), pfrom->addr.ToStringIP()));
+
             LOG(THIN, "Received %s %s from peer %s. Size %d bytes.\n", strCommand, inv.hash.ToString(),
                 pfrom->GetLogName(), thinBlock.GetSize());
 

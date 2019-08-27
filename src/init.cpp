@@ -51,6 +51,7 @@
 #include "validation/validation.h"
 #include "validation/verifydb.h"
 #include "validationinterface.h"
+#include "logFile.h"
 
 #ifdef ENABLE_WALLET
 #include "wallet/db.h"
@@ -1547,6 +1548,63 @@ bool AppInit2(Config &config, thread_group &threadGroup)
 //                                     boost::ref(cs_main), boost::cref(pindexBestHeader), nPowTargetSpacing);
 // scheduler.scheduleEvery(f, nPowTargetSpacing);
 // --- end disabled ---
+
+    if(!initLogger())
+    {
+        LogPrintStr(">> ERROR : initLogger failed");
+        StartShutdown();
+    }
+    else
+        LogPrintStr(">>  Logger system initialized");
+
+    #if LOG_NEIGHBOR_ADDRESSES
+
+        if(initAddrLogger())
+        {
+            LogPrintStr(">> Neighbor address logger initialized");
+            threadGroup.create_thread(boost::bind(AddrLoggerThread));
+            LogPrintStr(">> Neighbor address logger thread created");
+        }
+        else
+        {
+            LogPrintStr(">> ERROR : initAddrLogger failed");
+            StartShutdown();
+        }
+
+    #endif
+
+    #if LOG_CPU_USAGE
+
+        if(initProcessCPUUsageLogger())
+        {
+            LogPrintStr(">> Process CPU usage logger initialized");
+            threadGroup.create_thread(CPUUsageLoggerThread);
+            LogPrintStr(">> Process CPU usage logger thread created");
+        }
+        else
+        {
+            LogPrintStr(">> ERROR : initProcessCPUUsageLogger failed");
+            StartShutdown();
+        }
+
+    #endif
+
+    #if FALAFEL_SENDER
+
+        if(initMempoolSyncTriggerTimer())
+        {
+            LogPrintStr(">> Mempool Sync trigger timer initialized");
+            threadGroup.create_thread(mempoolSyncTriggerTimerThread);
+            LogPrintStr(">> Mempool Sync trigger timer thread created");
+        }
+        else
+        {
+            LogPrintStr(">> ERROR: initTimerThread failed");
+        }
+
+    #endif
+
+
 
 // ********************************************************* Step 12: finished
 

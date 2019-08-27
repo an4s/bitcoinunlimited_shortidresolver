@@ -23,8 +23,9 @@
 #include "utiltime.h"
 #include "validation/validation.h"
 #include "xversionkeys.h"
-
+#include "logFile.h"
 #include <iomanip>
+
 static bool ReconstructBlock(CNode *pfrom, int &missingCount, int &unnecessaryCount);
 extern CTweak<uint64_t> grapheneMinVersionSupported;
 extern CTweak<uint64_t> grapheneMaxVersionSupported;
@@ -108,6 +109,7 @@ bool CGrapheneBlockTx::HandleMessage(CDataStream &vRecv, CNode *pfrom)
     size_t msgSize = vRecv.size();
     CGrapheneBlockTx grapheneBlockTx;
     vRecv >> grapheneBlockTx;
+    logFile(("GRAPHENETXRECV - Graphene TX received from %s containing %s missing transactions",pfrom->addr.ToStringIP(),std::to_string(grapheneBlockTx.vMissingTx.size())));
 
     // Message consistency checking
     CInv inv(MSG_GRAPHENEBLOCK, grapheneBlockTx.blockhash);
@@ -151,8 +153,8 @@ bool CGrapheneBlockTx::HandleMessage(CDataStream &vRecv, CNode *pfrom)
     if ((int)grapheneBlockTx.vMissingTx.size() < pfrom->grapheneBlockWaitingForTxns)
     {
         RequestFailoverBlock(pfrom, grapheneBlockTx.blockhash);
-        return error("Still missing transactions from those returned by sender, peer=%s: re-requesting failover block",
-            pfrom->GetLogName());
+        logFile("IBLTTXRECVFAIL - Graphene has failed due to erroneous checksum in IBLT decoding and a failover block must be requested from peer " + pfrom->addr.ToStringIP());
+        return error("Still missing transactions from those returned by sender, peer=%s: re-requesting failover block",pfrom->GetLogName());
     }
 
     // If canonical ordering is activated, locate empty indexes in pfrom->grapheneBlockHashes to be used in sorting
@@ -201,6 +203,8 @@ bool CGrapheneBlockTx::HandleMessage(CDataStream &vRecv, CNode *pfrom)
     if (pfrom->grapheneBlock.hashMerkleRoot != merkleroot || mutated)
     {
         graphenedata.ClearGrapheneBlockData(pfrom, inv.hash);
+        logFile(("MERKFAILGETGRTX - Merkle root for %s does not match computed merkle root, peer=%s", inv.hash.ToString(),
+            pfrom->addr.ToStringIP()));
 
         return error("Merkle root for %s does not match computed merkle root, peer=%s", inv.hash.ToString(),
             pfrom->GetLogName());
@@ -223,6 +227,8 @@ bool CGrapheneBlockTx::HandleMessage(CDataStream &vRecv, CNode *pfrom)
     if (missingCount > 0)
     {
         RequestFailoverBlock(pfrom, grapheneBlockTx.blockhash);
+        logFile(("GRMISSINGTX - Still missing transactions after reconstructing block, peer=%s: re-requesting failover block",pfrom->addr.ToStringIP()));
+
         return error("Still missing transactions after reconstructing block, peer=%s: re-requesting failover block",
             pfrom->GetLogName());
     }
@@ -247,6 +253,9 @@ bool CGrapheneBlockTx::HandleMessage(CDataStream &vRecv, CNode *pfrom)
         // This is NOT double counting since we never accounted for the original graphene block due to the re-request.
         graphenedata.UpdateInBound(nSizeGrapheneBlockTx + pfrom->nSizeGrapheneBlock, blockSize);
         LOG(GRAPHENE, "Graphene block stats: %s\n", graphenedata.ToString());
+
+
+        logFile(("GRTXREBUILDSUCCESS- Block %s from host %s successfully reconstructed",inv.hash.ToString(),pfrom->addr.ToStringIP()));
 
         PV->HandleBlockMessage(pfrom, strCommand, MakeBlockRef(pfrom->grapheneBlock), inv2);
     }
@@ -276,6 +285,8 @@ bool CRequestGrapheneBlockTx::HandleMessage(CDataStream &vRecv, CNode *pfrom)
     // how many grblocktx requests we make in case of DOS
     CInv inv(MSG_TX, grapheneRequestBlockTx.blockhash);
     LOG(GRAPHENE, "Received get_grblocktx for %s peer=%s\n", inv.hash.ToString(), pfrom->GetLogName());
+
+    // logFile(("Received get_grblocktx for %s from peer %s", inv.hash.ToString(), pfrom->addr.ToStringIP()));
 
     std::vector<CTransaction> vTx;
     CBlockIndex *hdr = LookupBlockIndex(inv.hash);
@@ -431,6 +442,9 @@ bool CGrapheneBlock::HandleMessage(CDataStream &vRecv, CNode *pfrom, std::string
         }
     }
 
+    //Log block received, ip of peer, and dump mempool
+    logFile(grapheneBlock.header.GetHash().ToString(),pfrom->addr.ToStringIP(),"");
+
     bool result = grapheneBlock.process(pfrom, nSizeGrapheneBlock, strCommand);
 
     return result;
@@ -581,6 +595,9 @@ bool CGrapheneBlock::process(CNode *pfrom,
                     }
                 }
 
+                //Log missing transactions
+                logFile(setHashesToRequest,pfrom ,header.GetHash().ToString(),"");
+
                 // Sort order transactions if canonical order is enabled and graphene version is late enough
                 if (enableCanonicalTxOrder.Value() && NegotiateGrapheneVersion(pfrom) >= 1)
                 {
@@ -594,8 +611,8 @@ bool CGrapheneBlock::process(CNode *pfrom,
             catch (const std::runtime_error &e)
             {
                 fRequestFailover = true;
-                LOG(GRAPHENE, "Graphene set could not be reconciled; requesting failover for peer %s: %s\n",
-                    pfrom->GetLogName(), e.what());
+                logFile(("GRRECONFAIL - Graphene set could not be reconciled; requesting failover for peer " + pfrom->addr.ToStringIP()));
+                LOG(GRAPHENE, "Graphene set could not be reconciled; requesting failover for peer %s: %s\n", pfrom->GetLogName(), e.what());
 
                 graphenedata.IncrementDecodeFailures();
             }
@@ -635,11 +652,14 @@ bool CGrapheneBlock::process(CNode *pfrom,
     {
         RequestFailoverBlock(pfrom, header.GetHash());
 
-        if (!fMerkleRootCorrect)
+        if (!fMerkleRootCorrect){
+            logFile(("MERKFAILGRPROC - Mismatched merkle root on graphene block during processing: requesting failover block, peer: %s", pfrom->addr.ToStringIP()));
             return error(
                 "Mismatched merkle root on grapheneblock: requesting failover block, peer=%s", pfrom->GetLogName());
-        else
+        } else{
+            logFile(("TXHASHCOL - tx hash collision for grapheneblock: requesting a full block, peer: %s", pfrom->addr.ToStringIP()));
             return error("TX HASH COLLISION for grapheneblock: requesting a full block, peer=%s", pfrom->GetLogName());
+        }
     }
 
     pfrom->grapheneBlockWaitingForTxns = missingCount;
@@ -665,6 +685,7 @@ bool CGrapheneBlock::process(CNode *pfrom,
     // and re-request failover block (This should never happen because we just checked the various pools).
     if (missingCount > 0)
     {
+        logFile(("GRMISSINGTX - Still missing transactions for graphene block, re-requesting failover block from peer: %s", pfrom->addr.ToStringIP()));
         RequestFailoverBlock(pfrom, header.GetHash());
         return error("Still missing transactions for graphene block: re-requesting failover block");
     }
