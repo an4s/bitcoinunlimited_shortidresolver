@@ -1,18 +1,19 @@
-// Copyright (c) 2018 The Bitcoin Unlimited developers
+// Copyright (c) 2018-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 
 #include "blockleveldb.h"
 #include "blockstorage.h"
-#include "hash.h"
+#include "hashwrapper.h"
 #include "main.h"
 
 CBlockLevelDB::CBlockLevelDB(size_t nCacheSizeBlock, size_t nCacheSizeUndo, bool fMemory, bool fWipe, bool obfuscate)
 {
     COverrideOptions overrideblock;
     // we want to have much larger file sizes for the blocks db so override the default.
-    overrideblock.max_file_size = nCacheSizeBlock / 2;
+    overrideblock.max_file_size = nCacheSizeBlock / 15;
+    overrideblock.block_size = 40960;
     pwrapperblock =
         new CDBWrapper(GetDataDir() / "blockdb" / "blocks", nCacheSizeBlock, fMemory, fWipe, obfuscate, &overrideblock);
 
@@ -34,7 +35,14 @@ bool CBlockLevelDB::WriteBlock(const CBlock &block)
     std::ostringstream key;
     key << block.GetBlockTime() << ":" << block.GetHash().ToString();
 
-    return pwrapperblock->Write(key.str(), block, true);
+    if (IsChainNearlySyncd())
+    {
+        return pwrapperblock->Write(key.str(), block, true);
+    }
+    else
+    {
+        return pwrapperblock->Write(key.str(), block, false);
+    }
 }
 
 bool CBlockLevelDB::ReadBlock(const CBlockIndex *pindex, CBlock &block)
@@ -86,7 +94,15 @@ bool CBlockLevelDB::WriteUndo(const CBlockUndo &blockundo, const CBlockIndex *pi
     hasher << hashBlock;
     hasher << blockundo;
     UndoDBValue value(hasher.GetHash(), hashBlock, &blockundo);
-    return pwrapperundo->Write(key.str(), value, true);
+
+    if (IsChainNearlySyncd())
+    {
+        return pwrapperundo->Write(key.str(), value, true);
+    }
+    else
+    {
+        return pwrapperundo->Write(key.str(), value, false);
+    }
 }
 
 bool CBlockLevelDB::ReadUndo(CBlockUndo &blockundo, const CBlockIndex *pindex)

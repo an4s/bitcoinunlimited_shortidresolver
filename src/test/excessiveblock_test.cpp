@@ -1,3 +1,6 @@
+// Copyright (c) 2016-2019 The Bitcoin Unlimited developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
 #include "unlimited.h"
 
 #include "../consensus/consensus.h"
@@ -30,7 +33,7 @@ BOOST_AUTO_TEST_CASE(rpc_excessive)
     BOOST_CHECK_THROW(CallRPC("setexcessiveblock not_uint"), runtime_error);
     BOOST_CHECK_THROW(CallRPC("setexcessiveblock 36000000 not_uint"), boost::bad_lexical_cast);
     BOOST_CHECK_THROW(CallRPC("setexcessiveblock 36000000 -1"), boost::bad_lexical_cast);
-    BOOST_CHECK_THROW(CallRPC("setexcessiveblock -1 0"), boost::bad_lexical_cast);
+    BOOST_CHECK_THROW(CallRPC("setexcessiveblock -1 0"), runtime_error);
 
     // 2) passing 3 params should raise an exception
     BOOST_CHECK_THROW(CallRPC("setexcessiveblock 1000 0 0"), runtime_error);
@@ -143,50 +146,18 @@ BOOST_AUTO_TEST_CASE(excessiveChecks)
 
     excessiveBlockSize = 16000000; // Ignore excessive block size when checking sigops and block effort
 
-    // Check sigops values
-
-    // Maintain compatibility with the old sigops calculator for blocks <= 1MB
-    BOOST_CHECK_MESSAGE(false == CheckExcessive(block, BLOCKSTREAM_CORE_MAX_BLOCK_SIZE - 1,
-                                     BLOCKSTREAM_CORE_MAX_BLOCK_SIGOPS, 100, 100),
-        "improper sigops");
-    BOOST_CHECK_MESSAGE(false == CheckExcessive(block, BLOCKSTREAM_CORE_MAX_BLOCK_SIZE - 1,
-                                     BLOCKSTREAM_CORE_MAX_BLOCK_SIGOPS, 100, 100),
-        "improper sigops");
-    BOOST_CHECK_MESSAGE(
-        false == CheckExcessive(block, BLOCKSTREAM_CORE_MAX_BLOCK_SIZE, BLOCKSTREAM_CORE_MAX_BLOCK_SIGOPS, 100, 100),
-        "improper sigops");
-
-    BOOST_CHECK_MESSAGE(true == CheckExcessive(block, BLOCKSTREAM_CORE_MAX_BLOCK_SIZE - 1,
-                                    BLOCKSTREAM_CORE_MAX_BLOCK_SIGOPS + 1, 100, 100),
-        "improper sigops");
-    BOOST_CHECK_MESSAGE(
-        true == CheckExcessive(block, BLOCKSTREAM_CORE_MAX_BLOCK_SIZE, BLOCKSTREAM_CORE_MAX_BLOCK_SIGOPS + 1, 100, 100),
-        "improper sigops");
-
-
-    // Check sigops > 1MB.
-    BOOST_CHECK_MESSAGE(
-        false == CheckExcessive(block, 1000000 + 1, (blockSigopsPerMb.Value() * 2), 100, 100), "improper sigops");
-    BOOST_CHECK_MESSAGE(
-        true == CheckExcessive(block, 1000000 + 1, (blockSigopsPerMb.Value() * 2) + 1, 100, 100), "improper sigops");
-    BOOST_CHECK_MESSAGE(
-        true == CheckExcessive(block, (2 * 1000000), (blockSigopsPerMb.Value() * 2) + 1, 100, 100), "improper sigops");
-    BOOST_CHECK_MESSAGE(false == CheckExcessive(block, (2 * 1000000) + 1, (blockSigopsPerMb.Value() * 2) + 1, 100, 100),
-        "improper sigops");
-
-
     // Check tx size values
     maxTxSize.Set(DEFAULT_LARGEST_TRANSACTION);
 
     // Within a 1 MB block, a 1MB transaction is not excessive
     BOOST_CHECK_MESSAGE(
-        false == CheckExcessive(block, BLOCKSTREAM_CORE_MAX_BLOCK_SIZE, 1, 1, BLOCKSTREAM_CORE_MAX_BLOCK_SIZE),
+        false == CheckExcessive(block, BLOCKSTREAM_CORE_MAX_BLOCK_SIZE, 1, BLOCKSTREAM_CORE_MAX_BLOCK_SIZE),
         "improper max tx");
 
     // With a > 1 MB block, use the maxTxSize to determine
-    BOOST_CHECK_MESSAGE(false == CheckExcessive(block, BLOCKSTREAM_CORE_MAX_BLOCK_SIZE + 1, 1, 1, maxTxSize.Value()),
-        "improper max tx");
-    BOOST_CHECK_MESSAGE(true == CheckExcessive(block, BLOCKSTREAM_CORE_MAX_BLOCK_SIZE + 1, 1, 1, maxTxSize.Value() + 1),
+    BOOST_CHECK_MESSAGE(
+        false == CheckExcessive(block, BLOCKSTREAM_CORE_MAX_BLOCK_SIZE + 1, 1, maxTxSize.Value()), "improper max tx");
+    BOOST_CHECK_MESSAGE(true == CheckExcessive(block, BLOCKSTREAM_CORE_MAX_BLOCK_SIZE + 1, 1, maxTxSize.Value() + 1),
         "improper max tx");
 }
 

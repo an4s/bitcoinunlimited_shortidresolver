@@ -1,4 +1,5 @@
 // Copyright (c) 2009-2016 The Bitcoin Core developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -348,17 +349,17 @@ protected:
             flags |= SCRIPT_VERIFY_P2SH;
 
         ScriptError error;
-        unsigned char sighashtype;
+        ScriptMachineResourceTracker stats;
         CScript script_sig(scriptsig_raw.begin(), scriptsig_raw.end());
         CScript script_pubkey(scriptpubkey_raw.begin(), scriptpubkey_raw.end());
-        const bool result = VerifyScript(
-            script_sig, script_pubkey, flags, MAX_OPS_PER_SCRIPT, BaseSignatureChecker(), &error, &sighashtype);
+        const bool result =
+            VerifyScript(script_sig, script_pubkey, flags, MAX_OPS_PER_SCRIPT, BaseSignatureChecker(), &error, &stats);
 
         if (produce_output)
         {
             CDataStream out(output, SER_NETWORK, INIT_PROTO_VERSION);
             out << result;
-            out << sighashtype;
+            out << stats.sighashtype;
             out << scriptsig_raw;
             out << scriptpubkey_raw;
             output.insert(output.begin(), out.begin(), out.end());
@@ -528,6 +529,7 @@ protected:
 
         try
         {
+            uint64_t gs_version = CGrapheneBlock::GetGrapheneSetVersion(GRAPHENE_MAX_VERSION_SUPPORTED);
             gs = std::make_shared<CGrapheneSet>(
                 nReceiverUniverseItems, nReceiverUniverseItems, itemHashes, 0, 0, true, ordered, fDeterministic);
 
@@ -543,7 +545,7 @@ protected:
                     *ds >> nBlockTx;
                     *ds >> nReceiverPoolTx;
                     if ((nReceiverPoolTx >= nBlockTx - 1))
-                        out << gs->OptimalSymDiff(nBlockTx, nReceiverPoolTx);
+                        out << CGrapheneSet::OptimalSymDiff(gs_version, nBlockTx, nReceiverPoolTx);
                 }
                 break;
                 case 1:
@@ -573,9 +575,6 @@ protected:
 int main(int argc, char **argv)
 {
     ECCVerifyHandle globalVerifyHandle;
-
-    /* Make a couple things determinstic for fuzzing */
-    xversion_deterministic_hashing = true;
 
     FuzzDeserNet<CBlock> fuzz_cblock("cblock");
     FuzzDeserNet<CTransaction> fuzz_ctransaction("ctransaction");

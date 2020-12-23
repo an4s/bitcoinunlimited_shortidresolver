@@ -1,6 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2017 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -70,25 +70,25 @@ inline T *NCONST_PTR(const T *val)
 template <typename V>
 inline typename V::value_type *begin_ptr(V &v)
 {
-    return v.empty() ? NULL : &v[0];
+    return v.empty() ? nullptr : &v[0];
 }
 /** Get begin pointer of vector (const version) */
 template <typename V>
 inline const typename V::value_type *begin_ptr(const V &v)
 {
-    return v.empty() ? NULL : &v[0];
+    return v.empty() ? nullptr : &v[0];
 }
 /** Get end pointer of vector (non-const version) */
 template <typename V>
 inline typename V::value_type *end_ptr(V &v)
 {
-    return v.empty() ? NULL : (&v[0] + v.size());
+    return v.empty() ? nullptr : (&v[0] + v.size());
 }
 /** Get end pointer of vector (const version) */
 template <typename V>
 inline const typename V::value_type *end_ptr(const V &v)
 {
-    return v.empty() ? NULL : (&v[0] + v.size());
+    return v.empty() ? nullptr : (&v[0] + v.size());
 }
 
 /*
@@ -392,6 +392,36 @@ void WriteCompactSize(Stream &os, uint64_t nSize)
         ser_writedata64(os, nSize);
     }
     return;
+}
+
+template <typename Stream>
+uint64_t ReadCompactUint64(Stream &is)
+{
+    uint8_t chSize = ser_readdata8(is);
+    uint64_t nSizeRet = 0;
+    if (chSize < 253)
+    {
+        nSizeRet = chSize;
+    }
+    else if (chSize == 253)
+    {
+        nSizeRet = ser_readdata16(is);
+        if (nSizeRet < 253)
+            throw std::ios_base::failure("non-canonical ReadCompactSize()");
+    }
+    else if (chSize == 254)
+    {
+        nSizeRet = ser_readdata32(is);
+        if (nSizeRet < 0x10000u)
+            throw std::ios_base::failure("non-canonical ReadCompactSize()");
+    }
+    else
+    {
+        nSizeRet = ser_readdata64(is);
+        if (nSizeRet < 0x100000000ULL)
+            throw std::ios_base::failure("non-canonical ReadCompactSize()");
+    }
+    return nSizeRet;
 }
 
 template <typename Stream>
@@ -829,7 +859,7 @@ void Unserialize_impl(Stream &is, prevector<N, T> &v, const unsigned char &)
     while (i < nSize)
     {
         unsigned int blk = std::min(nSize - i, (unsigned int)(1 + 4999999 / sizeof(T)));
-        v.resize(i + blk);
+        v.resize_uninitialized(i + blk);
         is.read((char *)&v[i], blk * sizeof(T));
         i += blk;
     }
@@ -847,8 +877,8 @@ void Unserialize_impl(Stream &is, prevector<N, T> &v, const V &)
         nMid += 5000000 / sizeof(T);
         if (nMid > nSize)
             nMid = nSize;
-        v.resize(nMid);
-        for (; i < nMid; i++)
+        v.resize_uninitialized(nMid);
+        for (; i < nMid; ++i)
             Unserialize(is, v[i]);
     }
 }

@@ -1,6 +1,6 @@
-﻿// Copyright (c) 2010 Satoshi Nakamoto
+// Copyright (c) 2010 Satoshi Nakamoto
 // Copyright (c) 2009-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -19,9 +19,9 @@
 
 #include "chainparamsseeds.h"
 
-uint64_t nMiningSvForkTime = 0;
-// FIXME This need to be update every new fork
-uint64_t nMiningForkTime = 1557921600;
+// Next protocol upgrade will be activated once MTP >= Nov 15 12:00:00 UTC 2020
+const uint64_t NOV2020_ACTIVATION_TIME = 1605441600;
+uint64_t nMiningForkTime = NOV2020_ACTIVATION_TIME;
 
 CBlock CreateGenesisBlock(CScript prefix,
     const std::string &comment,
@@ -78,8 +78,8 @@ static CBlock CreateGenesisBlock(uint32_t nTime,
                                         << ParseHex("04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb6"
                                                     "49f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5f")
                                         << OP_CHECKSIG;
-    return CreateGenesisBlock(CScript() << 486604799 << CScriptNum(4), pszTimestamp, genesisOutputScript, nTime, nNonce,
-        nBits, nVersion, genesisReward);
+    return CreateGenesisBlock(CScript() << 486604799 << LegacyCScriptNum(4), pszTimestamp, genesisOutputScript, nTime,
+        nNonce, nBits, nVersion, genesisReward);
 }
 
 bool CChainParams::RequireStandard() const
@@ -113,19 +113,16 @@ public:
         consensus.BIP34Hash = uint256S("0x000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8");
         consensus.BIP65Height = 388381; // 000000000000000004c2b624ed5d7756c508d90fd0da2c7c679febfa6c4735f0
         consensus.BIP66Height = 363725; // 00000000000000000379eaa19dce8c9b722d46ae6a57c2f1a988119488b50931
+        consensus.BIP68Height = 419328; // BIP68, 112, 113 has activated
         consensus.powLimit = uint256S("00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
         consensus.nPowTargetSpacing = 10 * 60;
         consensus.fPowAllowMinDifficultyBlocks = false;
         consensus.fPowNoRetargeting = false;
-
-        // Deployment of BIP68, BIP112, and BIP113.
-        consensus.vDeployments[Consensus::DEPLOYMENT_CSV].bit = 0;
-        consensus.vDeployments[Consensus::DEPLOYMENT_CSV].nStartTime = 1462060800LL; // May 1st, 2016
-        consensus.vDeployments[Consensus::DEPLOYMENT_CSV].nTimeout = 1493596800LL; // May 1st, 2017
-        consensus.vDeployments[Consensus::DEPLOYMENT_CSV].windowsize = 2016;
-        consensus.vDeployments[Consensus::DEPLOYMENT_CSV].threshold = 1916; // 95% of 2016
-
+        // The half life for the ASERT DAA. For every (nASERTHalfLife) seconds behind schedule the blockchain gets,
+        // difficulty is cut in half. Doubled if blocks are ahead of schedule.
+        // Two days
+        consensus.nASERTHalfLife = 2 * 24 * 60 * 60;
         // testing bit
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = 1199145601LL; // January 1, 2008
@@ -141,9 +138,12 @@ public:
         consensus.may2018Height = 530359;
         // Nov, 15 2018 hard fork
         consensus.nov2018Height = 556766;
-        consensus.sv2018Height = 556766;
-        // Wed, 15 May 2019 12:00:00 UTC hard fork activation time
-        consensus.may2019ActivationTime = 1557921600;
+        // Noc, 15 2019 hard fork
+        consensus.nov2019Height = 609135;
+        // May, 15 2020 hard fork
+        consensus.may2020Height = 635258;
+        // Nov 15, 2020 12:00:00 UTC protocol upgrade¶
+        consensus.nov2020ActivationTime = NOV2020_ACTIVATION_TIME;
 
         /**
          * The message start string is designed to be unlikely to occur in normal data.
@@ -171,13 +171,7 @@ public:
         // List of Bitcoin Cash compatible seeders
         vSeeds.push_back(CDNSSeedData("bitcoinunlimited.info", "btccash-seeder.bitcoinunlimited.info", true));
         vSeeds.push_back(CDNSSeedData("bitcoinabc.org", "seed.bitcoinabc.org", true));
-        vSeeds.push_back(CDNSSeedData("bitcoinforks.org", "seed-abc.bitcoinforks.org", true));
-        vSeeds.push_back(CDNSSeedData("bitprim.org", "seed.bitprim.org", true)); // Bitprim
-        vSeeds.push_back(CDNSSeedData("deadalnix.me", "seed.deadalnix.me", true)); // Amaury SÉCHET
-        if (nMiningSvForkTime != 0)
-        {
-            vSeeds.push_back(CDNSSeedData("bitcoinsv.io", "seed.bitcoinsv.io", true)); // Bitcoin SV seeder
-        }
+        vSeeds.push_back(CDNSSeedData("bitcoinforks.org", "seed-bch.bitcoinforks.org", true));
 
         base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1, 0);
         base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1, 5);
@@ -220,8 +214,22 @@ public:
         checkpoints[504031] = uint256S("0x0000000000000000011ebf65b60d0a3de80b8175be709d653b4c1a1beeb6ab9c");
         // May 15th 2018 re-enable op_codes and 32 MB max block size
         checkpoints[530359] = uint256S("0x0000000000000000011ada8bd08f46074f44a8f155396f43e38acf9501c49103");
+        // Nov 15th 2018 activate LTOR, DSV op_code
+        checkpoints[556767] = uint256S("0x0000000000000000004626ff6e3b936941d341c5932ece4357eeccac44e6d56c");
+        // May 15th 2019 activate Schnorr, segwit recovery
+        checkpoints[582680] = uint256S("0x000000000000000001b4b8e36aec7d4f9671a47872cb9a74dc16ca398c7dcc18");
+        // Nov 15th 2019 activate Schnorr Multisig, minimal data
+        checkpoints[609136] = uint256S("0x000000000000000000b48bb207faac5ac655c313e41ac909322eaa694f5bc5b1");
+        // May 15th 2020 activate op_reverse, SigChecks
+        checkpoints[635259] = uint256S("0x00000000000000000033dfef1fc2d6a5d5520b078c55193a9bf498c5b27530f7");
 
         // clang-format on
+        // * UNIX timestamp of last checkpoint block
+        checkpointData.nTimeLastCheckpoint = 1573825449;
+        // * total number of transactions between genesis and last checkpoint
+        checkpointData.nTransactionsLastCheckpoint = 281198294;
+        // * estimated number of transactions per day after checkpoint (~3.5 TPS)
+        checkpointData.fTransactionsPerDay = 280000.0;
     }
 };
 
@@ -246,6 +254,7 @@ public:
         consensus.BIP34Hash = consensus.hashGenesisBlock;
         consensus.BIP65Height = 0;
         consensus.BIP66Height = 0;
+        consensus.BIP68Height = 0;
         consensus.powLimit = uint256S("00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60 / 10; // two weeks
         consensus.nPowTargetSpacing = 1 * 60;
@@ -275,9 +284,14 @@ public:
         consensus.may2018Height = 0;
         // Nov, 15 2018 hard fork
         consensus.nov2018Height = 0;
-        consensus.sv2018Height = 0;
-        // Wed, 15 May 2019 12:00:00 UTC hard fork activation time
-        consensus.may2019ActivationTime = 1557921600;
+        // May, 15 2019 hard fork
+        consensus.may2019Height = 0;
+        // May 15, 2020 12:00:00 UTC protocol upgrade¶
+        consensus.nov2019Height = 0;
+        // May, 15 2020 hard fork
+        consensus.may2020Height = 0;
+        // Nov, 15 2019 12:00:00 UTC fork activation time
+        consensus.nov2020ActivationTime = NOV2020_ACTIVATION_TIME;
 
         vFixedSeeds.clear();
         vSeeds.clear();
@@ -323,23 +337,21 @@ public:
         consensus.BIP34Hash = uint256S("0x0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8");
         consensus.BIP65Height = 581885; // 00000000007f6655f22f98e72ed80d8b06dc761d5da09df0fa1dc4be4f861eb6
         consensus.BIP66Height = 330776; // 000000002104c8c45e99a8853285a3b592602a3ccde2b832481da85e9e4ba182
+        consensus.BIP68Height = 770112; // BIP68, 112, 113 has activated
         consensus.powLimit = uint256S("00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
         consensus.nPowTargetSpacing = 10 * 60;
         consensus.fPowAllowMinDifficultyBlocks = true;
         consensus.fPowNoRetargeting = false;
+        // The half life for the ASERT DAA. For every (nASERTHalfLife) seconds behind schedule the blockchain gets,
+        // difficulty is cut in half. Doubled if blocks are ahead of schedule.
+        // One hour
+        consensus.nASERTHalfLife = 60 * 60;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = 1199145601; // January 1, 2008
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nTimeout = 1230767999; // December 31, 2008
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].windowsize = 2016;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].threshold = 1512; // 75% of 2016
-
-        // Deployment of BIP68, BIP112, and BIP113.
-        consensus.vDeployments[Consensus::DEPLOYMENT_CSV].bit = 0;
-        consensus.vDeployments[Consensus::DEPLOYMENT_CSV].nStartTime = 1456790400; // March 1st, 2016
-        consensus.vDeployments[Consensus::DEPLOYMENT_CSV].nTimeout = 1493596800; // May 1st, 2017
-        consensus.vDeployments[Consensus::DEPLOYMENT_CSV].windowsize = 2016;
-        consensus.vDeployments[Consensus::DEPLOYMENT_CSV].threshold = 1512; // 75% of 2016
 
         // Aug, 1 2017 hard fork
         consensus.uahfHeight = 1155876;
@@ -349,9 +361,14 @@ public:
         consensus.may2018Height = 1233070;
         // Nov 15, 2018 hard fork
         consensus.nov2018Height = 1267996;
-        consensus.sv2018Height = 1267996;
-        // Wed, 15 May 2019 12:00:00 UTC hard fork activation time
-        consensus.may2019ActivationTime = 1557921600;
+        // May, 15 2019 hard fork
+        consensus.may2019Height = 1303884;
+        // Nov, 15 2019 har fork
+        consensus.nov2019Height = 1341711;
+        // May, 15 2020 hard fork
+        consensus.may2020Height = 1378461;
+        // Nov 15, 2020 12:00:00 UTC protocol upgrade¶
+        consensus.nov2020ActivationTime = NOV2020_ACTIVATION_TIME;
 
 
         pchMessageStart[0] = 0x0b;
@@ -379,20 +396,9 @@ public:
         // Bitcoin ABC seeder
         vSeeds.push_back(CDNSSeedData("bitcoinabc.org", "testnet-seed.bitcoinabc.org", true));
         // bitcoinforks seeders
-        vSeeds.push_back(CDNSSeedData("bitcoinforks.org", "testnet-seed-abc.bitcoinforks.org", true));
+        vSeeds.push_back(CDNSSeedData("bitcoinforks.org", "testnet-seed-bch.bitcoinforks.org", true));
         // BU seeder
         vSeeds.push_back(CDNSSeedData("bitcoinunlimited.info", "testnet-seed.bitcoinunlimited.info", true));
-        // Bitprim
-        vSeeds.push_back(CDNSSeedData("bitprim.org", "testnet-seed.bitprim.org", true));
-        // Amaury SÉCHET
-        vSeeds.push_back(CDNSSeedData("deadalnix.me", "testnet-seed.deadalnix.me", true));
-        // criptolayer.net
-        vSeeds.push_back(CDNSSeedData("criptolayer.net", "testnet-seeder.criptolayer.net", true));
-        // Bitcoin SV seeder
-        if (nMiningSvForkTime != 0)
-        {
-            vSeeds.push_back(CDNSSeedData("bitcoinsv.io", "testnet-seed.bitcoinsv.io", true));
-        }
 
         base58Prefixes[PUBKEY_ADDRESS] = std::vector<uint8_t>(1, 111);
         base58Prefixes[SCRIPT_ADDRESS] = std::vector<uint8_t>(1, 196);
@@ -410,11 +416,32 @@ public:
         fMineBlocksOnDemand = false;
         fTestnetToBeDeprecatedFieldRPC = true;
 
-        checkpointData =
-            (CCheckpointData){boost::assign::map_list_of(546,
-                                  uint256S("000000002a936ca763904c3c35fce2f3556c559c0214345d31b1bcebf76acb70"))(1155876,
-                                  uint256S("00000000000e38fef93ed9582a7df43815d5c2ba9fd37ef70c9a0ea4a285b8f5")),
-                1501616524, 1488, 300};
+        // clang-format off
+        checkpointData = CCheckpointData();
+        MapCheckpoints &checkpoints = checkpointData.mapCheckpoints;
+        checkpoints[546]     = uint256S("0x000000002a936ca763904c3c35fce2f3556c559c0214345d31b1bcebf76acb70");
+        // August 1st 2017 CASH fork (UAHF) activation block
+        checkpoints[1155876] = uint256S("0x00000000000e38fef93ed9582a7df43815d5c2ba9fd37ef70c9a0ea4a285b8f5");
+        // Nov, 13th 2017. DAA activation block.
+        checkpoints[1188697] = uint256S("0x0000000000170ed0918077bde7b4d36cc4c91be69fa09211f748240dabe047fb");
+        // May 15th 2018, re-enabling opcodes, max block size 32MB
+        checkpoints[1233070] = uint256S("0x0000000000000253c6201a2076663cfe4722e4c75f537552cc4ce989d15f7cd5");
+        // Nov 15th 2018, CHECKDATASIG, ctor
+        checkpoints[1267996] = uint256S("0x00000000000001fae0095cd4bea16f1ce8ab63f3f660a03c6d8171485f484b24");
+        // May 15th 2019, Schnorr + segwit recovery activation block
+        checkpoints[1303885] = uint256S("0x00000000000000479138892ef0e4fa478ccc938fb94df862ef5bde7e8dee23d3");
+        // Nov 15th 2019 activate Schnorr Multisig, minimal data
+        checkpoints[1341712] = uint256S("0x00000000fffc44ea2e202bd905a9fbbb9491ef9e9d5a9eed4039079229afa35b");
+        // May 15th 2020 activate op_reverse, SigCheck
+        checkpoints[1378461] = uint256S("0x0000000099f5509b5f36b1926bcf82b21d936ebeadee811030dfbbb7fae915d7");
+
+        // clang-format on
+        // Data as of block
+        checkpointData.nTimeLastCheckpoint = 1573827462;
+        // * total number of transactions between genesis and last checkpoint
+        checkpointData.nTransactionsLastCheckpoint = 57494631;
+        // * estimated number of transactions per day after checkpoint (~1.6 TPS)
+        checkpointData.fTransactionsPerDay = 140000;
     }
 };
 static CTestNetParams testNetParams;
@@ -434,18 +461,16 @@ public:
         consensus.BIP34Hash = uint256();
         consensus.BIP65Height = 1351; // BIP65 activated on regtest (Used in rpc activation tests)
         consensus.BIP66Height = 1251; // BIP66 activated on regtest (Used in rpc activation tests)
+        consensus.BIP68Height = 576; // BIP68, 112, 113 has activated
         consensus.powLimit = uint256S("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // two weeks
         consensus.nPowTargetSpacing = 10 * 60;
         consensus.fPowAllowMinDifficultyBlocks = true;
         consensus.fPowNoRetargeting = true;
-
-        consensus.vDeployments[Consensus::DEPLOYMENT_CSV].bit = 0;
-        consensus.vDeployments[Consensus::DEPLOYMENT_CSV].nStartTime = 0;
-        consensus.vDeployments[Consensus::DEPLOYMENT_CSV].nTimeout = 999999999999LL;
-        consensus.vDeployments[Consensus::DEPLOYMENT_CSV].windowsize = 144;
-        consensus.vDeployments[Consensus::DEPLOYMENT_CSV].threshold = 108; // 75% of 144
-
+        // The half life for the ASERT DAA. For every (nASERTHalfLife) seconds behind schedule the blockchain gets,
+        // difficulty is cut in half. Doubled if blocks are ahead of schedule.
+        // Two days
+        consensus.nASERTHalfLife = 2 * 24 * 60 * 60;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 28;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = 0;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nTimeout = 999999999999LL;
@@ -460,9 +485,14 @@ public:
         consensus.may2018Height = 0;
         // Nov, 15 2018 hard fork is always active on regtest
         consensus.nov2018Height = 0;
-        consensus.sv2018Height = 0;
-        // Wed, 15 May 2019 12:00:00 UTC hard fork activation time
-        consensus.may2019ActivationTime = 1557921600;
+        // May, 15 2019 hard fork
+        consensus.may2019Height = 0;
+        // Nov, 15 2019 hard fork is always active on regtest
+        consensus.nov2019Height = 0;
+        // May, 15 2020 hard fork
+        consensus.may2020Height = 0;
+        // Nov 15, 2020 12:00:00 UTC protocol upgrade¶
+        consensus.nov2020ActivationTime = NOV2020_ACTIVATION_TIME;
 
         pchMessageStart[0] = 0xfa;
         pchMessageStart[1] = 0xbf;

@@ -1,5 +1,5 @@
 // Copyright (c) 2009-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2017 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -85,13 +85,13 @@ bool Lookup(const char *pszName,
  */
 bool LookupNumeric(const char *pszName, CService &addr, int portDefault = 0);
 
-bool ConnectSocket(const CService &addr, SOCKET &hSocketRet, int nTimeout, bool *outProxyConnectionFailed = 0);
+bool ConnectSocket(const CService &addr, SOCKET &hSocketRet, int nTimeout, bool *outProxyConnectionFailed = nullptr);
 bool ConnectSocketByName(CService &addr,
     SOCKET &hSocketRet,
     const char *pszDest,
     int portDefault,
     int nTimeout,
-    bool *outProxyConnectionFailed = 0);
+    bool *outProxyConnectionFailed = nullptr);
 /** Return readable error string for a network error code */
 std::string NetworkErrorString(int err);
 /** Close socket and set hSocket to INVALID_SOCKET */

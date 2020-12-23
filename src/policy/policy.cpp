@@ -1,5 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2015 The Bitcoin developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -50,7 +51,8 @@ bool IsStandard(const CScript &scriptPubKey, txnouttype &whichType)
     }
     else if (whichType == TX_CLTV)
     {
-        return true; // CLTV Freeze are standard enable(disable)
+        // are CLTV Freeze transactions standard (currently disabled)
+        return false;
     }
     else if (whichType == TX_NULL_DATA || whichType == TX_LABELPUBLIC)
     {
@@ -61,7 +63,7 @@ bool IsStandard(const CScript &scriptPubKey, txnouttype &whichType)
     return whichType != TX_NONSTANDARD;
 }
 
-bool IsStandardTx(const CTransactionRef &tx, std::string &reason)
+bool IsStandardTx(const CTransactionRef tx, std::string &reason)
 {
     if (tx->nVersion > CTransaction::MAX_STANDARD_VERSION || tx->nVersion < 1)
     {
@@ -73,7 +75,7 @@ bool IsStandardTx(const CTransactionRef &tx, std::string &reason)
     // almost as much to process as they cost the sender in fees, because
     // computing signature hashes is O(ninputs*txsize). Limiting transactions
     // to MAX_STANDARD_TX_SIZE mitigates CPU exhaustion attacks.
-    if (tx->GetTxSize() >= MAX_STANDARD_TX_SIZE)
+    if (tx->GetTxSize() > MAX_STANDARD_TX_SIZE)
     {
         reason = "tx-size";
         return false;
@@ -88,7 +90,7 @@ bool IsStandardTx(const CTransactionRef &tx, std::string &reason)
         // future-proofing. That's also enough to spend a 20-of-20
         // CHECKMULTISIG scriptPubKey, though such a scriptPubKey is not
         // considered standard)
-        if (txin.scriptSig.size() > 1650)
+        if (txin.scriptSig.size() > MAX_TX_IN_SCRIPT_SIG_SIZE)
         {
             reason = "scriptsig-size";
             return false;
@@ -134,7 +136,7 @@ bool IsStandardTx(const CTransactionRef &tx, std::string &reason)
     return true;
 }
 
-bool AreInputsStandard(const CTransactionRef &tx, const CCoinsViewCache &mapInputs)
+bool AreInputsStandard(const CTransactionRef tx, const CCoinsViewCache &mapInputs, bool may2020Enabled)
 {
     if (tx->IsCoinBase())
         return true; // Coinbases don't use vin normally
@@ -165,10 +167,13 @@ bool AreInputsStandard(const CTransactionRef &tx, const CCoinsViewCache &mapInpu
                 return false;
             if (stack.empty())
                 return false;
-            CScript subscript(stack.back().begin(), stack.back().end());
-            if (subscript.GetSigOpCount(STANDARD_CHECKDATASIG_VERIFY_FLAGS, true) > MAX_P2SH_SIGOPS)
+            if (!may2020Enabled)
             {
-                return false;
+                CScript subscript(stack.back().begin(), stack.back().end());
+                if (subscript.GetSigOpCount(STANDARD_SCRIPT_VERIFY_FLAGS, true) > MAX_P2SH_SIGOPS)
+                {
+                    return false;
+                }
             }
         }
     }

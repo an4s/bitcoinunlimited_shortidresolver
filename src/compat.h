@@ -30,6 +30,7 @@
 #include <winsock2.h> // Must be included before mswsock.h and windows.h
 
 #include <mswsock.h>
+#include <stdint.h>
 #include <windows.h>
 #include <ws2tcpip.h>
 #else
@@ -74,6 +75,16 @@ typedef u_int SOCKET;
 #define MAX_PATH 1024
 #endif
 
+#ifdef _MSC_VER
+#if !defined(ssize_t)
+#ifdef _WIN64
+typedef int64_t ssize_t;
+#else
+typedef int32_t ssize_t;
+#endif
+#endif
+#endif
+
 // As Solaris does not have the MSG_NOSIGNAL flag for send(2) syscall, it is defined as 0
 #if !defined(HAVE_MSG_NOSIGNAL) && !defined(MSG_NOSIGNAL)
 #define MSG_NOSIGNAL 0
@@ -88,6 +99,27 @@ typedef u_int SOCKET;
 #define THREAD_PRIORITY_BELOW_NORMAL 2
 #define THREAD_PRIORITY_NORMAL 0
 #define THREAD_PRIORITY_ABOVE_NORMAL (-2)
+#endif
+
+#ifdef ANDROID
+#define HAVE_DECL_STRNLEN 1
+#define HAVE_DECL_HTOLE16 1
+#define HAVE_DECL_HTOLE16 1
+#define HAVE_DECL_LE16TOH 1
+
+#define HAVE_DECL_HTOBE16 1
+#define HAVE_DECL_HTOBE32 1
+#define HAVE_DECL_HTOLE32 1
+#define HAVE_DECL_BE16TOH 1
+#define HAVE_DECL_BE32TOH 1
+#define HAVE_DECL_LE32TOH 1
+#define HAVE_DECL_HTOBE64 1
+
+#define HAVE_DECL_HTOLE64 1
+#define HAVE_DECL_BE64TOH 1
+#define HAVE_DECL_LE64TOH 1
+
+#define JAVA
 #endif
 
 #if HAVE_DECL_STRNLEN == 0

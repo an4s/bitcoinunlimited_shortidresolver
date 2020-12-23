@@ -1,6 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -15,19 +15,22 @@
 #include "net.h"
 
 #include "addrman.h"
+#include "blockrelay/blockrelay_common.h"
 #include "blockrelay/graphene.h"
+#include "blockrelay/mempool_sync.h"
 #include "chainparams.h"
 #include "connmgr.h"
 #include "consensus/consensus.h"
 #include "crypto/common.h"
 #include "dosman.h"
-#include "hash.h"
+#include "hashwrapper.h"
 #include "iblt.h"
 #include "primitives/transaction.h"
 #include "requestManager.h"
 #include "ui_interface.h"
 #include "unlimited.h"
 #include "utilstrencodings.h"
+#include "xversionkeys.h"
 
 extern CTweak<bool> ignoreNetTimeouts;
 
@@ -45,7 +48,7 @@ extern CTweak<bool> ignoreNetTimeouts;
 #endif
 
 #include <boost/filesystem.hpp>
-#include <boost/lexical_cast.hpp>
+#include <chrono>
 #include <thread>
 
 #include <math.h>
@@ -54,6 +57,9 @@ extern CTweak<bool> ignoreNetTimeouts;
 
 // Dump addresses to peers.dat and banlist.dat every 15 minutes (900s)
 #define DUMP_ADDRESSES_INTERVAL 900
+
+// Dump addresses to peers.dat and banlist.dat every 10 seconds
+#define UPDATE_MISBEHAVIOR_INTERVAL 10
 
 // We add a random period time (0 to 1 seconds) to feeler connections to prevent synchronization.
 #define FEELER_SLEEP_WINDOW 1
@@ -74,6 +80,12 @@ extern CTweak<bool> ignoreNetTimeouts;
 #endif
 
 extern std::atomic<bool> fRescan;
+extern bool fReindex;
+extern CTxMemPool mempool;
+extern CTweak<uint64_t> grapheneMinVersionSupported;
+extern CTweak<uint64_t> grapheneMaxVersionSupported;
+
+bool ShutdownRequested();
 
 using namespace std;
 
@@ -107,7 +119,6 @@ int nMaxConnections = DEFAULT_MAX_PEER_CONNECTIONS;
 int nMinXthinNodes = MIN_XTHIN_NODES;
 
 bool fAddressesInitialized = false;
-std::string strSubVersion;
 
 // BU moved to global.cpp
 // extern vector<CNode*> vNodes;
@@ -131,11 +142,16 @@ extern CCriticalSection cs_vUseDNSSeeds;
 
 extern CSemaphore *semOutbound;
 extern CSemaphore *semOutboundAddNode; // BU: separate semaphore for -addnodes
-boost::condition_variable messageHandlerCondition;
+std::condition_variable messageHandlerCondition;
+std::mutex wakeableDelayMutex;
 
 // BU  Connection Slot mitigation - used to determine how many connection attempts over time
 extern std::map<CNetAddr, ConnectionHistory> mapInboundConnectionTracker;
 extern CCriticalSection cs_mapInboundConnectionTracker;
+
+// Mempool synchronization
+extern uint64_t lastMempoolSync;
+extern uint64_t lastMempoolSyncClear;
 
 // Signals for message handling
 extern CNodeSignals g_signals;
@@ -182,12 +198,13 @@ static std::vector<CAddress> convertSeed6(const std::vector<SeedSpec6> &vSeedsIn
     const int64_t nOneWeek = 7 * 24 * 60 * 60;
     std::vector<CAddress> vSeedsOut;
     vSeedsOut.reserve(vSeedsIn.size());
+    FastRandomContext rng;
     for (std::vector<SeedSpec6>::const_iterator i(vSeedsIn.begin()); i != vSeedsIn.end(); ++i)
     {
         struct in6_addr ip;
         memcpy(&ip, i->addr, sizeof(ip));
         CAddress addr(CService(ip, i->port));
-        addr.nTime = GetTime() - GetRand(nOneWeek) - nOneWeek;
+        addr.nTime = GetTime() - rng.randrange(nOneWeek) - nOneWeek;
         vSeedsOut.push_back(addr);
     }
     return vSeedsOut;
@@ -228,14 +245,15 @@ bool IsPeerAddrLocalGood(CNode *pnode)
 // pushes our own address to a peer
 void AdvertiseLocal(CNode *pnode)
 {
-    if (fListen && pnode->successfullyConnected())
+    if (fListen && pnode->fSuccessfullyConnected)
     {
         CAddress addrLocal = GetLocalAddress(&pnode->addr);
         // If discovery is enabled, sometimes give our peer the address it
         // tells us that it sees us as in case it has a better idea of our
         // address than we do.
+        FastRandomContext rng;
         if (IsPeerAddrLocalGood(pnode) &&
-            (!addrLocal.IsRoutable() || GetRand((GetnScore(addrLocal) > LOCAL_MANUAL) ? 8 : 2) == 0))
+            (!addrLocal.IsRoutable() || rng.randbits((GetnScore(addrLocal) > LOCAL_MANUAL) ? 8 : 2) == 0))
         {
             addrLocal.SetIP(pnode->addrLocal);
         }
@@ -243,7 +261,7 @@ void AdvertiseLocal(CNode *pnode)
         {
             // BU logs too often: LOGA("AdvertiseLocal: advertising address %s\n", addrLocal.ToString());
             FastRandomContext insecure_rand;
-            pnode->PushAddress(addrLocal, insecure_rand);
+            pnode->PushAddress(addrLocal, rng);
         }
     }
 }
@@ -335,38 +353,6 @@ bool IsReachable(const CNetAddr &addr)
     return IsReachable(net);
 }
 
-// clang-format off
-static const std::map<uint64_t, std::string> bitMeaningsCSI(
-{
-    {(uint64_t)ConnectionStateIncoming::CONNECTED_WAIT_VERSION, "CONNECTED_WAIT_VERSION"},
-    {(uint64_t)ConnectionStateIncoming::SENT_VERACK_READY_FOR_POTENTIAL_XVERSION, "SENT_VERACK_READY_FOR_POTENTIAL_XVERSION"},
-    {(uint64_t)ConnectionStateIncoming::READY, "READY"},
-    {(uint64_t)ConnectionStateIncoming::ANY, "ALL"}
-});
-
-static const std::map<uint64_t, std::string> bitMeaningsCSO(
-{
-    {(uint64_t)ConnectionStateOutgoing::CONNECTED, "CONNECTED"},
-    {(uint64_t)ConnectionStateOutgoing::SENT_VERSION, "SENT_VERSION"},
-    {(uint64_t)ConnectionStateOutgoing::READY, "READY"},
-    {(uint64_t)ConnectionStateOutgoing::ANY, "ALL"}
-});
-// clang-format on
-
-ConnectionStateIncoming operator|(const ConnectionStateIncoming &a, const ConnectionStateIncoming &b)
-{
-    return (ConnectionStateIncoming)((uint64_t)a | (uint64_t)b);
-}
-
-ConnectionStateOutgoing operator|(const ConnectionStateOutgoing &a, const ConnectionStateOutgoing &b)
-{
-    return (ConnectionStateOutgoing)((uint64_t)a | (uint64_t)b);
-}
-
-std::string toString(const ConnectionStateIncoming &state) { return toString((uint64_t)state, bitMeaningsCSI); }
-std::ostream &operator<<(std::ostream &os, const ConnectionStateIncoming &state) { return (os << toString(state)); }
-std::string toString(const ConnectionStateOutgoing &state) { return toString((uint64_t)state, bitMeaningsCSO); }
-std::ostream &operator<<(std::ostream &os, const ConnectionStateOutgoing &state) { return (os << toString(state)); }
 // Initialize static CNode variables used in static CNode functions.
 std::atomic<uint64_t> CNode::nTotalBytesRecv{0};
 std::atomic<uint64_t> CNode::nTotalBytesSent{0};
@@ -414,6 +400,13 @@ CNodeRef FindNodeRef(const std::string &addrName)
     LOCK(cs_vNodes);
     return CNodeRef(FindNode(addrName));
 }
+
+CNodeRef FindNodeRef(const CNetAddr &ip)
+{
+    LOCK(cs_vNodes);
+    return CNodeRef(FindNode(ip));
+}
+
 
 int DisconnectSubNetNodes(const CSubNet &subNet)
 {
@@ -508,10 +501,38 @@ void CNode::CloseSocketDisconnect()
         CloseSocket(hSocket);
     }
 
+    // Purge any noderef's in the priority message queues relating to this peer. If we don't
+    // remove the node references here then we won't be able to complete the disconnection.
+    {
+        LOCK(cs_prioritySendQ);
+        auto it = vPrioritySendQ.begin();
+        while (it != vPrioritySendQ.end())
+        {
+            if (this == it->get())
+                it = vPrioritySendQ.erase(it);
+            else
+                it++;
+        }
+    }
+    {
+        LOCK(cs_priorityRecvQ);
+        auto it = vPriorityRecvQ.begin();
+        while (it != vPriorityRecvQ.end())
+        {
+            if (this == it->first.get())
+                it = vPriorityRecvQ.erase(it);
+            else
+                it++;
+        }
+    }
+
     // in case this fails, we'll empty the recv buffer when the CNode is deleted
     TRY_LOCK(cs_vRecvMsg, lockRecv);
     if (lockRecv)
+    {
         vRecvMsg.clear();
+        vRecvMsg_handshake.clear();
+    }
 }
 
 void CNode::PushVersion()
@@ -538,8 +559,6 @@ void CNode::PushVersion()
         FormatSubVersion(CLIENT_NAME, CLIENT_VERSION, BUComments), nBestHeight,
         !GetBoolArg("-blocksonly", DEFAULT_BLOCKSONLY));
     tVersionSent = GetTime();
-    DbgAssert(state_outgoing == ConnectionStateOutgoing::CONNECTED, {});
-    state_outgoing = ConnectionStateOutgoing::SENT_VERSION;
 }
 
 
@@ -553,14 +572,21 @@ void CNode::copyStats(CNodeStats &stats)
     X(nLastSend);
     X(nLastRecv);
     X(nTimeConnected);
+    X(nStopwatchConnected);
     X(nTimeOffset);
     X(addrName);
     X(nVersion);
     X(cleanSubVer);
     X(fInbound);
     X(nStartingHeight);
-    X(nSendBytes);
-    X(nRecvBytes);
+    {
+        LOCK(cs_vSend);
+        X(nSendBytes);
+    }
+    {
+        LOCK(cs_vRecvMsg);
+        X(nRecvBytes);
+    }
     X(fWhitelisted);
     X(fSupportsCompactBlocks);
 
@@ -573,7 +599,7 @@ void CNode::copyStats(CNodeStats &stats)
     int64_t nPingUsecWait = 0;
     if ((0 != nPingNonceSent) && (0 != nPingUsecStart))
     {
-        nPingUsecWait = GetTimeMicros() - nPingUsecStart;
+        nPingUsecWait = GetStopwatchMicros() - nPingUsecStart;
     }
 
     // Raw ping time is in microseconds, but show it to user as whole seconds (Bitcoin users should be well used to
@@ -587,17 +613,56 @@ void CNode::copyStats(CNodeStats &stats)
 }
 #undef X
 
+static bool IsMessageOversized(CNetMessage &msg)
+{
+    if (maxMessageSizeMultiplier && msg.in_data && (msg.hdr.nMessageSize > BLOCKSTREAM_CORE_MAX_BLOCK_SIZE) &&
+        (msg.hdr.nMessageSize > (maxMessageSizeMultiplier * excessiveBlockSize)))
+    {
+        // TODO: warn if too many nodes are doing this
+        return true;
+    }
+    return false;
+}
+
+static bool IsPriorityMsg(std::string strCommand)
+{
+    if (!IsChainNearlySyncd())
+        return false;
+
+    // Most traffic is INV, TX or GETDATA so check that first to prevent us from having to
+    // to evaluate, for every message, the long if statement that follows this one.
+    if (strCommand == NetMsgType::INV || strCommand == NetMsgType::TX || strCommand == NetMsgType::GETDATA)
+        return false;
+
+    // Various messages types that are considered priority.
+    // NOTE: The absence of BLOCK is not by accident. Full BLOCK messages are problematic for priority queuing.
+    //       as it is difficult to know the state of the peer in terms of whether they are sync'd to the chain.
+    //       We for instance don't want to be sending BLOCK's as priority messages if the peer is only in the process
+    //       of initial sync. Also, BLOCK's can be quite large and we don't want them to be dominating our priority
+    //       sending process. We prefer small objects that can be forwarded with one SockeSendData() attempt.
+    if (strCommand == NetMsgType::HEADERS || strCommand == NetMsgType::GRAPHENEBLOCK ||
+        strCommand == NetMsgType::GET_GRAPHENE || strCommand == NetMsgType::GRAPHENETX ||
+        strCommand == NetMsgType::GET_GRAPHENE_RECOVERY || strCommand == NetMsgType::GRAPHENE_RECOVERY ||
+        strCommand == NetMsgType::GET_GRAPHENETX || strCommand == NetMsgType::GET_XTHIN ||
+        strCommand == NetMsgType::GET_THIN || strCommand == NetMsgType::XTHINBLOCK ||
+        strCommand == NetMsgType::THINBLOCK || strCommand == NetMsgType::XBLOCKTX ||
+        strCommand == NetMsgType::GET_XBLOCKTX || strCommand == NetMsgType::XPEDITEDREQUEST ||
+        strCommand == NetMsgType::XPEDITEDBLK || strCommand == NetMsgType::XPEDITEDTXN ||
+        strCommand == NetMsgType::CMPCTBLOCK || strCommand == NetMsgType::GETBLOCKTXN ||
+        strCommand == NetMsgType::BLOCKTXN || strCommand == NetMsgType::BLOCK)
+    {
+        return true;
+    }
+    else
+    {
+        return false;
+    }
+}
 bool CNode::ReceiveMsgBytes(const char *pch, unsigned int nBytes)
 {
     AssertLockHeld(cs_vRecvMsg);
     while (nBytes > 0)
     {
-        // get current incomplete message, or create a new one
-        if (vRecvMsg.empty() || vRecvMsg.back().complete())
-            vRecvMsg.push_back(CNetMessage(GetMagic(Params()), SER_NETWORK, nRecvVersion));
-
-        CNetMessage &msg = vRecvMsg.back();
-
         // Absorb network data.
         int handled;
         if (!msg.in_data)
@@ -608,14 +673,10 @@ bool CNode::ReceiveMsgBytes(const char *pch, unsigned int nBytes)
         if (handled < 0)
             return false;
 
-        // BU: only reject the message if it is some multiple of the excessive
-        // block size.  Since traffic shaping will keep the bandwidth in check
-        // this basically eliminates nodes that are deliberately trying to screw us up.
-        if (maxMessageSizeMultiplier && msg.in_data && (msg.hdr.nMessageSize > BLOCKSTREAM_CORE_MAX_BLOCK_SIZE) &&
-            (msg.hdr.nMessageSize > (maxMessageSizeMultiplier * excessiveBlockSize)))
+        if (IsMessageOversized(msg))
         {
+            fDisconnect = true;
             LOG(NET, "Oversized message from peer=%i, disconnecting\n", GetId());
-            // BU: TODO warn if too many nodes are doing this
             return false;
         }
 
@@ -624,6 +685,11 @@ bool CNode::ReceiveMsgBytes(const char *pch, unsigned int nBytes)
 
         if (msg.complete())
         {
+            bool fSendLowPriority = true;
+
+            msg.nStopwatch = GetStopwatchMicros();
+            msg.nTime = GetTimeMicros();
+
             // Connection slot attack mitigation.  We don't want to add useful bytes for outgoing INV, PING, ADDR,
             // VERSION or VERACK messages since attackers will often just connect and listen to INV messages.
             // We want to make sure that connected nodes are doing useful work in sending us data or requesting data.
@@ -631,32 +697,45 @@ bool CNode::ReceiveMsgBytes(const char *pch, unsigned int nBytes)
             if (strCommand != NetMsgType::PONG && strCommand != NetMsgType::PING && strCommand != NetMsgType::ADDR &&
                 strCommand != NetMsgType::VERSION && strCommand != NetMsgType::VERACK)
             {
-                nActivityBytes += msg.hdr.nMessageSize;
+                nActivityBytes.fetch_add(msg.hdr.nMessageSize);
 
-                // If the message is a priority message then move from the back to the front of the deque.
-                //
-                // NOTE: for GET_XTHIN we don't jump the queue on test environments because the GET_XTHIN can get ahead
-                // of a previous GET_XTHIN/HEADER requests and result in a DOS if the block returns out of order and
-                // with no headers in the block index or the setblockindexcandidates.
-                if ((strCommand == NetMsgType::GET_XTHIN && Params().NetworkIDString() == "main") ||
-                    strCommand == NetMsgType::GET_THIN || strCommand == NetMsgType::XTHINBLOCK ||
-                    strCommand == NetMsgType::THINBLOCK || strCommand == NetMsgType::XBLOCKTX ||
-                    strCommand == NetMsgType::GET_XBLOCKTX || strCommand == NetMsgType::GET_GRAPHENE ||
-                    strCommand == NetMsgType::GRAPHENEBLOCK || strCommand == NetMsgType::GRAPHENETX ||
-                    strCommand == NetMsgType::GET_GRAPHENETX)
+                // If the message is a priority message then move it into the priority queue.
+                if (IsPriorityMsg(strCommand))
                 {
-                    LOG(THIN | GRAPHENE, "ReceiveMsgBytes %s\n", strCommand);
+                    LOCK(cs_priorityRecvQ);
+                    // As a safeguard on some peer trying to dominate our networking
+                    // don't allow unlimited simultaneous priority messages. There should in general only be
+                    // one priority message at any one time with the exception of block HEADERS announcements
+                    // which can come relatively close together in time.
+                    if (vPriorityRecvQ.size() <= 5)
+                    {
+                        // Move the this message to the priority queue.
+                        vPriorityRecvQ.push_back(std::make_pair<CNodeRef, CNetMessage>(CNodeRef(this), std::move(msg)));
+                        msg = CNetMessage(GetMagic(Params()), SER_NETWORK, nRecvVersion);
 
-                    // Move the this message to the front of the queue.
-                    std::rotate(vRecvMsg.begin(), vRecvMsg.end() - 1, vRecvMsg.end());
-
-                    std::string strFirstMsgCommand = vRecvMsg[0].hdr.GetCommand();
-                    DbgAssert(strFirstMsgCommand == strCommand, );
-                    LOG(THIN | GRAPHENE, "Receive Queue: pushed %s to the front of the queue\n", strFirstMsgCommand);
+                        LOG(PRIORITYQ, "Receive Queue: pushed %s to the priority queue, %d bytes, peer(%d)\n",
+                            strCommand, vPriorityRecvQ.back().second.hdr.nMessageSize, this->GetId());
+                        // Indicate we have a priority message to process
+                        fPriorityRecvMsg.store(true);
+                        fSendLowPriority = false;
+                    }
                 }
             }
-            // BU: end
-            msg.nTime = GetTimeMicros();
+
+            if (fSendLowPriority)
+            {
+                if (strCommand == NetMsgType::VERSION || strCommand == NetMsgType::XVERSION ||
+                    strCommand == NetMsgType::XVERSION_OLD || strCommand == NetMsgType::XVERACK_OLD ||
+                    strCommand == NetMsgType::VERACK)
+                {
+                    vRecvMsg_handshake.push_back(std::move(msg));
+                }
+                else
+                {
+                    vRecvMsg.push_back(std::move(msg));
+                }
+                msg = CNetMessage(GetMagic(Params()), SER_NETWORK, nRecvVersion);
+            }
             messageHandlerCondition.notify_one();
         }
     }
@@ -717,30 +796,45 @@ int CNetMessage::readData(const char *pch, unsigned int nBytes)
 
 
 // requires LOCK(cs_vSend), BU: returns > 0 if any data was sent, 0 if nothing accomplished.
-int SocketSendData(CNode *pnode)
+int SocketSendData(CNode *pnode, bool fSendTwo = false) EXCLUSIVE_LOCKS_REQUIRED(pnode->cs_vSend)
 {
+    AssertLockHeld(pnode->cs_vSend);
     // BU This variable is incremented if something happens.  If it is zero at the bottom of the loop, we delay.  This
     // solves spin loop issues where the select does not block but no bytes can be transferred (traffic shaping limited,
     // for example).
     int progress = 0;
-
+    uint32_t nMsgSent = 0;
     // Make sure we haven't already been asked to disconnect
     if (pnode->fDisconnect)
         return progress;
 
-    std::deque<CSerializeData>::iterator it = pnode->vSendMsg.begin();
-    while (it != pnode->vSendMsg.end())
+    std::deque<CSerializeData>::iterator it;
+    while (!pnode->vSendMsg.empty() || !pnode->vLowPrioritySendMsg.empty())
     {
+        if (!pnode->vSendMsg.empty())
+        {
+            it = pnode->vSendMsg.begin();
+        }
+        else
+        {
+            // Move a message from the lower priority queue to the higher priority queue
+            // and then continue. This keeps all active message sending from the priority queue
+            // only and prevents us from putting the next priority message in front of any that
+            // has already been partially sent.
+            pnode->vSendMsg.push_back(std::move(*pnode->vLowPrioritySendMsg.begin()));
+            pnode->vLowPrioritySendMsg.pop_front();
+            continue;
+        }
+
         const CSerializeData &data = *it;
         if (data.size() <= 0)
         {
-            it++;
+            pnode->vSendMsg.pop_front();
             LOGA("ERROR:  Trying to send message but data size was %d nSendOffset was %d nSendSize was %d\n",
                 data.size(), pnode->nSendOffset, pnode->nSendSize);
             continue;
         }
-        // assert(data.size() > pnode->nSendOffset);
-
+        DbgAssert(data.size() > pnode->nSendOffset, );
         int amt2Send = min((int64_t)(data.size() - pnode->nSendOffset), sendShaper.available(SEND_SHAPER_MIN_FRAG));
         if (amt2Send == 0)
             break;
@@ -763,7 +857,12 @@ int SocketSendData(CNode *pnode)
             {
                 pnode->nSendOffset = 0;
                 pnode->nSendSize.fetch_sub(data.size());
-                it++;
+                pnode->vSendMsg.pop_front();
+
+                // If this is a priority send then just send two messages, then stop sending more.
+                nMsgSent++;
+                if (fSendTwo && nMsgSent >= 2)
+                    break;
             }
             else
             {
@@ -790,19 +889,17 @@ int SocketSendData(CNode *pnode)
         }
     }
 
-    if (it == pnode->vSendMsg.end())
+    if (pnode->vSendMsg.empty() && pnode->vLowPrioritySendMsg.empty())
     {
         if (pnode->nSendOffset != 0 || pnode->nSendSize != 0)
             LOGA("ERROR: One or more values were not Zero - nSendOffset was %d nSendSize was %d\n", pnode->nSendOffset,
                 pnode->nSendSize);
-        // assert(pnode->nSendOffset == 0);
-        // assert(pnode->nSendSize == 0);
+        DbgAssert(pnode->nSendOffset == 0, );
+        DbgAssert(pnode->nSendSize == 0, );
     }
-    pnode->vSendMsg.erase(pnode->vSendMsg.begin(), it);
+
     return progress;
 }
-
-extern list<CNode *> vNodesDisconnected;
 
 #if 0 // Not currenly used
 static bool ReverseCompareNodeMinPingTime(const CNodeRef &a, const CNodeRef &b)
@@ -865,12 +962,18 @@ static bool AttemptToEvictConnection(bool fPreferNewConnection)
         static int64_t nLastTime = GetTime();
         for (CNode *node : vNodes)
         {
-            // Decay the activity bytes for each node over a period of 2 hours.  This gradually de-prioritizes a
-            // connection
-            // that was once active but has gone stale for some reason and allows lower priority active nodes to climb
-            // the ladder.
+            // Decay the activity bytes for each node over a period of 2 hours.  This gradually de-prioritizes
+            // a connection that was once active but has gone stale for some reason and allows lower priority
+            // active nodes to climb the ladder.
             int64_t nNow = GetTime();
-            node->nActivityBytes *= pow(1.0 - 1.0 / 7200, (double)(nNow - nLastTime)); // exponential 2 hour decay
+
+            while (true)
+            {
+                uint64_t nOldActivityBytes = node->nActivityBytes;
+                uint64_t nNewActivityBytes = nOldActivityBytes * pow(1.0 - 1.0 / 7200, (double)(nNow - nLastTime));
+                if (node->nActivityBytes.compare_exchange_weak(nOldActivityBytes, nNewActivityBytes))
+                    break;
+            }
 
             if (node->fWhitelisted)
                 continue;
@@ -882,9 +985,10 @@ static bool AttemptToEvictConnection(bool fPreferNewConnection)
 
             // on occasion a node will connect but not complete it's initial ping/pong in a reasonable amount of time
             // and will therefore be the lowest priority connection and disconnected first.
-            if (node->nPingNonceSent > 0 && node->nPingUsecTime == 0 && ((GetTime() - node->nTimeConnected) > 60))
+            if (node->nPingNonceSent > 0 && node->nPingUsecTime == 0 &&
+                ((GetStopwatchMicros() - node->nStopwatchConnected) > 60 * 1000000))
             {
-                LOG(NET, "node %s evicted, slow ping\n", node->GetLogName());
+                LOG(EVICT, "node %s evicted, slow ping\n", node->GetLogName());
                 node->fDisconnect = true;
                 return true;
             }
@@ -928,7 +1032,8 @@ static bool AttemptToEvictConnection(bool fPreferNewConnection)
         if (nEvictions > 15)
         {
             int nHoursToBan = 4;
-            dosMan.Ban(ipAddress, BanReasonNodeMisbehaving, nHoursToBan * 60 * 60);
+            std::string userAgent = vEvictionCandidatesByActivity[0]->cleanSubVer;
+            dosMan.Ban(ipAddress, userAgent, BanReasonTooManyEvictions, nHoursToBan * 60 * 60);
             LOGA("Banning %s for %d hours: Too many evictions - connection dropped\n",
                 vEvictionCandidatesByActivity[0]->addr.ToString(), nHoursToBan);
         }
@@ -1075,7 +1180,8 @@ static void AcceptConnection(const ListenSocket &hListenSocket)
         if (nConnections > 4 && !whitelisted && !addr.IsLocal()) // local connections are auto-whitelisted
         {
             int nHoursToBan = 4;
-            dosMan.Ban((CNetAddr)addr, BanReasonNodeMisbehaving, nHoursToBan * 60 * 60);
+            std::string userAgent = mapInboundConnectionTracker[ipAddress].userAgent;
+            dosMan.Ban((CNetAddr)addr, userAgent, BanReasonTooManyConnectionAttempts, nHoursToBan * 60 * 60);
             LOGA("Banning %s for %d hours: Too many connection attempts - connection dropped\n", addr.ToString(),
                 nHoursToBan);
             CloseSocket(hSocket);
@@ -1098,6 +1204,74 @@ static void AcceptConnection(const ListenSocket &hListenSocket)
 
 char recvMsgBuf[MAX_RECV_CHUNK]; // Messages are first pulled into this buffer
 
+void CleanupDisconnectedNodes()
+{
+    //
+    // Disconnect nodes
+    //
+    list<CNode *> vNodesDisconnectedCopy;
+    {
+        LOCK2(cs_vNodes, cs_vNodesDisconnected);
+        // Disconnect unused nodes
+        vector<CNode *> vNodesCopy = vNodes;
+        for (CNode *pnode : vNodesCopy)
+        {
+            if (pnode->fDisconnect || pnode->GetRefCount() <= 0)
+            {
+                // remove from vNodes
+                vNodes.erase(remove(vNodes.begin(), vNodes.end(), pnode), vNodes.end());
+
+                // inform connection manager
+                connmgr->RemovedNode(pnode);
+
+                // release outbound grant (if any)
+                pnode->grantOutbound.Release();
+
+                // close socket and cleanup
+                pnode->CloseSocketDisconnect();
+
+                // Release this one reference.
+                pnode->Release();
+
+                // hold in disconnected pool until all other refs are released
+                vNodesDisconnected.push_back(pnode);
+            }
+        }
+        vNodesDisconnectedCopy = vNodesDisconnected;
+    }
+
+    // Delete disconnected nodes
+    for (CNode *pnode : vNodesDisconnectedCopy)
+    {
+        // wait until threads are done using it
+        if (pnode->GetRefCount() <= 0)
+        {
+            bool fDelete = false;
+            {
+                TRY_LOCK(pnode->cs_vSend, lockSend);
+                if (lockSend)
+                {
+                    TRY_LOCK(pnode->cs_vRecvMsg, lockRecv);
+                    if (lockRecv)
+                    {
+                        TRY_LOCK(pnode->cs_inventory, lockInv);
+                        if (lockInv)
+                            fDelete = true;
+                    }
+                }
+            }
+            if (fDelete)
+            {
+                LOCK(cs_vNodesDisconnected);
+                vNodesDisconnected.remove(pnode);
+                // no need to remove from vNodes. we know pnode has already been removed from vNodes since that
+                // occurred prior to insertion into vNodesDisconnected
+                delete pnode;
+            }
+        }
+    }
+}
+
 void ThreadSocketHandler()
 {
     unsigned int nPrevNodeCount = 0;
@@ -1111,69 +1285,7 @@ void ThreadSocketHandler()
         progress = 0;
         fAquiredAllRecvLocks = true;
         stat_io_service.poll(); // BU instrumentation
-        //
-        // Disconnect nodes
-        //
-        {
-            LOCK(cs_vNodes);
-            // Disconnect unused nodes
-            vector<CNode *> vNodesCopy = vNodes;
-            for (CNode *pnode : vNodesCopy)
-            {
-                if (pnode->fDisconnect || (pnode->GetRefCount() <= 0 && pnode->vRecvMsg.empty() &&
-                                              pnode->nSendSize == 0 && pnode->ssSend.empty()))
-                {
-                    // remove from vNodes
-                    vNodes.erase(remove(vNodes.begin(), vNodes.end(), pnode), vNodes.end());
-
-                    // inform connection manager
-                    connmgr->RemovedNode(pnode);
-
-                    // release outbound grant (if any)
-                    pnode->grantOutbound.Release();
-
-                    // close socket and cleanup
-                    pnode->CloseSocketDisconnect();
-
-                    // hold in disconnected pool until all refs are released
-                    if (pnode->fNetworkNode || pnode->fInbound)
-                        pnode->Release();
-                    vNodesDisconnected.push_back(pnode);
-                }
-            }
-        }
-        {
-            // Delete disconnected nodes
-            list<CNode *> vNodesDisconnectedCopy = vNodesDisconnected;
-            for (CNode *pnode : vNodesDisconnectedCopy)
-            {
-                // wait until threads are done using it
-                if (pnode->GetRefCount() <= 0)
-                {
-                    bool fDelete = false;
-                    {
-                        TRY_LOCK(pnode->cs_vSend, lockSend);
-                        if (lockSend)
-                        {
-                            TRY_LOCK(pnode->cs_vRecvMsg, lockRecv);
-                            if (lockRecv)
-                            {
-                                TRY_LOCK(pnode->cs_inventory, lockInv);
-                                if (lockInv)
-                                    fDelete = true;
-                            }
-                        }
-                    }
-                    if (fDelete)
-                    {
-                        vNodesDisconnected.remove(pnode);
-                        // no need to remove from vNodes. we know pnode has already been removed from vNodes since that
-                        // occurred prior to insertion into vNodesDisconnected
-                        delete pnode;
-                    }
-                }
-            }
-        }
+        CleanupDisconnectedNodes();
         if (vNodes.size() != nPrevNodeCount)
         {
             nPrevNodeCount = vNodes.size();
@@ -1238,7 +1350,7 @@ void ThreadSocketHandler()
                 // * We process a message in the buffer (message handler thread).
                 {
                     TRY_LOCK(pnode->cs_vSend, lockSend);
-                    if (lockSend && !pnode->vSendMsg.empty())
+                    if (lockSend && (!pnode->vSendMsg.empty() || !pnode->vLowPrioritySendMsg.empty()))
                     {
                         FD_SET(hSocket, &fdsetSend);
                         continue;
@@ -1246,9 +1358,10 @@ void ThreadSocketHandler()
                 }
                 {
                     TRY_LOCK(pnode->cs_vRecvMsg, lockRecv);
-                    if (lockRecv && (pnode->vRecvMsg.empty() || !pnode->vRecvMsg.front().complete() ||
-                                        pnode->GetTotalRecvSize() <= ReceiveFloodSize()))
+                    if (lockRecv && (pnode->vRecvMsg.empty() || pnode->GetTotalRecvSize() <= ReceiveFloodSize()))
+                    {
                         FD_SET(hSocket, &fdsetRecv);
+                    }
                 }
             }
         }
@@ -1300,7 +1413,7 @@ void ThreadSocketHandler()
         {
             if (shutdown_threads.load() == true)
             {
-                return;
+                break; // drop out of this loop so we can quickly release node refs and return
             }
 
             //
@@ -1374,6 +1487,76 @@ void ThreadSocketHandler()
                 continue;
             if (FD_ISSET(hSocket, &fdsetSend))
             {
+                // Send priority messages if there any regardless of which peer, taking care to maintain
+                // locking orders.
+                //
+                // Only send two messages, the first two in the send queue by setting the fSendTwo flag, since the
+                // priority message will be the first or second one in the queue. If there happen to be multiple
+                // priority messages stacked in the same queue then we will loop around sending one message each time.
+                // This way we don't end up draining each queue for a peer before being able to send another priority
+                // message from another peer which would happen in the case of block announcements.
+                //
+                // The following presents a more difficult issue in maintaining locking orders. cs_vSend must be
+                // taken before cs_prioritySendQ and hence the following blocks of code needed to preserve that order.
+                while (fPrioritySendMsg)
+                {
+                    // Check if anything is really in queue and pop the noderef. If we're empty then set the
+                    // priority flag to false. Do it here so we don't have to check at the end again and take a lock
+                    // twice.
+                    CNodeRef noderef;
+                    {
+                        LOCK(cs_prioritySendQ);
+                        if (!vPrioritySendQ.empty())
+                        {
+                            noderef = vPrioritySendQ.front();
+                            vPrioritySendQ.pop_front();
+                        }
+                        else
+                        {
+                            fPrioritySendMsg = false;
+                            break;
+                        }
+                    }
+
+                    // Send the first two messages in the send queue. We send two because
+                    // the first message may be a partial message and as a result may not be
+                    // a priority message; the priorty message may be the one behind this partial message.
+                    CNode *pfrom = noderef.get();
+                    if (pfrom != nullptr)
+                    {
+                        bool fEmpty = false;
+                        TRY_LOCK(pfrom->cs_vSend, lock_sendtwo);
+                        if (lock_sendtwo)
+                        {
+                            if (!pfrom->vSendMsg.empty())
+                            {
+                                bool fSendTwo = true;
+                                progress += SocketSendData(pfrom, fSendTwo);
+                            }
+                            else
+                                fEmpty = true;
+                        }
+
+                        if (!pfrom->fDisconnect && !lock_sendtwo)
+                        {
+                            // Only if we failed to lock, then push to the back of the queue an try later.
+                            //
+                            // NOTE: If priority messages failed to send or are not sent in their entirety then do "NOT"
+                            //       try again, just let the normal queuing take care of sending the rest. We don't want
+                            //       to start a possible infinite loop where a socket could be hung or network could
+                            //       be backed up. The remainder of the message is at the front of the queue so
+                            //       it will get sent (if it can) at some point.
+                            LOCK(cs_prioritySendQ);
+                            vPrioritySendQ.push_back(noderef);
+                            fPrioritySendMsg = true;
+                            break;
+                        }
+                        else if (fEmpty)
+                            break;
+                    }
+                }
+
+                // Send messages from this pnode's send queue
                 TRY_LOCK(pnode->cs_vSend, lockSend);
                 if (lockSend && sendShaper.try_leak(0))
                 {
@@ -1382,36 +1565,40 @@ void ThreadSocketHandler()
             }
 
             //
-            // Inactivity checking
+            // Inactivity checking every TIMEOUT_INTERVAL
             //
-            int64_t nTime = GetTime();
-            if (nTime - pnode->nTimeConnected > 60)
+            int64_t stopwatchTime = GetStopwatchMicros();
+            if (stopwatchTime - pnode->nStopwatchConnected > TIMEOUT_INTERVAL * 1000000)
             {
-                if (pnode->nLastRecv == 0 || pnode->nLastSend == 0)
+                pnode->nStopwatchConnected = GetTimeMicros();
+                if (ignoreNetTimeouts.Value() == false)
                 {
-                    LOG(NET, "Node %s socket no message in first 60 seconds, %d %d from %d\n", pnode->GetLogName(),
-                        pnode->nLastRecv != 0, pnode->nLastSend != 0, pnode->id);
-                    if (ignoreNetTimeouts.Value() == false)
+                    int64_t nTime = GetTime();
+                    if (pnode->nLastRecv == 0 || pnode->nLastSend == 0)
+                    {
+                        LOG(NET, "Node %s: no message sent or received after startup, %d %d from %d\n",
+                            pnode->GetLogName(), pnode->nLastRecv != 0, pnode->nLastSend != 0, pnode->id);
                         pnode->fDisconnect = true;
-                }
-                else if (nTime - pnode->nLastSend > TIMEOUT_INTERVAL)
-                {
-                    LOG(NET, "Node %s socket sending timeout: %is\n", pnode->GetLogName(), nTime - pnode->nLastSend);
-                    if (ignoreNetTimeouts.Value() == false)
+                    }
+                    else if (nTime - pnode->nLastSend > TIMEOUT_INTERVAL)
+                    {
+                        LOG(NET, "Node %s: socket sending timeout: %is\n", pnode->GetLogName(),
+                            nTime - pnode->nLastSend);
                         pnode->fDisconnect = true;
-                }
-                else if (nTime - pnode->nLastRecv > TIMEOUT_INTERVAL)
-                {
-                    LOG(NET, "Node %s socket receive timeout: %is\n", pnode->GetLogName(), nTime - pnode->nLastRecv);
-                    if (ignoreNetTimeouts.Value() == false)
+                    }
+                    else if (nTime - pnode->nLastRecv > TIMEOUT_INTERVAL)
+                    {
+                        LOG(NET, "Node %s: socket receive timeout: %is\n", pnode->GetLogName(),
+                            nTime - pnode->nLastRecv);
                         pnode->fDisconnect = true;
-                }
-                else if (pnode->nPingNonceSent && pnode->nPingUsecStart + TIMEOUT_INTERVAL * 1000000 < GetTimeMicros())
-                {
-                    LOG(NET, "Node %s ping timeout: %fs\n", pnode->GetLogName(),
-                        0.000001 * (GetTimeMicros() - pnode->nPingUsecStart));
-                    if (ignoreNetTimeouts.Value() == false)
+                    }
+                    else if (pnode->nPingNonceSent &&
+                             pnode->nPingUsecStart + (TIMEOUT_INTERVAL * 1000000) < (int64_t)GetStopwatchMicros())
+                    {
+                        LOG(NET, "Node %s: ping timeout: %fs\n", pnode->GetLogName(),
+                            0.000001 * (GetStopwatchMicros() - pnode->nPingUsecStart));
                         pnode->fDisconnect = true;
+                    }
                 }
             }
         }
@@ -1429,14 +1616,14 @@ void ThreadSocketHandler()
     }
 }
 
-
 #ifdef USE_UPNP
+static bool fShutdownUPnP = false;
 void ThreadMapPort()
 {
     std::string port = strprintf("%u", GetListenPort());
-    const char *multicastif = 0;
-    const char *minissdpdpath = 0;
-    struct UPNPDev *devlist = 0;
+    const char *multicastif = nullptr;
+    const char *minissdpdpath = nullptr;
+    struct UPNPDev *devlist = nullptr;
     char lanaddr[64];
 
 #ifndef UPNPDISCOVER_SUCCESS
@@ -1479,45 +1666,44 @@ void ThreadMapPort()
 
         string strDesc = "Bitcoin " + FormatFullVersion();
 
-        try
+        while (true)
         {
-            while (true)
-            {
 #ifndef UPNPDISCOVER_SUCCESS
-                /* miniupnpc 1.5 */
-                r = UPNP_AddPortMapping(urls.controlURL, data.first.servicetype, port.c_str(), port.c_str(), lanaddr,
-                    strDesc.c_str(), "TCP", 0);
+            /* miniupnpc 1.5 */
+            r = UPNP_AddPortMapping(urls.controlURL, data.first.servicetype, port.c_str(), port.c_str(), lanaddr,
+                strDesc.c_str(), "TCP", 0);
 #else
-                /* miniupnpc 1.6 */
-                r = UPNP_AddPortMapping(urls.controlURL, data.first.servicetype, port.c_str(), port.c_str(), lanaddr,
-                    strDesc.c_str(), "TCP", 0, "0");
+            /* miniupnpc 1.6 */
+            r = UPNP_AddPortMapping(urls.controlURL, data.first.servicetype, port.c_str(), port.c_str(), lanaddr,
+                strDesc.c_str(), "TCP", 0, "0");
 #endif
+            if (r != UPNPCOMMAND_SUCCESS)
+                LOGA("AddPortMapping(%s, %s, %s) failed with code %d (%s)\n", port, port, lanaddr, r, strupnperror(r));
+            else
+                LOGA("UPnP Port Mapping successful.\n");
 
-                if (r != UPNPCOMMAND_SUCCESS)
-                    LOGA("AddPortMapping(%s, %s, %s) failed with code %d (%s)\n", port, port, lanaddr, r,
-                        strupnperror(r));
-                else
-                    LOGA("UPnP Port Mapping successful.\n");
-                ;
-
-                MilliSleep(20 * 60 * 1000); // Refresh every 20 minutes
+            // Refresh every 20 minutes
+            for (int i = 1; i < 20 * 60; i++)
+            {
+                MilliSleep(1000);
+                if (ShutdownRequested() || fShutdownUPnP)
+                {
+                    LOGA("interrupt caught and deleting portmapping\n");
+                    r = UPNP_DeletePortMapping(urls.controlURL, data.first.servicetype, port.c_str(), "TCP", 0);
+                    LOGA("UPNP_DeletePortMapping() returned: %d\n", r);
+                    freeUPNPDevlist(devlist);
+                    devlist = nullptr;
+                    FreeUPNPUrls(&urls);
+                    return;
+                }
             }
-        }
-        catch (const boost::thread_interrupted &)
-        {
-            r = UPNP_DeletePortMapping(urls.controlURL, data.first.servicetype, port.c_str(), "TCP", 0);
-            LOGA("UPNP_DeletePortMapping() returned: %d\n", r);
-            freeUPNPDevlist(devlist);
-            devlist = 0;
-            FreeUPNPUrls(&urls);
-            throw;
         }
     }
     else
     {
         LOGA("No valid UPnP IGDs found\n");
         freeUPNPDevlist(devlist);
-        devlist = 0;
+        devlist = nullptr;
         if (r != 0)
             FreeUPNPUrls(&urls);
     }
@@ -1525,21 +1711,22 @@ void ThreadMapPort()
 
 void MapPort(bool fUseUPnP)
 {
-    static boost::thread *upnp_thread = nullptr;
+    static std::thread *upnp_thread = nullptr;
 
     if (fUseUPnP)
     {
         if (upnp_thread)
         {
-            upnp_thread->interrupt();
+            fShutdownUPnP = true;
             upnp_thread->join();
             delete upnp_thread;
         }
-        upnp_thread = new boost::thread(boost::bind(&TraceThread<void (*)()>, "upnp", &ThreadMapPort));
+        fShutdownUPnP = false;
+        upnp_thread = new std::thread(std::bind(&TraceThread<void (*)()>, "upnp", &ThreadMapPort));
     }
     else if (upnp_thread)
     {
-        upnp_thread->interrupt();
+        fShutdownUPnP = true;
         upnp_thread->join();
         delete upnp_thread;
         upnp_thread = nullptr;
@@ -1569,7 +1756,12 @@ static void DNSAddressSeed()
     // goal: only query DNS seeds if address need is acute
     if ((addrman.size() > 0) && (!GetBoolArg("-forcednsseed", DEFAULT_FORCEDNSSEED)))
     {
-        MilliSleep(11 * 1000);
+        for (int j = 0; j < 22; j++)
+        {
+            MilliSleep(500);
+            if (shutdown_threads.load() == true)
+                return;
+        }
 
         LOCK(cs_vNodes);
         if (vNodes.size() >= 2)
@@ -1743,8 +1935,38 @@ void DumpData(int64_t seconds_between_runs)
                 break;
             }
             std::this_thread::sleep_for(std::chrono::seconds(2));
+            nStart = GetTime();
         }
         _DumpData();
+    }
+}
+
+void UpdateMisbehaviorPoints(int64_t seconds_between_runs)
+{
+    // Update all misbehaviors
+    while (shutdown_threads.load() == false)
+    {
+        // this has the potential to be a long sleep. so do it in chunks incase of node shutdown
+        int64_t nStart = GetTime();
+        int64_t nEnd = nStart + seconds_between_runs;
+        while (nStart < nEnd)
+        {
+            if (shutdown_threads.load() == true)
+            {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            nStart = GetTime();
+        }
+
+        // Update each peers misbehavior
+        {
+            LOCK(cs_vNodes);
+            for (auto pnode : vNodes)
+            {
+                dosMan.UpdateMisbehavior(pnode);
+            }
+        }
     }
 }
 
@@ -1802,10 +2024,10 @@ void ThreadOpenConnections()
     // is intended as "only make outbound connections to the configured nodes".
 
     // Initiate network connections
-    int64_t nStart = GetTime();
+    int64_t nStart = GetStopwatchMicros();
     unsigned int nDisconnects = 0;
     // Minimum time before next feeler connection (in microseconds).
-    int64_t nNextFeeler = PoissonNextSend(nStart * 1000 * 1000, FEELER_INTERVAL);
+    int64_t nNextFeeler = PoissonNextSend(nStart, FEELER_INTERVAL);
 
     while (shutdown_threads.load() == false)
     {
@@ -1845,33 +2067,35 @@ void ThreadOpenConnections()
             }
             // Disconnect a node that is not XTHIN capable if all outbound slots are full and we
             // have not yet connected to enough XTHIN nodes.
-            nMinXthinNodes = GetArg("-min-xthin-nodes", MIN_XTHIN_NODES);
-            if (nOutbound >= nMaxOutConnections && nThinBlockCapable <= min(nMinXthinNodes, nMaxOutConnections) &&
-                nDisconnects < MAX_DISCONNECTS && IsThinBlocksEnabled() && IsChainNearlySyncd())
+            if (!fReindex)
             {
-                if (pNonXthinNode != nullptr)
+                nMinXthinNodes = GetArg("-min-xthin-nodes", MIN_XTHIN_NODES);
+                if (nOutbound >= nMaxOutConnections && nThinBlockCapable <= min(nMinXthinNodes, nMaxOutConnections) &&
+                    nDisconnects < MAX_DISCONNECTS && IsThinBlocksEnabled() && IsChainNearlySyncd())
                 {
-                    pNonXthinNode->fDisconnect = true;
-                    fDisconnected = true;
-                    nDisconnects++;
+                    if (pNonXthinNode != nullptr)
+                    {
+                        pNonXthinNode->fDisconnect = true;
+                        fDisconnected = true;
+                        nDisconnects++;
+                    }
+                }
+                else if (IsInitialBlockDownload())
+                {
+                    if (pNonNodeNetwork != nullptr)
+                    {
+                        pNonNodeNetwork->fDisconnect = true;
+                        fDisconnected = true;
+                        nDisconnects++;
+                    }
                 }
             }
-            else if (IsInitialBlockDownload())
-            {
-                if (pNonNodeNetwork != nullptr)
-                {
-                    pNonNodeNetwork->fDisconnect = true;
-                    fDisconnected = true;
-                    nDisconnects++;
-                }
-            }
-
             // In the event that outbound nodes restart or drop off the network over time we need to
             // replenish the number of disconnects allowed once per day.
-            if (GetTime() - nStart > 86400)
+            if (GetStopwatchMicros() - nStart > 86400UL * 1000000UL)
             {
                 nDisconnects = 0;
-                nStart = GetTime();
+                nStart = GetStopwatchMicros();
             }
         }
 
@@ -1907,7 +2131,8 @@ void ThreadOpenConnections()
             // If the try_wait() fails, meaning all grants are currently in use, then we wait for one minute
             // to check again whether we should disconnect any nodes.  We don't have to check this too often
             // as this is most relevant during IBD.
-            MilliSleep(60000);
+            for (auto j = 0; (j < 120) && (shutdown_threads.load() == false); j++)
+                MilliSleep(500);
             continue;
         }
         if (shutdown_threads.load() == true)
@@ -1948,7 +2173,7 @@ void ThreadOpenConnections()
         bool fFeeler = false;
         if (nOutbound >= nMaxOutConnections)
         {
-            int64_t nTime = GetTimeMicros(); // The current time right now (in microseconds).
+            int64_t nTime = GetStopwatchMicros(); // The current time right now (in microseconds).
             if (nTime > nNextFeeler)
             {
                 nNextFeeler = PoissonNextSend(nTime, FEELER_INTERVAL);
@@ -2033,7 +2258,12 @@ void ThreadOpenAddedConnections()
     // BU: This intial sleep fixes a timing issue where a remote peer may be trying to connect using addnode
     //     at the same time this thread is starting up causing both an outbound and an inbound -addnode connection
     //     to be possible, when it should not be.
-    MilliSleep(15000);
+    for (int j = 0; j < 30; j++)
+    {
+        MilliSleep(500);
+        if (shutdown_threads.load() == true)
+            return;
+    }
 
     // BU: we need our own separate semaphore for -addnodes otherwise we won't be able to reconnect
     //     after a remote node restarts, becuase all the outgoing connection slots will already be filled.
@@ -2072,7 +2302,12 @@ void ThreadOpenAddedConnections()
             }
             // Retry every 15 seconds.  It is important to check often to make sure the Xpedited Relay network
             // nodes reconnect quickly after the remote peers restart
-            MilliSleep(15000);
+            for (int j = 0; j < 30; j++)
+            {
+                MilliSleep(500);
+                if (shutdown_threads.load() == true)
+                    return;
+            }
         }
     }
 
@@ -2138,11 +2373,11 @@ void ThreadOpenAddedConnections()
         }
         // Retry every 15 seconds.  It is important to check often to make sure the Xpedited Relay network
         // nodes reconnect quickly after the remote peers restart
-        MilliSleep(15000);
-
-        if (shutdown_threads.load() == true)
+        for (int j = 0; j < 30; j++)
         {
-            return;
+            MilliSleep(500);
+            if (shutdown_threads.load() == true)
+                return;
         }
     }
 }
@@ -2205,15 +2440,17 @@ static bool threadProcessMessages(CNode *pnode)
     // Discover if there's more work to be done
     if (pnode->nSendSize < SendBufferSize())
     {
-        { // If already locked some other thread is working on it, so no work for this thread
+        {
+            // If already locked some other thread is working on it, so no work for this thread
             TRY_LOCK(pnode->csRecvGetData, lockRecv);
             if (lockRecv && (!pnode->vRecvGetData.empty()))
                 fSleep = false;
         }
         if (fSleep)
-        { // If already locked some other thread is working on it, so no work for this thread
+        {
+            // If already locked some other thread is working on it, so no work for this thread
             TRY_LOCK(pnode->cs_vRecvMsg, lockRecv);
-            if (lockRecv && (!pnode->vRecvMsg.empty() && pnode->vRecvMsg[0].complete()))
+            if (lockRecv && (!pnode->vRecvMsg.empty() || fPriorityRecvMsg.load()))
                 fSleep = false;
         }
     }
@@ -2222,11 +2459,30 @@ static bool threadProcessMessages(CNode *pnode)
 
 void ThreadMessageHandler()
 {
-    boost::mutex condition_mutex;
-    boost::unique_lock<boost::mutex> lock(condition_mutex);
-
     while (shutdown_threads.load() == false)
     {
+        // Start or Stop threads as determined by the numMsgHandlerThreads tweak
+        {
+            static CCriticalSection cs_threads;
+            static uint32_t numThreads GUARDED_BY(cs_threads) = numMsgHandlerThreads.Value();
+            LOCK(cs_threads);
+            if (numMsgHandlerThreads.Value() >= 1 && numThreads > numMsgHandlerThreads.Value())
+            {
+                // Kill this thread
+                numThreads--;
+                LOGA("Stopping a message handler thread: Current handler threads are %d\n", numThreads);
+
+                return;
+            }
+            else if (numThreads < numMsgHandlerThreads.Value())
+            {
+                // Launch another thread
+                numThreads++;
+                threadGroup.create_thread(&ThreadMessageHandler);
+                LOGA("Starting a new message handler thread: Current handler threads are %d\n", numThreads);
+            }
+        }
+
         vector<CNode *> vNodesCopy;
         {
             // We require the vNodes lock here, throughout, even though we are only incrementing
@@ -2254,12 +2510,20 @@ void ThreadMessageHandler()
 
         bool fSleep = true;
 
+        if (((GetStopwatchMicros() - lastMempoolSync) > MEMPOOLSYNC_FREQ_US) && vNodesCopy.size() > 0)
+        {
+            // select node from whom to request mempool sync
+            CNode *syncPeer = SelectMempoolSyncPeer(vNodesCopy);
+            if (syncPeer && IsChainNearlySyncd())
+                requester.RequestMempoolSync(syncPeer);
+        }
+
         for (CNode *pnode : vNodesCopy)
         {
             if (pnode->fDisconnect)
                 continue;
 
-            if (pnode->successfullyConnected())
+            if (pnode->fSuccessfullyConnected)
             {
                 // parallel processing
                 fSleep &= threadProcessMessages(pnode);
@@ -2273,12 +2537,12 @@ void ThreadMessageHandler()
             }
             if (shutdown_threads.load() == true)
             {
-                return;
+                break; // skip down to where we release the node refs
             }
 
             // Put transaction and block requests into the request manager
             // and all other requests into the send queue.
-            if (pnode->successfullyConnected())
+            if (pnode->fSuccessfullyConnected)
             {
                 // parallel processing
                 g_signals.SendMessages(pnode);
@@ -2292,13 +2556,14 @@ void ThreadMessageHandler()
             }
             if (shutdown_threads.load() == true)
             {
-                return;
+                break; // skip down to where we release the node refs
             }
         }
 
         // From the request manager, make requests for transactions and blocks. We do this before potentially
         // sleeping in the step below so as to allow requests to return during the sleep time.
-        requester.SendRequests();
+        if (shutdown_threads.load() == false)
+            requester.SendRequests();
 
         // A cs_vNodes lock is not required here when releasing refs for two reasons: one, this only decrements
         // an atomic counter, and two, the counter will always be > 0 at this point, so we don't have to worry
@@ -2310,8 +2575,8 @@ void ThreadMessageHandler()
 
         if (fSleep)
         {
-            messageHandlerCondition.timed_wait(
-                lock, boost::posix_time::microsec_clock::universal_time() + boost::posix_time::milliseconds(50));
+            std::unique_lock<std::mutex> lock(wakeableDelayMutex);
+            messageHandlerCondition.wait_until(lock, std::chrono::steady_clock::now() + std::chrono::milliseconds(10));
         }
     }
 }
@@ -2422,7 +2687,7 @@ bool BindListenPort(const CService &addrBind, string &strError, bool fWhiteliste
     return true;
 }
 
-void static Discover(thread_group &threadGroup)
+void static Discover()
 {
     if (!fDiscover)
         return;
@@ -2477,7 +2742,7 @@ void static Discover(thread_group &threadGroup)
 #endif
 }
 
-void StartNode(thread_group &threadGroup)
+void StartNode()
 {
     uiInterface.InitMessage(_("Loading addresses..."));
     // Load addresses from peers.dat
@@ -2522,7 +2787,7 @@ void StartNode(thread_group &threadGroup)
     if (pnodeLocalHost == nullptr)
         pnodeLocalHost = new CNode(INVALID_SOCKET, CAddress(CService("127.0.0.1", 0), nLocalServices));
 
-    Discover(threadGroup);
+    Discover();
 
     //
     // Start threads
@@ -2550,6 +2815,9 @@ void StartNode(thread_group &threadGroup)
 
     // Dump network addresses
     threadGroup.create_thread(&DumpData, DUMP_ADDRESSES_INTERVAL);
+
+    // Update peer misbehavior points
+    threadGroup.create_thread(&UpdateMisbehaviorPoints, UPDATE_MISBEHAVIOR_INTERVAL);
 }
 
 bool StopNode()
@@ -2571,48 +2839,84 @@ bool StopNode()
 
 void NetCleanup()
 {
-    LOCK(cs_vNodes);
-
-    // Close sockets
-    for (CNode *pnode : vNodes)
-    {
-        if (pnode->hSocket != INVALID_SOCKET)
-            CloseSocket(pnode->hSocket);
-    }
-    for (ListenSocket &hListenSocket : vhListenSocket)
-    {
-        if (hListenSocket.socket != INVALID_SOCKET)
-            if (!CloseSocket(hListenSocket.socket))
-                LOG(NET, "CloseSocket(hListenSocket) failed with error %s\n", NetworkErrorString(WSAGetLastError()));
-    }
-
     // clean up some globals (to help leak detection)
-    for (CNode *pnode : vNodes)
-        delete pnode;
-    for (CNode *pnode : vNodesDisconnected)
-        delete pnode;
-    vNodes.clear();
-    vNodesDisconnected.clear();
-    vhListenSocket.clear();
-    if (semOutbound)
-        delete semOutbound;
-    semOutbound = nullptr;
-    // BU: clean up the "-addnode" semaphore
-    if (semOutboundAddNode)
-        delete semOutboundAddNode;
-    semOutboundAddNode = nullptr;
-    if (pnodeLocalHost)
-        delete pnodeLocalHost;
-    pnodeLocalHost = nullptr;
+    {
+        LOCK(cs_vNodes);
+
+        // Close sockets
+        for (CNode *pnode : vNodes)
+        {
+            // Since we are quitting, disconnect abruptly from the node rather than finishing up our conversation
+            // with it.
+            {
+                LOCK(pnode->cs_vRecvMsg);
+                pnode->vRecvMsg.clear();
+                pnode->vRecvMsg_handshake.clear();
+            }
+            {
+                LOCK(pnode->cs_vSend);
+                pnode->ssSend.clear();
+            }
+            pnode->nSendSize.store(0);
+            // Now close communications with the other node
+            pnode->CloseSocketDisconnect();
+        }
+        for (ListenSocket &hListenSocket : vhListenSocket)
+        {
+            if (hListenSocket.socket != INVALID_SOCKET)
+                if (!CloseSocket(hListenSocket.socket))
+                    LOG(NET, "CloseSocket(hListenSocket) failed with error %s\n",
+                        NetworkErrorString(WSAGetLastError()));
+        }
+    }
+
+    // Try to let nodes be cleaned up for a while, but ultimately give up because we are shutting down.
+    for (int iters = 0; iters < 20; iters++)
+    {
+        CleanupDisconnectedNodes();
+        {
+            LOCK2(cs_vNodes, cs_vNodesDisconnected);
+            if ((vNodes.size() == 0) && (vNodesDisconnected.size() == 0))
+                break; // every node is properly disconnected
+        }
+        MilliSleep(100); // Give other threads a chance to finish up using the node.
+    }
+
+
+    {
+        LOCK2(cs_vNodes, cs_vNodesDisconnected);
+        if (!((vNodes.size() == 0) && (vNodesDisconnected.size() == 0)))
+        {
+            LOG(NET, "Some node objects were not properly cleaned up.\n");
+        }
+
+        // If the nodes were not properly shut down, remove them from the vNodes list now, so the vNode item
+        // is not leaked.
+        // The node memory itself will be leaked but since we are quitting this is not a big issue.
+        // We cannot just delete them because some other thread still has a reference.
+        vNodes.clear();
+        vNodesDisconnected.clear();
+        vhListenSocket.clear();
+        if (semOutbound)
+            delete semOutbound;
+        semOutbound = nullptr;
+        // BU: clean up the "-addnode" semaphore
+        if (semOutboundAddNode)
+            delete semOutboundAddNode;
+        semOutboundAddNode = nullptr;
+        if (pnodeLocalHost)
+            delete pnodeLocalHost;
+        pnodeLocalHost = nullptr;
 
 #ifdef WIN32
-    // Shutdown Windows Sockets
-    WSACleanup();
+        // Shutdown Windows Sockets
+        WSACleanup();
 #endif
+    }
 }
 
 
-void RelayTransaction(const CTransactionRef &ptx, const bool fRespend)
+void RelayTransaction(const CTransactionRef ptx, const CTxProperties *txProperties)
 {
     if (ptx->GetTxSize() > maxTxSize.Value())
     {
@@ -2635,24 +2939,35 @@ void RelayTransaction(const CTransactionRef &ptx, const bool fRespend)
         mapRelay.insert(std::make_pair(inv, ptx));
         vRelayExpiration.push_back(std::make_pair(GetTime() + 15 * 60, inv));
     }
+
     LOCK(cs_vNodes);
     for (CNode *pnode : vNodes)
     {
         if (!pnode->fRelayTxes)
+        {
             continue;
+        }
+        // If the transaction won't be acceptable to the target node, then don't send it.  This avoids poisoning
+        // the node against this tx (via the node's alreadyHave() logic), so that it can be sent later.
+        if (txProperties && (!pnode->IsTxAcceptable(*txProperties)))
+        {
+            continue;
+        }
 
         LOCK(pnode->cs_filter);
         // If the bloom filter is not empty then a peer must have sent us a filter
         // and we can assume this node is an SPV node.
         if (pnode->pfilter && !pnode->pfilter->IsEmpty())
         {
-            // Relaying double spends to SPV clients is an easy attack vector,
-            // and therefore only relay txns that are not potential double spends.
-            if (!fRespend && pnode->pfilter->IsRelevantAndUpdate(ptx))
+            if (pnode->pfilter->IsRelevantAndUpdate(ptx))
+            {
                 pnode->PushInventory(inv);
+            }
         }
         else
+        {
             pnode->PushInventory(inv);
+        }
     }
 }
 
@@ -2741,7 +3056,8 @@ uint64_t CNode::GetTotalBytesRecv() { return nTotalBytesRecv; }
 uint64_t CNode::GetTotalBytesSent() { return nTotalBytesSent; }
 void CNode::Fuzz(int nChance)
 {
-    if (!successfullyConnected())
+    AssertLockHeld(cs_vSend);
+    if (!fSuccessfullyConnected)
         return; // Don't fuzz initial handshake
     if (GetRand(nChance) != 0)
         return; // Fuzz 1 of every nChance messages
@@ -2891,23 +3207,20 @@ bool CAddrDB::Read(CAddrMan &addr, CDataStream &ssPeers)
 unsigned int ReceiveFloodSize() { return 1000 * GetArg("-maxreceivebuffer", DEFAULT_MAXRECEIVEBUFFER); }
 unsigned int SendBufferSize() { return 1000 * GetArg("-maxsendbuffer", DEFAULT_MAXSENDBUFFER); }
 CNode::CNode(SOCKET hSocketIn, const CAddress &addrIn, const std::string &addrNameIn, bool fInboundIn)
-    : ssSend(SER_NETWORK, INIT_PROTO_VERSION), skipChecksum(false), id(connmgr->NextNodeId()), addrKnown(5000, 0.001)
+    : xVersionEnabled(false), skipChecksum(false), ssSend(SER_NETWORK, INIT_PROTO_VERSION), id(connmgr->NextNodeId()),
+      addrKnown(5000, 0.001)
 {
     nServices = 0;
     hSocket = hSocketIn;
     nRecvVersion = INIT_PROTO_VERSION;
-    nLastSend = 0;
-    nLastRecv = 0;
     nSendBytes = 0;
     nRecvBytes = 0;
-    nActivityBytes = 0; // BU connection slot exhaustion mitigation
     nTimeConnected = GetTime();
+    nStopwatchConnected = GetStopwatchMicros();
     nTimeOffset = 0;
     addr = addrIn;
     addrName = addrNameIn == "" ? addr.ToStringIPPort() : addrNameIn;
     nVersion = 0;
-    state_incoming = ConnectionStateIncoming::CONNECTED_WAIT_VERSION;
-    state_outgoing = ConnectionStateOutgoing::CONNECTED;
     strSubVer = "";
     fWhitelisted = false;
     fOneShot = false;
@@ -2918,6 +3231,7 @@ CNode::CNode(SOCKET hSocketIn, const CAddress &addrIn, const std::string &addrNa
     fAutoOutbound = false;
     fNetworkNode = false;
     tVersionSent = -1;
+    fSuccessfullyConnected = false;
     fDisconnect = false;
     fDisconnectRequest = false;
     nRefCount = 0;
@@ -2940,14 +3254,15 @@ CNode::CNode(SOCKET hSocketIn, const CAddress &addrIn, const std::string &addrNa
     fPingQueued = false;
     nMinPingUsecTime = std::numeric_limits<int64_t>::max();
 
+    msg = CNetMessage(GetMagic(Params()), SER_NETWORK, nRecvVersion);
+
     // xthinblocks
     nXthinBloomfilterSize = 0;
     addrFromPort = 0;
 
     // graphene
-    nLocalGrapheneBlockBytes = 0;
-    nSizeGrapheneBlock = 0;
-    grapheneBlockWaitingForTxns = -1;
+    gr_shorttxidk0 = 0;
+    gr_shorttxidk1 = 0;
 
     // compact blocks
     shorttxidk0 = 0;
@@ -2956,10 +3271,6 @@ CNode::CNode(SOCKET hSocketIn, const CAddress &addrIn, const std::string &addrNa
     // performance tracking
     nAvgBlkResponseTime = -1.0;
     nMaxBlocksInTransit = 16;
-
-    // for misbehavior
-    nMisbehavior = 0;
-    fShouldBan = false;
 
     // For statistics only, BU doesn't support CB protocol
     fSupportsCompactBlocks = false;
@@ -3019,9 +3330,6 @@ CNode::~CNode()
         }
     }
 
-    grapheneBlockWaitingForTxns = -1;
-    grapheneBlock.SetNull();
-
     // We must set this to false on disconnect otherwise we will have trouble reconnecting -addnode nodes
     // if the remote peer restarts.
     fAutoOutbound = false;
@@ -3029,8 +3337,11 @@ CNode::~CNode()
     addrFromPort = 0;
 
     // Update addrman timestamp
-    if (nMisbehavior == 0 && successfullyConnected())
+    if (nMisbehavior == 0 && fSuccessfullyConnected)
         addrman.Connected(addr);
+
+    // Decrement thintype peer counters
+    thinrelay.RemovePeers(this);
 
     GetNodeSignals().FinalizeNode(GetId());
 }
@@ -3099,31 +3410,37 @@ void CNode::EndMessage() UNLOCK_FUNCTION(cs_vSend)
         strcmp(strCommand, NetMsgType::ADDR) != 0 && strcmp(strCommand, NetMsgType::VERSION) != 0 &&
         strcmp(strCommand, NetMsgType::VERACK) != 0 && strcmp(strCommand, NetMsgType::INV) != 0)
     {
-        nActivityBytes += nSize;
+        nActivityBytes.fetch_add(nSize);
+    }
 
-        // If the message is a priority message then move to the front of the deque
-        if (strcmp(strCommand, NetMsgType::GET_XTHIN) == 0 || strcmp(strCommand, NetMsgType::XTHINBLOCK) == 0 ||
-            strcmp(strCommand, NetMsgType::GET_THIN) == 0 || strcmp(strCommand, NetMsgType::THINBLOCK) == 0 ||
-            strcmp(strCommand, NetMsgType::XBLOCKTX) == 0 || strcmp(strCommand, NetMsgType::GET_XBLOCKTX) == 0 ||
-            strcmp(strCommand, NetMsgType::GET_GRAPHENE) == 0 || strcmp(strCommand, NetMsgType::GRAPHENEBLOCK) == 0 ||
-            strcmp(strCommand, NetMsgType::GRAPHENETX) == 0 || strcmp(strCommand, NetMsgType::GET_GRAPHENETX) == 0)
-        {
-            it = vSendMsg.insert(vSendMsg.begin(), CSerializeData());
-            LOG(THIN, "Send Queue: pushed %s to the front of the queue\n", strCommand);
-        }
-        else
-            it = vSendMsg.insert(vSendMsg.end(), CSerializeData());
+    // If the message is a priority message then move it to priority queue.
+    if (IsPriorityMsg(strCommand))
+    {
+        it = vSendMsg.insert(vSendMsg.end(), CSerializeData());
+        ssSend.GetAndClear(*it);
+        nSendSize.fetch_add((*it).size());
+        LOG(PRIORITYQ, "Send Queue: pushed %s to the priority queue, peer(%d)\n", strCommand, this->GetId());
+
+        LOCK(cs_prioritySendQ);
+        vPrioritySendQ.push_back(CNodeRef(this));
+        fPrioritySendMsg = true;
     }
     else
-        it = vSendMsg.insert(vSendMsg.end(), CSerializeData());
-    // BU: end
+    {
+        it = vLowPrioritySendMsg.insert(vLowPrioritySendMsg.end(), CSerializeData());
+        ssSend.GetAndClear(*it);
+        nSendSize.fetch_add((*it).size());
+    }
 
-    ssSend.GetAndClear(*it);
-    nSendSize.fetch_add((*it).size());
-
-    // If write queue empty, attempt "optimistic write"
-    if (it == vSendMsg.begin())
+    // if only 1 message is in queue then attempt and "optimistic" send
+    if (vSendMsg.size() == 1)
+    {
         SocketSendData(this);
+    }
+    else if (vSendMsg.empty() && (vLowPrioritySendMsg.size() == 1))
+    {
+        SocketSendData(this);
+    }
 
     LEAVE_CRITICAL_SECTION(cs_vSend);
 }
@@ -3147,13 +3464,103 @@ void CNode::DisconnectIfBanned()
         }
         else if (addr.IsLocal())
         {
+            nMisbehavior.store(0);
+            nBanType.store(-1);
             LOGA("Warning: not banning local peer %s!\n", GetLogName());
         }
         else
         {
             fDisconnect = true;
-            dosMan.Ban(addr, BanReasonNodeMisbehaving);
+            dosMan.Ban(addr, cleanSubVer, (BanReason)nBanType.load());
         }
+    }
+}
+
+void CNode::ReadConfigFromXVersion_OLD()
+{
+    xVersionEnabled = true;
+    LOCK(cs_xversion);
+    skipChecksum = (xVersion.as_u64c(XVer::BU_MSG_IGNORE_CHECKSUM_OLD) == 1);
+    if (addrFromPort == 0)
+    {
+        addrFromPort = xVersion.as_u64c(XVer::BU_LISTEN_PORT_OLD) & 0xffff;
+    }
+
+    uint64_t num = xVersion.as_u64c(XVer::BU_MEMPOOL_ANCESTOR_COUNT_LIMIT_OLD);
+    if (num)
+        nLimitAncestorCount = num; // num == 0 means the field was not provided.
+    num = xVersion.as_u64c(XVer::BU_MEMPOOL_ANCESTOR_SIZE_LIMIT_OLD);
+    if (num)
+        nLimitAncestorSize = num;
+
+    num = xVersion.as_u64c(XVer::BU_MEMPOOL_DESCENDANT_COUNT_LIMIT_OLD);
+    if (num)
+        nLimitDescendantCount = num;
+    num = xVersion.as_u64c(XVer::BU_MEMPOOL_DESCENDANT_SIZE_LIMIT_OLD);
+    if (num)
+        nLimitDescendantSize = num;
+
+    canSyncMempoolWithPeers = (xVersion.as_u64c(XVer::BU_MEMPOOL_SYNC_OLD) == 1);
+    nMempoolSyncMinVersionSupported = xVersion.as_u64c(XVer::BU_MEMPOOL_SYNC_MIN_VERSION_SUPPORTED_OLD);
+    nMempoolSyncMaxVersionSupported = xVersion.as_u64c(XVer::BU_MEMPOOL_SYNC_MAX_VERSION_SUPPORTED_OLD);
+    txConcat = xVersion.as_u64c(XVer::BU_TXN_CONCATENATION_OLD);
+    minGrapheneVersion = xVersion.as_u64c(XVer::BU_GRAPHENE_MIN_VERSION_SUPPORTED_OLD);
+    maxGrapheneVersion = xVersion.as_u64c(XVer::BU_GRAPHENE_MAX_VERSION_SUPPORTED_OLD);
+
+    {
+        uint64_t selfMax = grapheneMaxVersionSupported.Value();
+        uint64_t selfMin = grapheneMinVersionSupported.Value();
+
+        uint64_t upper = (uint64_t)std::min(maxGrapheneVersion, selfMax);
+        uint64_t lower = (uint64_t)std::max(minGrapheneVersion, selfMin);
+        if (lower > upper)
+            negotiatedGrapheneVersion = GRAPHENE_NO_VERSION_SUPPORTED;
+        else
+            negotiatedGrapheneVersion = upper;
+    }
+}
+
+void CNode::ReadConfigFromXVersion()
+{
+    xVersionEnabled = true;
+    LOCK(cs_xversion);
+    skipChecksum = (xVersion.as_u64c(XVer::BU_MSG_IGNORE_CHECKSUM) == 1);
+    if (addrFromPort == 0)
+    {
+        addrFromPort = xVersion.as_u64c(XVer::BU_LISTEN_PORT) & 0xffff;
+    }
+
+    uint64_t num = xVersion.as_u64c(XVer::BU_MEMPOOL_ANCESTOR_COUNT_LIMIT);
+    if (num)
+        nLimitAncestorCount = num; // num == 0 means the field was not provided.
+    num = xVersion.as_u64c(XVer::BU_MEMPOOL_ANCESTOR_SIZE_LIMIT);
+    if (num)
+        nLimitAncestorSize = num;
+
+    num = xVersion.as_u64c(XVer::BU_MEMPOOL_DESCENDANT_COUNT_LIMIT);
+    if (num)
+        nLimitDescendantCount = num;
+    num = xVersion.as_u64c(XVer::BU_MEMPOOL_DESCENDANT_SIZE_LIMIT);
+    if (num)
+        nLimitDescendantSize = num;
+
+    canSyncMempoolWithPeers = (xVersion.as_u64c(XVer::BU_MEMPOOL_SYNC) == 1);
+    nMempoolSyncMinVersionSupported = xVersion.as_u64c(XVer::BU_MEMPOOL_SYNC_MIN_VERSION_SUPPORTED);
+    nMempoolSyncMaxVersionSupported = xVersion.as_u64c(XVer::BU_MEMPOOL_SYNC_MAX_VERSION_SUPPORTED);
+    txConcat = xVersion.as_u64c(XVer::BU_TXN_CONCATENATION);
+    minGrapheneVersion = xVersion.as_u64c(XVer::BU_GRAPHENE_MIN_VERSION_SUPPORTED);
+    maxGrapheneVersion = xVersion.as_u64c(XVer::BU_GRAPHENE_MAX_VERSION_SUPPORTED);
+
+    {
+        uint64_t selfMax = grapheneMaxVersionSupported.Value();
+        uint64_t selfMin = grapheneMinVersionSupported.Value();
+
+        uint64_t upper = (uint64_t)std::min(maxGrapheneVersion, selfMax);
+        uint64_t lower = (uint64_t)std::max(minGrapheneVersion, selfMin);
+        if (lower > upper)
+            negotiatedGrapheneVersion = GRAPHENE_NO_VERSION_SUPPORTED;
+        else
+            negotiatedGrapheneVersion = upper;
     }
 }
 

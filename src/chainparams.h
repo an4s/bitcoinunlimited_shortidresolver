@@ -14,6 +14,29 @@
 
 #include <vector>
 
+/** Default for -minrelaytxfee, minimum relay fee for transactions */
+static const unsigned int DEFAULT_MIN_RELAY_TX_FEE = 1000;
+//! -maxtxfee default
+static const CAmount DEFAULT_TRANSACTION_MAXFEE = 0.1 * COIN;
+//! Discourage users to set fees higher than this amount (in satoshis) per kB
+static const CAmount HIGH_TX_FEE_PER_KB = 0.01 * COIN;
+//! -maxtxfee will warn if called with a higher fee than this amount (in satoshis)
+static const CAmount HIGH_MAX_TX_FEE = 100 * HIGH_TX_FEE_PER_KB;
+/** Default for -maxorphantx, maximum number of orphan transactions kept in memory.
+ *  A high default is chosen which allows for about 1/10 of the default mempool to
+ *  be kept as orphans, assuming 250 byte transactions.  We are essentially disabling
+ *  the limiting or orphan transactions by number and using orphan pool bytes as
+ *  the limiting factor, while at the same time allowing node operators to
+ *  limit by number if transactions if they wish by modifying -maxorphantx=<n> if
+ *  the have a need to.
+ */
+static const unsigned int DEFAULT_MAX_ORPHAN_TRANSACTIONS = 1000000;
+/** Default for -mempoolexpiry, expiration time for mempool transactions in hours */
+static const unsigned int DEFAULT_MEMPOOL_EXPIRY = 72;
+/** Default for -orphanpoolexpiry, expiration time for orphan pool transactions in hours */
+static const unsigned int DEFAULT_ORPHANPOOL_EXPIRY = 15;
+
+
 struct CDNSSeedData
 {
     std::string name, host;
@@ -94,7 +117,6 @@ public:
     const std::string &CashAddrPrefix() const { return cashaddrPrefix; }
     const std::vector<SeedSpec6> &FixedSeeds() const { return vFixedSeeds; }
     const CCheckpointData &Checkpoints() const { return checkpointData; }
-    CCheckpointData &ModifiableCheckpoints() { return checkpointData; }
 protected:
     CChainParams() {}
     Consensus::Params consensus;

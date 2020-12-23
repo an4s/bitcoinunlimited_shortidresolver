@@ -19,6 +19,12 @@ static const CAmount CENT = 1000000;
 
 extern const std::string CURRENCY_UNIT;
 
+enum
+{
+    //! Minimum # of bytes to generate and spend a UTXO. 34 for the output, 148 for the input. Used in dust calculation
+    TYPICAL_UTXO_LIFECYCLE_SIZE = 148 + 34,
+};
+
 /** No amount larger than this (in satoshi) is valid.
  *
  * Note that this constant is *not* the total money supply, which in Bitcoin
@@ -39,11 +45,20 @@ private:
     CAmount nSatoshisPerK; // unit is satoshis-per-1,000-bytes
 public:
     CFeeRate() : nSatoshisPerK(0) {}
-    explicit CFeeRate(const CAmount &_nSatoshisPerK) : nSatoshisPerK(_nSatoshisPerK) {}
+    explicit CFeeRate(const CAmount _nSatoshisPerK) : nSatoshisPerK(_nSatoshisPerK) {}
     CFeeRate(const CAmount &nFeePaid, size_t nSize);
     CFeeRate(const CFeeRate &other) { nSatoshisPerK = other.nSatoshisPerK; }
+    CFeeRate &operator=(const CFeeRate other)
+    {
+        nSatoshisPerK = other.nSatoshisPerK;
+        return *this;
+    }
     CAmount GetFee(size_t size) const; // unit returned is satoshis
     CAmount GetFeePerK() const { return GetFee(1000); } // satoshis-per-1000-bytes
+    /** Dust is too small to be spendable.  It is either set via the txDust tweak or proportional to the cost to
+        spend an output. */
+    CAmount GetDust() const;
+
     friend bool operator<(const CFeeRate &a, const CFeeRate &b) { return a.nSatoshisPerK < b.nSatoshisPerK; }
     friend bool operator>(const CFeeRate &a, const CFeeRate &b) { return a.nSatoshisPerK > b.nSatoshisPerK; }
     friend bool operator==(const CFeeRate &a, const CFeeRate &b) { return a.nSatoshisPerK == b.nSatoshisPerK; }
@@ -64,5 +79,8 @@ public:
         READWRITE(nSatoshisPerK);
     }
 };
+
+/** A fee rate smaller than this is considered zero fee (for relaying, mining and transaction creation) */
+extern CFeeRate minRelayTxFee;
 
 #endif //  BITCOIN_AMOUNT_H

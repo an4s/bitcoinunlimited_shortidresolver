@@ -14,7 +14,7 @@
 - (NSString *)__bundleIdentifier
 {
     if (self == [NSBundle mainBundle]) {
-        return @"org.bitcoinfoundation.Bitcoin-Qt";
+        return @"org.bitcoinunlimited.BCHUnlimited-Qt";
     } else {
         return [self __bundleIdentifier];
     }
@@ -76,7 +76,7 @@ bool MacNotificationHandler::hasUserNotificationCenterSupport(void)
 
 MacNotificationHandler *MacNotificationHandler::instance()
 {
-    static MacNotificationHandler *s_instance = NULL;
+    static MacNotificationHandler *s_instance = nullptr;
     if (!s_instance) {
         s_instance = new MacNotificationHandler();
         

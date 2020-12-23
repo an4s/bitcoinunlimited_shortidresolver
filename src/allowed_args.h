@@ -1,4 +1,5 @@
 // Copyright (c) 2017 Stephen McCarthy
+// Copyright (c) 2017-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -147,6 +148,12 @@ class ConfigFile : public AllowedArgs
 {
 public:
     ConfigFile(CTweakMap *pTweaks);
+};
+
+class BitcoinBench : public AllowedArgs
+{
+public:
+    BitcoinBench();
 };
 
 

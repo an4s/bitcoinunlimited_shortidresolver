@@ -1,10 +1,11 @@
 // Copyright (c) 2016 The Bitcoin Core developers
 // Copyright (c) 2017 The Bitcoin developers
+// Copyright (c) 2017-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_CONSENSUS_VERSIONBITS
-#define BITCOIN_CONSENSUS_VERSIONBITS
+#ifndef BITCOIN_VERSIONBITS
+#define BITCOIN_VERSIONBITS
 
 #include "chain.h"
 #include <map>
@@ -38,7 +39,7 @@ enum VersionBitBIP
 
 // A map that gives the state for blocks whose height is a multiple of Period().
 // The map is indexed by the block's parent, however, so all keys in the map
-// will either be NULL or a block with (height + 1) % Period() == 0.
+// will either be nullptr or a block with (height + 1) % Period() == 0.
 typedef std::map<const CBlockIndex *, ThresholdState> ThresholdConditionCache;
 
 struct ForkDeploymentInfo
@@ -109,4 +110,4 @@ void ClearBip135Votes();
 bool AssignBip135Votes(const std::string &features, int vote);
 
 
-#endif
+#endif // BITCOIN_VERSIONBITS_H

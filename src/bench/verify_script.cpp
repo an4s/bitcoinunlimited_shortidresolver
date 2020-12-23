@@ -1,4 +1,5 @@
 // Copyright (c) 2016 The Bitcoin Core developers
+// Copyright (c) 2016-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -52,6 +53,9 @@ static CMutableTransaction BuildSpendingTransaction(const CScript &scriptSig, co
 // modified to measure performance of other types of scripts.
 static void VerifyScriptBench(benchmark::State &state)
 {
+    const ECCVerifyHandle verify_handle;
+    ECC_Start();
+
     const int flags = SCRIPT_VERIFY_P2SH;
 
     // Keypair.
@@ -68,7 +72,7 @@ static void VerifyScriptBench(benchmark::State &state)
     CScript scriptSig;
     CScript witScriptPubkey = CScript() << OP_DUP << OP_HASH160 << ToByteVector(pubkeyHash) << OP_EQUALVERIFY
                                         << OP_CHECKSIG;
-    CTransaction txCredit = BuildCreditingTransaction(scriptPubKey);
+    const CMutableTransaction &txCredit = BuildCreditingTransaction(scriptPubKey);
     CMutableTransaction txSpend = BuildSpendingTransaction(scriptSig, txCredit);
     CScript &ssig = txSpend.vin[0].scriptSig;
     uint256 sighash = SignatureHash(witScriptPubkey, txSpend, 0, SIGHASH_ALL, txCredit.vout[0].nValue);
@@ -89,6 +93,7 @@ static void VerifyScriptBench(benchmark::State &state)
         assert(err == SCRIPT_ERR_OK);
         assert(success);
     }
+    ECC_Stop();
 }
 
-BENCHMARK(VerifyScriptBench);
+BENCHMARK(VerifyScriptBench, 6300);

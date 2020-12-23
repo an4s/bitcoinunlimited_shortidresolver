@@ -24,7 +24,6 @@ class MempoolCoinbaseTest(BitcoinTestFramework):
         self.nodes.append(start_node(1, self.options.tmpdir, args))
         connect_nodes(self.nodes[1], 0)
         self.is_network_split = False
-        self.sync_all()
 
     def run_test(self):
 
@@ -99,6 +98,23 @@ class MempoolCoinbaseTest(BitcoinTestFramework):
 
         # mempool should be empty.
         assert_equal(set(self.nodes[0].getrawmempool()), set())
+
+        # test abandontransaction and evicttransaction
+        abandonTx = self.nodes[0].sendtoaddress(node1_address, 1.0)
+        waitFor(10, lambda: abandonTx in self.nodes[1].getrawmempool())
+        self.nodes[1].evicttransaction(abandonTx)
+        assert not abandonTx in self.nodes[1].getrawmempool()
+        self.nodes[0].abandontransaction(abandonTx)
+        assert not abandonTx in self.nodes[0].getrawmempool()
+
+        # negative tests of abandontransaction and evicttransaction
+
+        # evict nonexistant tx
+        self.nodes[1].evicttransaction(abandonTx)
+        # abandon tx 2x
+        self.nodes[0].abandontransaction(abandonTx)
+        # abandon tx not in our wallet
+        self.nodes[1].abandontransaction(abandonTx)
 
 if __name__ == '__main__':
     MempoolCoinbaseTest().main()

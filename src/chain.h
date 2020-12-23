@@ -1,6 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -10,12 +10,15 @@
 #include "arith_uint256.h"
 #include "pow.h"
 #include "primitives/block.h"
+#include "sync.h"
 #include "tinyformat.h"
 #include "uint256.h"
 #include "util.h"
 
 #include <atomic>
 #include <vector>
+
+extern CSharedCriticalSection cs_mapBlockIndex;
 
 class CBlockFileInfo
 {
@@ -204,9 +207,9 @@ public:
 
     void SetNull()
     {
-        phashBlock = NULL;
-        pprev = NULL;
-        pskip = NULL;
+        phashBlock = nullptr;
+        pprev = nullptr;
+        pskip = nullptr;
         nHeight = 0;
         nFile = 0;
         nDataPos = 0;
@@ -334,6 +337,7 @@ public:
     //! Returns true if the validity was changed.
     bool RaiseValidity(enum BlockStatus nUpTo)
     {
+        AssertWriteLockHeld(cs_mapBlockIndex);
         assert(!(nUpTo & ~BLOCK_VALID_MASK)); // Only validity flags allowed.
         if (nStatus & BLOCK_FAILED_MASK)
             return false;
@@ -439,22 +443,37 @@ private:
     std::atomic<CBlockIndex *> tip;
 
 public:
+    mutable CSharedCriticalSection cs_chainLock;
+
     CChain() : tip(nullptr) {}
-    /** Returns the index entry for the genesis block of this chain, or NULL if none. */
-    CBlockIndex *Genesis() const { return vChain.size() > 0 ? vChain[0] : NULL; }
-    /** Returns the index entry for the tip of this chain, or NULL if none.  Does not require cs_main. */
+    /** Returns the index entry for the genesis block of this chain, or nullptr if none. */
+    CBlockIndex *Genesis() const { return vChain.size() > 0 ? vChain[0] : nullptr; }
+    /** Returns the index entry for the tip of this chain, or nullptr if none.  Does not require cs_main. */
     CBlockIndex *Tip() const { return tip; }
-    /** Returns the index entry at a particular height in this chain, or NULL if no such height exists. */
+    /** Returns the index entry at a particular height in this chain, or nullptr if no such height exists. */
     CBlockIndex *operator[](int nHeight) const
     {
+        READLOCK(cs_chainLock);
         if (nHeight < 0 || nHeight >= (int)vChain.size())
-            return NULL;
+            return nullptr;
+        // We can return this outside of the lock because CBlockIndex objects are never deleted
+        return vChain[nHeight];
+    }
+
+    /** Returns the index entry at a particular height in this chain, or nullptr if no such height exists. Lock free */
+    CBlockIndex *_idx(int nHeight) const
+    {
+        if (nHeight < 0 || nHeight >= (int)vChain.size())
+            return nullptr;
+        // We can return this outside of the lock because CBlockIndex objects are never deleted
         return vChain[nHeight];
     }
 
     /** Compare two chains efficiently. */
     friend bool operator==(const CChain &a, const CChain &b)
     {
+        READLOCK(a.cs_chainLock);
+        READLOCK(b.cs_chainLock);
         return a.vChain.size() == b.vChain.size() && a.vChain[a.vChain.size() - 1] == b.vChain[b.vChain.size() - 1];
     }
 
@@ -463,25 +482,42 @@ public:
     {
         /* null pointer isn't in this chain but caller should not send in the first place */
         DbgAssert(pindex, return false);
+        // lock not needed because operator [] locks
         return (*this)[pindex->nHeight] == pindex;
     }
 
-    /** Find the successor of a block in this chain, or NULL if the given index is not found or is the tip. */
+    /** Efficiently check whether a block is present in this chain.  Lock free */
+    bool _Contains(const CBlockIndex *pindex) const
+    {
+        /* null pointer isn't in this chain but caller should not send in the first place */
+        DbgAssert(pindex, return false);
+        return _idx(pindex->nHeight) == pindex;
+    }
+
+    /** Find the successor of a block in this chain, or nullptr if the given index is not found or is the tip. */
     CBlockIndex *Next(const CBlockIndex *pindex) const
     {
-        if (Contains(pindex))
-            return (*this)[pindex->nHeight + 1];
+        READLOCK(cs_chainLock);
+        if (_Contains(pindex))
+            return _idx(pindex->nHeight + 1);
         else
             return nullptr;
     }
 
     /** Return the maximal height in the chain.  Does not require cs_main */
-    int Height() const { return tip.load() ? tip.load()->nHeight : -1; }
+    int Height() const
+    {
+        auto tmp = tip.load();
+        if (tmp)
+            return tmp->nHeight;
+        else
+            return -1;
+    }
     /** Set/initialize a chain with a given tip. */
     void SetTip(CBlockIndex *pindex);
 
     /** Return a CBlockLocator that refers to a block in this chain (by default the tip). */
-    CBlockLocator GetLocator(const CBlockIndex *pindex = NULL) const;
+    CBlockLocator GetLocator(const CBlockIndex *pindex = nullptr) const;
 
     /** Find the last common block between this chain and a block index entry. */
     const CBlockIndex *FindFork(const CBlockIndex *pindex) const;

@@ -1,5 +1,5 @@
 // Copyright (c) 2012-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2017 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 #include "addrman.h"
@@ -7,7 +7,7 @@
 #include <boost/test/unit_test.hpp>
 #include <string>
 
-#include "hash.h"
+#include "hashwrapper.h"
 #include "random.h"
 
 using namespace std;
@@ -25,14 +25,8 @@ public:
         insecure_rand = FastRandomContext(true);
     }
 
-    int RandomInt(int nMax)
-    {
-        state = (CHashWriter(SER_GETHASH, 0) << state).GetHash().GetCheapHash();
-        return (unsigned int)(state % nMax);
-    }
-
-    CAddrInfo *Find(const CNetAddr &addr, int *pnId = NULL) { return CAddrMan::Find(addr, pnId); }
-    CAddrInfo *Create(const CAddress &addr, const CNetAddr &addrSource, int *pnId = NULL)
+    CAddrInfo *Find(const CNetAddr &addr, int *pnId = nullptr) { return CAddrMan::Find(addr, pnId); }
+    CAddrInfo *Create(const CAddress &addr, const CNetAddr &addrSource, int *pnId = nullptr)
     {
         return CAddrMan::Create(addr, addrSource, pnId);
     }
@@ -180,10 +174,12 @@ BOOST_AUTO_TEST_CASE(addrman_select)
     BOOST_CHECK(addrman.size() == 7);
 
     // Test 12: Select pulls from new and tried regardless of port number.
-    BOOST_CHECK(addrman.Select().ToString() == "250.4.6.6:8333");
-    BOOST_CHECK(addrman.Select().ToString() == "250.3.2.2:9999");
-    BOOST_CHECK(addrman.Select().ToString() == "250.3.3.3:9999");
-    BOOST_CHECK(addrman.Select().ToString() == "250.4.4.4:8333");
+    std::set<uint16_t> ports;
+    for (int i = 0; i < 20; ++i)
+    {
+        ports.insert(addrman.Select().GetPort());
+    }
+    BOOST_CHECK_EQUAL(ports.size(), 3);
 }
 
 BOOST_AUTO_TEST_CASE(addrman_new_collisions)
@@ -330,7 +326,7 @@ BOOST_AUTO_TEST_CASE(addrman_delete)
     addrman.Delete(nId);
     BOOST_CHECK(addrman.size() == 0);
     CAddrInfo *info2 = addrman.Find(addr1);
-    BOOST_CHECK(info2 == NULL);
+    BOOST_CHECK(info2 == nullptr);
 }
 
 BOOST_AUTO_TEST_CASE(addrman_getaddr)

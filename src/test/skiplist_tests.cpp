@@ -1,11 +1,10 @@
 // Copyright (c) 2014-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2017 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include "chain.h"
 #include "test/test_bitcoin.h"
-#include "test/test_random.h"
 #include "util.h"
 
 #include <vector>
@@ -23,7 +22,7 @@ BOOST_AUTO_TEST_CASE(skiplist_test)
     for (int i = 0; i < SKIPLIST_LENGTH; i++)
     {
         vIndex[i].nHeight = i;
-        vIndex[i].pprev = (i == 0) ? NULL : &vIndex[i - 1];
+        vIndex[i].pprev = (i == 0) ? nullptr : &vIndex[i - 1];
         vIndex[i].BuildSkip();
     }
 
@@ -38,14 +37,14 @@ BOOST_AUTO_TEST_CASE(skiplist_test)
         }
         else
         {
-            BOOST_CHECK(vIndex[i].pskip == NULL);
+            BOOST_CHECK(vIndex[i].pskip == nullptr);
         }
     }
 
     for (int i = 0; i < 1000; i++)
     {
-        int from = insecure_rand() % (SKIPLIST_LENGTH - 1);
-        int to = insecure_rand() % (from + 1);
+        int from = InsecureRandRange(SKIPLIST_LENGTH - 1);
+        int to = InsecureRandRange(from + 1);
 
         BOOST_CHECK(vIndex[SKIPLIST_LENGTH - 1].GetAncestor(from) == &vIndex[from]);
         BOOST_CHECK(vIndex[from].GetAncestor(to) == &vIndex[to]);
@@ -62,13 +61,13 @@ BOOST_AUTO_TEST_CASE(getlocator_test)
     {
         vHashMain[i] = ArithToUint256(i); // Set the hash equal to the height, so we can quickly check the distances.
         vBlocksMain[i].nHeight = i;
-        vBlocksMain[i].pprev = i ? &vBlocksMain[i - 1] : NULL;
+        vBlocksMain[i].pprev = i ? &vBlocksMain[i - 1] : nullptr;
         vBlocksMain[i].phashBlock = &vHashMain[i];
         vBlocksMain[i].BuildSkip();
         if ((int)UintToArith256(vBlocksMain[i].GetBlockHash()).GetLow64() != vBlocksMain[i].nHeight)
             BOOST_CHECK_EQUAL((int)UintToArith256(vBlocksMain[i].GetBlockHash()).GetLow64(), vBlocksMain[i].nHeight);
-        if (!(vBlocksMain[i].pprev == NULL || vBlocksMain[i].nHeight == vBlocksMain[i].pprev->nHeight + 1))
-            BOOST_CHECK(vBlocksMain[i].pprev == NULL || vBlocksMain[i].nHeight == vBlocksMain[i].pprev->nHeight + 1);
+        if (!(vBlocksMain[i].pprev == nullptr || vBlocksMain[i].nHeight == vBlocksMain[i].pprev->nHeight + 1))
+            BOOST_CHECK(vBlocksMain[i].pprev == nullptr || vBlocksMain[i].nHeight == vBlocksMain[i].pprev->nHeight + 1);
     }
 
     // Build a branch that splits off at block 49999, 50000 blocks long.
@@ -84,8 +83,8 @@ BOOST_AUTO_TEST_CASE(getlocator_test)
         vBlocksSide[i].BuildSkip();
         if ((int)UintToArith256(vBlocksSide[i].GetBlockHash()).GetLow64() != vBlocksSide[i].nHeight)
             BOOST_CHECK_EQUAL((int)UintToArith256(vBlocksSide[i].GetBlockHash()).GetLow64(), vBlocksSide[i].nHeight);
-        if (!(vBlocksSide[i].pprev == NULL || vBlocksSide[i].nHeight == vBlocksSide[i].pprev->nHeight + 1))
-            BOOST_CHECK(vBlocksSide[i].pprev == NULL || vBlocksSide[i].nHeight == vBlocksSide[i].pprev->nHeight + 1);
+        if (!(vBlocksSide[i].pprev == nullptr || vBlocksSide[i].nHeight == vBlocksSide[i].pprev->nHeight + 1))
+            BOOST_CHECK(vBlocksSide[i].pprev == nullptr || vBlocksSide[i].nHeight == vBlocksSide[i].pprev->nHeight + 1);
     }
 
     // Build a CChain for the main branch.
@@ -95,7 +94,7 @@ BOOST_AUTO_TEST_CASE(getlocator_test)
     // Test 100 random starting points for locators.
     for (int n = 0; n < 100; n++)
     {
-        int r = insecure_rand() % 150000;
+        int r = InsecureRandRange(150000);
         CBlockIndex *tip = (r < 100000) ? &vBlocksMain[r] : &vBlocksSide[r - 100000];
         CBlockLocator locator = chain.GetLocator(tip);
 

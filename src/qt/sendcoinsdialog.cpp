@@ -1,5 +1,5 @@
 // Copyright (c) 2011-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -130,7 +130,8 @@ void SendCoinsDialog::setClientModel(ClientModel *_clientModel)
 
     if (_clientModel)
     {
-        connect(_clientModel, SIGNAL(numBlocksChanged(int, QDateTime, double)), this, SLOT(updateSmartFeeLabel()));
+        connect(
+            _clientModel, SIGNAL(numBlocksChanged(int, QDateTime, double, bool)), this, SLOT(updateSmartFeeLabel()));
     }
 }
 
@@ -262,7 +263,24 @@ void SendCoinsDialog::on_sendButton_clicked()
     WalletModelTransaction currentTransaction(recipients);
     WalletModel::SendCoinsReturn prepareStatus;
     if (model->getOptionsModel()->getCoinControlFeatures()) // coin control enabled
+    {
+        // The way the GUI works is that removing all checked coins automatically switches to allowing other inputs.
+        // We need to make the coinControl structure consistent with this GUI behavior.  We could do it in many places
+        // as coins are selected and unselected in various UI ways, or we can have a single catch-all rule here.
+        if (CoinControlDialog::coinControl)
+        {
+            if (!CoinControlDialog::coinControl->HasSelected())
+            {
+                CoinControlDialog::coinControl->fAllowOtherInputs = true;
+            }
+            else // The GUI has no way to use some coins and supplement with additional -- instead it errors
+            {
+                CoinControlDialog::coinControl->fAllowOtherInputs = false;
+            }
+        }
+
         prepareStatus = model->prepareTransaction(currentTransaction, CoinControlDialog::coinControl);
+    }
     else
         prepareStatus = model->prepareTransaction(currentTransaction);
 
@@ -686,8 +704,7 @@ void SendCoinsDialog::updateSmartFeeLabel()
         return;
 
     int nBlocksToConfirm = defaultConfirmTarget - ui->sliderSmartFee->value();
-    int estimateFoundAtBlocks = nBlocksToConfirm;
-    CFeeRate feeRate = mempool.estimateSmartFee(nBlocksToConfirm, &estimateFoundAtBlocks);
+    CFeeRate feeRate = mempool.estimateFee(nBlocksToConfirm);
     if (feeRate <= CFeeRate(0)) // not enough data => minfee
     {
         ui->labelSmartFee->setText(BitcoinUnits::formatWithUnit(model->getOptionsModel()->getDisplayUnit(),
@@ -702,8 +719,7 @@ void SendCoinsDialog::updateSmartFeeLabel()
                                        std::max(feeRate.GetFeePerK(), CWallet::GetRequiredFee(1000))) +
                                    "/kB");
         ui->labelSmartFee2->hide();
-        ui->labelFeeEstimation->setText(
-            tr("Estimated to begin confirmation within %n block(s).", "", estimateFoundAtBlocks));
+        ui->labelFeeEstimation->setText(tr(""));
     }
 
     updateFeeMinimizedLabel();

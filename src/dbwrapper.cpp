@@ -1,5 +1,5 @@
 // Copyright (c) 2012-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -85,9 +85,11 @@ CDBWrapper::CDBWrapper(const fs::path &path,
 {
     penv = nullptr;
     readoptions.verify_checksums = true;
+    readoptions.fill_cache = true;
     iteroptions.verify_checksums = true;
     iteroptions.fill_cache = false;
     syncoptions.sync = true;
+    writeoptions.sync = false;
     options = GetDefaultOptions(nCacheSize);
 
     // Modify default database options

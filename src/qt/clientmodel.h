@@ -1,5 +1,5 @@
 // Copyright (c) 2011-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2017 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -59,7 +59,8 @@ public:
     //! Return number of connections, default is in- and outbound (total)
     int getNumConnections(unsigned int flags = CONNECTIONS_ALL) const;
     int getNumBlocks() const;
-
+    int getHeaderTipHeight() const;
+    int64_t getHeaderTipTime() const;
     //! Return number of transactions in the mempool
     long getMempoolSize() const;
 
@@ -68,9 +69,6 @@ public:
 
     //! Return the dynamic memory usage of the mempool
     size_t getMempoolDynamicUsage() const;
-
-    //! BU: Return the transactions per second that are accepted into the mempool
-    double getTransactionsPerSecond() const;
 
     quint64 getTotalBytesRecv() const;
     quint64 getTotalBytesSent() const;
@@ -108,19 +106,20 @@ private:
 
     QTimer *pollTimer1;
     QTimer *pollTimer2;
+    QTimer *pollTimer3;
 
     void subscribeToCoreSignals();
     void unsubscribeFromCoreSignals();
 
 Q_SIGNALS:
     void numConnectionsChanged(int count);
-    void numBlocksChanged(int count, const QDateTime &blockDate, double nVerificationProgress);
+    void numBlocksChanged(int count, const QDateTime &blockDate, double nVerificationProgress, bool fHeader);
     void timeSinceLastBlockChanged(qint64 lastBlockTime);
     void mempoolSizeChanged(long count, size_t mempoolSizeInBytes);
     void orphanPoolSizeChanged(long count);
     void alertsChanged(const QString &warnings);
     void bytesChanged(quint64 totalBytesIn, quint64 totalBytesOut);
-    void transactionsPerSecondChanged(double tansactionsPerSecond); // BU:
+    void transactionsPerSecondChanged(double smoothedTps, double instantaneousTps, double peakTps);
     void thinBlockPropagationStatsChanged(const ThinBlockQuickStats &thin);
     void compactBlockPropagationStatsChanged(const CompactBlockQuickStats &compact);
     void grapheneBlockPropagationStatsChanged(const GrapheneQuickStats &graphene);
@@ -134,6 +133,7 @@ Q_SIGNALS:
 public Q_SLOTS:
     void updateTimer1();
     void updateTimer2();
+    void updateTimerTransactionRate();
     void updateNumConnections(int numConnections);
     void updateAlert();
     void updateBanlist();

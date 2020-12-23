@@ -1,5 +1,10 @@
+// Copyright (c) 2015-2018 The Bitcoin Core developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
 #include "merkle.h"
-#include "hash.h"
+#include "hashwrapper.h"
 #include "utilstrencodings.h"
 
 /*     WARNING! If you're reading this because you're learning about crypto
@@ -158,17 +163,37 @@ static void MerkleComputation(const std::vector<uint256> &leaves,
         *proot = h;
 }
 
-uint256 ComputeMerkleRoot(const std::vector<uint256> &leaves, bool *mutated)
+uint256 ComputeMerkleRoot(std::vector<uint256> hashes, bool *mutated)
 {
-    uint256 hash;
-    MerkleComputation(leaves, &hash, mutated, -1, NULL);
-    return hash;
+    bool mutation = false;
+    while (hashes.size() > 1)
+    {
+        if (mutated)
+        {
+            for (size_t pos = 0; pos + 1 < hashes.size(); pos += 2)
+            {
+                if (hashes[pos] == hashes[pos + 1])
+                    mutation = true;
+            }
+        }
+        if (hashes.size() & 1)
+        {
+            hashes.push_back(hashes.back());
+        }
+        SHA256D64(hashes[0].begin(), hashes[0].begin(), hashes.size() / 2);
+        hashes.resize(hashes.size() / 2);
+    }
+    if (mutated)
+        *mutated = mutation;
+    if (hashes.size() == 0)
+        return uint256();
+    return hashes[0];
 }
 
 std::vector<uint256> ComputeMerkleBranch(const std::vector<uint256> &leaves, uint32_t position)
 {
     std::vector<uint256> ret;
-    MerkleComputation(leaves, NULL, NULL, position, &ret);
+    MerkleComputation(leaves, nullptr, nullptr, position, &ret);
     return ret;
 }
 
@@ -198,7 +223,7 @@ uint256 BlockMerkleRoot(const CBlock &block, bool *mutated)
     {
         leaves[s] = block.vtx[s]->GetHash();
     }
-    return ComputeMerkleRoot(leaves, mutated);
+    return ComputeMerkleRoot(std::move(leaves), mutated);
 }
 
 std::vector<uint256> BlockMerkleBranch(const CBlock &block, uint32_t position)
@@ -209,5 +234,5 @@ std::vector<uint256> BlockMerkleBranch(const CBlock &block, uint32_t position)
     {
         leaves[s] = block.vtx[s]->GetHash();
     }
-    return ComputeMerkleBranch(leaves, position);
+    return ComputeMerkleBranch(std::move(leaves), position);
 }

@@ -1,12 +1,36 @@
-// Copyright (c) 2018 The Bitcoin Unlimited developers
+// Copyright (c) 2018-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#ifndef BITCOIN_TXADMISSION_H
+#define BITCOIN_TXADMISSION_H
+
 #include "fastfilter.h"
+#include "main.h"
 #include "net.h"
 #include "threadgroup.h"
+#include "txdebugger.h"
 #include "txmempool.h"
 #include <queue>
+
+/** The default value for -minrelaytxfee in sat/byte */
+static const double DEFAULT_MINLIMITERTXFEE = (double)DEFAULT_MIN_RELAY_TX_FEE / 1000;
+/** The default value for -maxrelaytxfee in sat/byte */
+static const double DEFAULT_MAXLIMITERTXFEE = (double)DEFAULT_MIN_RELAY_TX_FEE / 1000;
+/** The number of block heights to gradually choke spam transactions over */
+static const unsigned int MAX_BLOCK_SIZE_MULTIPLIER = 3;
+
+/** The maximum number of free transactions (in KB) that can enter the mempool per minute.
+ *  For a 1MB block we allow 15KB of free transactions per 1 minute.
+ */
+// static const uint32_t DEFAULT_LIMITFREERELAY = DEFAULT_BLOCK_MAX_SIZE * 0.000015;
+static const uint32_t DEFAULT_LIMITFREERELAY = 0;
+/** The minimum value possible for -limitfreerelay when rate limiting */
+// static const unsigned int DEFAULT_MIN_LIMITFREERELAY = 1;
+static const unsigned int DEFAULT_MIN_LIMITFREERELAY = 0;
+
+/** Subject free transactions to priority checking when entering the mempool */
+static const bool DEFAULT_RELAYPRIORITY = false;
 
 /**
  * Filter for transactions that were recently rejected by
@@ -33,7 +57,7 @@
 class Snapshot
 {
 public:
-    CCriticalSection cs;
+    CSharedCriticalSection cs_snapshot;
     uint64_t tipHeight;
     uint64_t tipMedianTimePast;
     int64_t adjustedTime;
@@ -100,6 +124,9 @@ enum
 // maximum transaction mempool admission threads
 extern CTweak<unsigned int> numTxAdmissionThreads;
 
+// restrict transaction inputs to 1 for long unconfirmed chains
+extern CTweak<bool> restrictInputs;
+
 extern CRollingFastFilter<4 * 1024 * 1024> recentRejects;
 extern CRollingFastFilter<4 * 1024 * 1024> txRecentlyInBlock;
 
@@ -131,7 +158,7 @@ extern std::map<uint256, CTxCommitData> *txCommitQ;
 CTransactionRef CommitQGet(uint256 hash);
 
 /** Start the transaction mempool admission threads */
-void StartTxAdmission(thread_group &threadGroup);
+void StartTxAdmission();
 /** Stop the transaction mempool admission threads (assumes that ShutdownRequested() will return true) */
 void StopTxAdmission();
 /** Wait for the currently enqueued transactions to be flushed.  If new tx keep coming in, you may wait a while */
@@ -161,7 +188,9 @@ bool ParallelAcceptToMemoryPool(Snapshot &ss,
     bool fRejectAbsurdFee,
     TransactionClass allowedTx,
     std::vector<COutPoint> &vCoinsToUncache,
-    bool *isRespend);
+    bool *isRespend,
+    CValidationDebugger *debugger = nullptr,
+    CTxProperties *txProps = nullptr);
 
 /** Checks the size of the mempool and trims it if needed */
 void LimitMempoolSize(CTxMemPool &pool, size_t limit, unsigned long age);
@@ -169,9 +198,14 @@ void LimitMempoolSize(CTxMemPool &pool, size_t limit, unsigned long age);
 // Return > 0 if its likely that we have already dealt with this transaction. inv MUST be MSG_TX type.
 unsigned int TxAlreadyHave(const CInv &inv);
 
-// Commit all accepted tx into the mempool.  Corral with CORRAL_TX_PAUSE before calling to stop
-// threads from adding new tx into the q.
+/**
+ * Commit all accepted tx into the mempool.  Corral with CORRAL_TX_PAUSE before calling to stop
+ * threads from adding new tx into the q.
+ */
 void CommitTxToMempool();
+
+/** Run the transaction admission thread */
+void ThreadTxAdmission();
 
 /**
  * Check if transaction will be final in the next block to be created.
@@ -180,7 +214,7 @@ void CommitTxToMempool();
  *
  * See consensus/consensus.h for flag definitions.
  */
-bool CheckFinalTx(const CTransactionRef &tx, int flags = -1, const Snapshot *ss = nullptr);
+bool CheckFinalTx(const CTransactionRef tx, int flags = -1, const Snapshot *ss = nullptr);
 
 /*
  * Check if transaction will be BIP 68 final in the next block to be created.
@@ -193,7 +227,7 @@ bool CheckFinalTx(const CTransactionRef &tx, int flags = -1, const Snapshot *ss 
  *
  * See consensus/consensus.h for flag definitions.
  */
-bool CheckSequenceLocks(const CTransactionRef &tx,
+bool CheckSequenceLocks(const CTransactionRef tx,
     int flags,
     LockPoints *lp = nullptr,
     bool useExistingLockPoints = false,
@@ -217,3 +251,5 @@ public:
         txProcessingCorral.Exit(CORRAL_TX_PAUSE);
     }
 };
+
+#endif

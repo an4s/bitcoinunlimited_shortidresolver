@@ -1,5 +1,5 @@
 // Copyright (c) 2011-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -34,14 +34,20 @@
 #include <boost/test/unit_test.hpp>
 #include <thread>
 
-FastRandomContext insecure_rand_ctx(true);
+uint256 insecure_rand_seed = GetRandHash();
+FastRandomContext insecure_rand_ctx(insecure_rand_seed);
 
 extern bool fPrintToConsole;
 extern void noui_connect();
 
 BasicTestingSetup::BasicTestingSetup(const std::string &chainName)
 {
+    // Do not place the data created by these unit tests on top of any existing chain,
+    // by overriding datadir to use a temporary if it isn't already overridden
+    if (mapArgs.count("-datadir") == 0)
+        mapArgs["-datadir"] = GetTempPath().string();
     SHA256AutoDetect();
+    RandomInit();
     ECC_Start();
     SetupEnvironment();
     SetupNetworking();
@@ -60,7 +66,8 @@ TestingSetup::TestingSetup(const std::string &chainName) : BasicTestingSetup(cha
     // instead of unit tests, but for now we need these here.
     RegisterAllCoreRPCCommands(tableRPC);
     ClearDatadirCache();
-    pathTemp = GetTempPath() / strprintf("test_bitcoin_%lu_%i", (unsigned long)GetTime(), (int)(GetRand(1 << 30)));
+    pathTemp =
+        GetTempPath() / strprintf("test_bitcoin_%lu_%i", (unsigned long)GetTime(), (int)(InsecureRandRange(1 << 30)));
     fs::create_directories(pathTemp);
     pblocktree = new CBlockTreeDB(1 << 20, "", true);
     pcoinsdbview = new CCoinsViewDB(1 << 23, true);
@@ -68,6 +75,16 @@ TestingSetup::TestingSetup(const std::string &chainName) : BasicTestingSetup(cha
     txCommitQ = new std::map<uint256, CTxCommitData>();
     bool worked = InitBlockIndex(chainparams);
     assert(worked);
+
+    // -limitfreerelay is diabled by default but some tests rely on it so make sure to set it here.
+    SetArg("-limitfreerelay", std::to_string(15));
+
+    // Initial dbcache settings so that the automatic cache setting don't kick in and allow
+    // us to accidentally use up our RAM on Travis, and also so that we are not prevented from flushing the
+    // dbcache if the need arises in the unit tests (dbcache must be less than the DEFAULT_HIGH_PERF_MEM_CUTOFF
+    // to allow all cache entries to be flushed).
+    SoftSetArg("-dbcache", std::to_string(5));
+    nCoinCacheMaxSize.store(5000000);
 
     // Make sure there are 3 script check threads running for each queue
     SoftSetArg("-par", std::to_string(3));
@@ -135,7 +152,7 @@ CBlock TestChain100Setup::CreateAndProcessBlock(const std::vector<CMutableTransa
         ++block.nNonce;
 
     CValidationState state;
-    ProcessNewBlock(state, chainparams, NULL, &block, true, NULL, false);
+    ProcessNewBlock(state, chainparams, nullptr, &block, true, nullptr, false);
 
     CBlock result = block;
     return result;
@@ -150,7 +167,7 @@ CTxMemPoolEntry TestMemPoolEntryHelper::FromTx(const CMutableTransaction &tx, CT
 
 CTxMemPoolEntry TestMemPoolEntryHelper::FromTx(const CTransaction &txn, CTxMemPool *pool)
 {
-    bool hasNoDependencies = pool ? pool->HasNoInputsOf(txn) : hadNoDependencies;
+    bool hasNoDependencies = pool ? pool->HasNoInputsOf(MakeTransactionRef(txn)) : hadNoDependencies;
     // Hack to assume either its completely dependent on other mempool txs or not at all
     CAmount inChainValue = hasNoDependencies ? txn.GetValueOut() : 0;
 

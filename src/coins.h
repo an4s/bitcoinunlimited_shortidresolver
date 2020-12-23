@@ -1,6 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -9,7 +9,7 @@
 
 #include "compressor.h"
 #include "core_memusage.h"
-#include "hash.h"
+#include "hashwrapper.h"
 #include "memusage.h"
 #include "serialize.h"
 #include "sync.h"
@@ -293,11 +293,21 @@ public:
         size_t &nChildCachedCoinsUsage);
 
     /**
-     * Check if we have the given utxo already loaded in this cache.
+     * Check if we have the given utxo on disk and load it into cache.
      * The semantics are the same as HaveCoin(), but no calls to
      * the backing CCoinsView are made.
      */
-    bool HaveCoinInCache(const COutPoint &outpoint) const;
+    bool GetCoinFromDB(const COutPoint &outpoint) const;
+
+    /**
+     * Check if we have the given utxo already loaded in this cache.
+     *
+     * @param[in]  outpoint   A reference to an outpoint in the coin we are checking
+     * @param[out] fSpent     A reference to an bool which indicates if the coin was spent or not
+     *                        NOTE: this value will not be set if the coin does not exist in cache.
+     * @return     bool       A return of true only indicates the coin is in cache, but not if it is spent/unspent
+     */
+    bool HaveCoinInCache(const COutPoint &outpoint, bool &fSpent) const;
 
     /**
      * Return a reference to Coin in the cache, or a pruned one if not found. This is
@@ -404,16 +414,12 @@ protected:
 void AddCoins(CCoinsViewCache &cache, const CTransaction &tx, int nHeight);
 
 //! Mark a transaction's inputs as spent in the passed CCoinsViewCache, and create the needed undo information.
-void SpendCoins(const CTransaction &tx, CValidationState &state, CCoinsViewCache &utxo, CTxUndo &txundo, int nHeight);
+void SpendCoins(const CTransaction &tx, CCoinsViewCache &utxo, CTxUndo &txundo, int nHeight);
 
 /** Apply the effects of this transaction on the UTXO set represented by view.  This function is equivalent to
 SpendCoins(...); AddCoins(...);
 */
-void UpdateCoins(const CTransaction &tx,
-    CValidationState &state,
-    CCoinsViewCache &inputs,
-    CTxUndo &txundo,
-    int nHeight);
-void UpdateCoins(const CTransaction &tx, CValidationState &state, CCoinsViewCache &inputs, int nHeight);
+void UpdateCoins(const CTransaction &tx, CCoinsViewCache &inputs, CTxUndo &txundo, int nHeight);
+void UpdateCoins(const CTransaction &tx, CCoinsViewCache &inputs, int nHeight);
 
 #endif // BITCOIN_COINS_H

@@ -1,5 +1,5 @@
 ---
-name: "BUcash-linux-1.6"
+name: "bch-unlimited-linux"
 enable_cache: true
 suites:
 - "bionic"
@@ -20,10 +20,10 @@ packages:
 - "bsdmainutils"
 - "ca-certificates"
 - "python"
-- "python3-git" # building electrs
-- "clang" # for rocksdb in electrs
-- "cmake" # for rocksdb in electrs
-reference_datetime: "2019-04-09 00:00:00"
+- "python3-git" # building electrscash
+- "clang" # for rocksdb in electrscash
+- "cmake" # for rocksdb in electrscash
+reference_datetime: "2020-08-20 00:00:00"
 remotes:
 - "url": "https://github.com/BitcoinUnlimited/BitcoinUnlimited.git"
   "dir": "bitcoin"
@@ -122,7 +122,11 @@ script: |
     if [ -d "$EXTRA_INCLUDES" ]; then
       export HOST_ID_SALT="$EXTRA_INCLUDES"
     fi
-    make ${MAKEOPTS} -C ${BASEPREFIX} HOST="${i}"
+    if [ "${i}" = "i686-pc-linux-gnu" ]; then
+      make ${MAKEOPTS} -C ${BASEPREFIX} HOST="${i}" NO_RUST=1
+    else
+      make ${MAKEOPTS} -C ${BASEPREFIX} HOST="${i}"
+    fi
     unset HOST_ID_SALT
   done
 
@@ -136,14 +140,13 @@ script: |
   ./autogen.sh
   CONFIG_SITE=${BASEPREFIX}/`echo "${HOSTS}" | awk '{print $1;}'`/share/config.site ./configure --prefix=/
   make dist
-  # cp bitcoinUnlimited-*.tar.gz BUcash-1.1.0.tar.gz
-  SOURCEDIST=`echo BUcash-*.tar.gz`
+  SOURCEDIST=`echo bch-unlimited-*.tar.gz`
   DISTNAME=`echo ${SOURCEDIST} | sed 's/.tar.*//'`
   # Correct tar file order
   mkdir -p temp
   pushd temp
   tar xf ../$SOURCEDIST
-  find BUcash* | sort | tar --no-recursion --mode='u+rw,go+r-w,a+X' --owner=0 --group=0 -c -T - | gzip -9n > ../$SOURCEDIST
+  find bch-unlimited* | sort | tar --no-recursion --mode='u+rw,go+r-w,a+X' --owner=0 --group=0 -c -T - | gzip -9n > ../$SOURCEDIST
   popd
 
   ORIGPATH="$PATH"
@@ -157,16 +160,18 @@ script: |
     tar --strip-components=1 -xf ../$SOURCEDIST
     CONFIG_SITE=${BASEPREFIX}/${i}/share/config.site ./configure --prefix=/ --disable-ccache --disable-maintainer-mode --disable-dependency-tracking ${CONFIGFLAGS} CFLAGS="${HOST_CFLAGS}" CXXFLAGS="${HOST_CXXFLAGS}" LDFLAGS="${HOST_LDFLAGS}"
     if [ "$i" = "x86_64-linux-gnu" ]; then
-        # Scope of electrs support is for servers running linux.
+        # Scope of electrscash support is for servers running linux.
         # We'll support x86_64 only for now.
-        make ${MAKEOPTS} electrs
+        make ${MAKEOPTS} electrscash
     fi
     make -j7 ${MAKEOPTS}
     make ${MAKEOPTS} -C src check-security
     make ${MAKEOPTS} -C src check-symbols
     make install DESTDIR=${INSTALLPATH}
-    if [ -f src/electrs ]; then
-        cp src/electrs ${INSTALLPATH}/bin/electrs
+    if [ -f src/electrscash ]; then
+        cp src/electrscash ${OUTDIR}/electrscash-${i}.debug
+        strip src/electrscash
+        cp src/electrscash ${INSTALLPATH}/bin/electrscash
     fi
     # BU save the executables with debug symbols
     cp -f src/bitcoind ${OUTDIR}/bitcoind-${i}.debug

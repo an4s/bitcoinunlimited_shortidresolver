@@ -1,4 +1,5 @@
 // Copyright (c) 2018 The Bitcoin developers
+// Copyright (c) 2018-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 #ifndef BITCOIN_RESPEND_RESPENDDETECTOR_H
@@ -22,13 +23,14 @@ class RespendDetector
 {
 public:
     RespendDetector(const CTxMemPool &pool,
-        const CTransactionRef &ptx,
+        const CTransactionRef ptx,
         std::vector<RespendActionPtr> = CreateDefaultActions());
 
     ~RespendDetector();
-    void CheckForRespend(const CTxMemPool &pool, const CTransactionRef &ptx);
+    void CheckForRespend(const CTxMemPool &pool, const CTransactionRef ptx);
     void SetValid(bool valid);
     bool IsRespend() const;
+    int GetDsproof() const;
 
     // Respend is interesting enough to trigger full tx validation.
     bool IsInteresting() const;
@@ -40,6 +42,9 @@ private:
     static std::unique_ptr<CRollingBloomFilter> respentBefore;
     static std::mutex respentBeforeMutex;
     std::vector<RespendActionPtr> actions;
+
+    // Does this tx have a dsproof associated with it
+    int dsproof = -1;
 };
 
 } // ns respend

@@ -5,10 +5,17 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 import pdb
 import binascii
+import random
 
 from .mininode import *
 from .script import CScript, OP_TRUE, OP_CHECKSIG, OP_DROP, OP_DUP, OP_HASH160, OP_EQUALVERIFY, OP_CHECKSIG, OP_RETURN, OP_NOP
 from .util import BTC
+
+# Minimum size a transaction can have.
+MIN_TX_SIZE = 100
+
+# Maximum bytes in a TxOut pubkey script
+MAX_TXOUT_PUBKEY_SCRIPT = 10000
 
 # Create a block (with regtest difficulty)
 def create_block(hashprev, coinbase, nTime=None, txns=None, ctor=True):
@@ -17,7 +24,11 @@ def create_block(hashprev, coinbase, nTime=None, txns=None, ctor=True):
         import time
         block.nTime = int(time.time()+600)
     else:
+        if type(nTime) is not int:
+            raise ValueError("nTime should be int, got {}".format(type(nTime)))
         block.nTime = nTime
+    if type(hashprev) is str:
+        hashprev = int(hashprev, 16)
     block.hashPrevBlock = hashprev
     block.nBits = 0x207fffff # Will break after a difficulty adjustment...
     if coinbase:
@@ -29,6 +40,12 @@ def create_block(hashprev, coinbase, nTime=None, txns=None, ctor=True):
     block.hashMerkleRoot = block.calc_merkle_root()
     block.calc_sha256()
     return block
+
+def make_conform_to_ctor(block):
+    for tx in block.vtx:
+        tx.rehash()
+    block.vtx = [block.vtx[0]] + \
+        sorted(block.vtx[1:], key=lambda tx: tx.getHash())
 
 def serialize_script_num(value):
     r = bytearray(0)
@@ -48,9 +65,10 @@ def serialize_script_num(value):
 # Create a coinbase transaction, assuming no miner fees.
 # If pubkey is passed in, the coinbase output will be a P2PK output;
 # otherwise an anyone-can-spend output.
-def create_coinbase(height, pubkey = None):
+def create_coinbase(height, pubkey = None, scriptPubKey = None):
+    assert not (pubkey and scriptPubKey), "cannot both have pubkey and custom scriptPubKey"
     coinbase = CTransaction()
-    coinbase.vin.append(CTxIn(COutPoint(0, 0xffffffff), 
+    coinbase.vin.append(CTxIn(COutPoint(0, 0xffffffff),
                 ser_string(serialize_script_num(height)), 0xffffffff))
     coinbaseoutput = CTxOut()
     coinbaseoutput.nValue = 50 * COIN
@@ -59,7 +77,9 @@ def create_coinbase(height, pubkey = None):
     if (pubkey != None):
         coinbaseoutput.scriptPubKey = CScript([pubkey, OP_CHECKSIG])
     else:
-        coinbaseoutput.scriptPubKey = CScript([OP_NOP])
+        if scriptPubKey is None:
+            scriptPubKey = CScript([OP_NOP])
+        coinbaseoutput.scriptPubKey = CScript(scriptPubKey)
     coinbase.vout = [ coinbaseoutput ]
 
     # Make sure the coinbase is at least 100 bytes
@@ -75,6 +95,7 @@ def create_coinbase(height, pubkey = None):
 # or a list to create multiple outputs
 PADDED_ANY_SPEND =  b'\x61'*50 # add a bunch of OP_NOPs to make sure this tx is long enough
 def create_transaction(prevtx, n, sig, value, out=PADDED_ANY_SPEND):
+    prevtx.calc_sha256()
     if not type(value) is list:
         value = [value]
     tx = CTransaction()
@@ -175,3 +196,83 @@ def createrawtransaction(inputs, outputs, outScriptGenerator=p2pkh):
             tx.vout.append(CTxOut(amount * BTC, outScriptGenerator(addr)))
     tx.rehash()
     return hexlify(tx.serialize()).decode("utf-8")
+
+
+def pad_tx(tx, pad_to_size=MIN_TX_SIZE):
+    """
+    Pad a transaction with op_return junk data until it is at least pad_to_size, or
+    leave it alone if it's already bigger than that.
+    """
+    curr_size = len(tx.serialize())
+    if curr_size >= pad_to_size:
+        # Bail early txn is already big enough
+        return
+
+    # This code attempts to pad a transaction with opreturn vouts such that
+    # it will be exactly pad_to_size.  In order to do this we have to create
+    # vouts of size x (maximum OP_RETURN size - vout overhead), plus the final
+    # one subsumes any runoff which would be less than vout overhead.
+    #
+    # There are two cases where this is not possible:
+    # 1. The transaction size is between pad_to_size and pad_to_size - extrabytes
+    # 2. The transaction is already greater than pad_to_size
+    #
+    # Visually:
+    # | .. x  .. | .. x .. | .. x .. | .. x + desired_size % x |
+    #    VOUT_1     VOUT_2    VOUT_3    VOUT_4
+    # txout.value + txout.pk_script bytes + op_return
+    extra_bytes = 8 + 1 + 1
+    required_padding = pad_to_size - curr_size
+    while required_padding > 0:
+        # We need at least extra_bytes left over each time, or we can't
+        # subsume the final (and possibly undersized) iteration of the loop
+        padding_len = min(required_padding,
+                          MAX_TXOUT_PUBKEY_SCRIPT - extra_bytes)
+        assert padding_len >= 0, "Can't pad less than 0 bytes, trying {}".format(
+            padding_len)
+        # We will end up with less than 1 UTXO of bytes after this, add
+        # them to this txn
+        next_iteration_padding = required_padding - padding_len - extra_bytes
+        if next_iteration_padding > 0 and next_iteration_padding < extra_bytes:
+            padding_len += next_iteration_padding
+
+        # If we're at exactly, or below, extra_bytes we don't want a 1 extra byte padding
+        if padding_len <= extra_bytes:
+            tx.vout.append(CTxOut(0, CScript([OP_RETURN])))
+        else:
+            # Subtract the overhead for the TxOut
+            padding_len -= extra_bytes
+            padding = random.randrange(
+                1 << 8 * padding_len - 2, 1 << 8 * padding_len - 1)
+            tx.vout.append(
+                CTxOut(0, CScript([OP_RETURN, padding])))
+
+        curr_size = len(tx.serialize())
+        required_padding = pad_to_size - curr_size
+    assert curr_size >= pad_to_size, "{} !>= {}".format(curr_size, pad_to_size)
+    tx.rehash()
+
+def pad_raw_tx(rawtx_hex, min_size=MIN_TX_SIZE):
+    """
+    Pad a raw transaction with OP_RETURN data until it reaches at least min_size
+    """
+    tx = CTransaction()
+    FromHex(tx, rawtx_hex)
+    pad_tx(tx, min_size)
+    return ToHex(tx)
+
+def create_tx_with_script(prevtx, n, script_sig=b"",
+                          amount=1, script_pub_key=CScript()):
+    """Return one-input, one-output transaction object
+       spending the prevtx's n-th output with the given amount.
+
+       Can optionally pass scriptPubKey and scriptSig, default is anyone-can-spend output.
+    """
+    tx = CTransaction()
+    assert(n < len(prevtx.vout))
+    tx.vin.append(CTxIn(COutPoint(prevtx.sha256, n), script_sig, 0xffffffff))
+    tx.vout.append(CTxOut(amount, script_pub_key))
+    pad_tx(tx)
+    tx.calc_sha256()
+    return tx
+

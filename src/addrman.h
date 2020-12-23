@@ -1,4 +1,5 @@
 // Copyright (c) 2012 Pieter Wuille
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -120,13 +121,13 @@ public:
  */
 
 //! total number of buckets for tried addresses
-#define ADDRMAN_TRIED_BUCKET_COUNT 256
+#define ADDRMAN_TRIED_BUCKET_COUNT_LOG2 8
 
 //! total number of buckets for new addresses
-#define ADDRMAN_NEW_BUCKET_COUNT 1024
+#define ADDRMAN_NEW_BUCKET_COUNT_LOG2 10
 
 //! maximum allowed number of entries in buckets for new and tried addresses
-#define ADDRMAN_BUCKET_SIZE 64
+#define ADDRMAN_BUCKET_SIZE_LOG2 6
 
 //! over how many buckets entries with tried addresses from a single group (/16 for IPv4) are spread
 #define ADDRMAN_TRIED_BUCKETS_PER_GROUP 8
@@ -161,6 +162,11 @@ public:
 //! the maximum number of tried addr collisions to store
 #define ADDRMAN_SET_TRIED_COLLISION_SIZE 10
 
+//! Convenience
+#define ADDRMAN_TRIED_BUCKET_COUNT (1 << ADDRMAN_TRIED_BUCKET_COUNT_LOG2)
+#define ADDRMAN_NEW_BUCKET_COUNT (1 << ADDRMAN_NEW_BUCKET_COUNT_LOG2)
+#define ADDRMAN_BUCKET_SIZE (1 << ADDRMAN_BUCKET_SIZE_LOG2)
+
 /**
  * Stochastical (IP) address manager
  */
@@ -168,7 +174,7 @@ class CAddrMan
 {
 private:
     //! critical section to protect the inner data structures
-    mutable CCriticalSection cs;
+    mutable CCriticalSection cs_addrman;
 
     //! last used nId
     int nIdCount;
@@ -209,11 +215,11 @@ protected:
     FastRandomContext insecure_rand;
 
     //! Find an entry.
-    CAddrInfo *Find(const CNetAddr &addr, int *pnId = NULL);
+    CAddrInfo *Find(const CNetAddr &addr, int *pnId = nullptr);
 
     //! find an entry, creating it if necessary.
     //! nTime and nServices of the found node are updated, if necessary.
-    CAddrInfo *Create(const CAddress &addr, const CNetAddr &addrSource, int *pnId = NULL);
+    CAddrInfo *Create(const CAddress &addr, const CNetAddr &addrSource, int *pnId = nullptr);
 
     //! Swap two elements in vRandom.
     void SwapRandom(unsigned int nRandomPos1, unsigned int nRandomPos2);
@@ -244,9 +250,6 @@ protected:
 
     //! Return a random to-be-evicted tried table address.
     CAddrInfo SelectTriedCollision_();
-
-    //! Wraps GetRandInt to allow tests to override RandomInt and make it determinismistic.
-    virtual int RandomInt(int nMax);
 
 #ifdef DEBUG_ADDRMAN
     //! Perform consistency check. Returns an error code or zero.
@@ -292,7 +295,7 @@ public:
     template <typename Stream>
     void Serialize(Stream &s) const
     {
-        LOCK(cs);
+        LOCK(cs_addrman);
 
         unsigned char nVersion = 1;
         s << nVersion;
@@ -350,7 +353,7 @@ public:
     template <typename Stream>
     void Unserialize(Stream &s)
     {
-        LOCK(cs);
+        LOCK(cs_addrman);
 
         Clear();
 
@@ -477,7 +480,7 @@ public:
     void Clear()
     {
         std::vector<int>().swap(vRandom);
-        nKey = GetRandHash();
+        nKey = insecure_rand.rand256();
         for (size_t bucket = 0; bucket < ADDRMAN_NEW_BUCKET_COUNT; bucket++)
         {
             for (size_t entry = 0; entry < ADDRMAN_BUCKET_SIZE; entry++)
@@ -508,7 +511,7 @@ public:
     {
 #ifdef DEBUG_ADDRMAN
         {
-            LOCK(cs);
+            LOCK(cs_addrman);
             int err;
             if ((err = Check_()))
                 LOGA("ADDRMAN CONSISTENCY CHECK FAILED!!! err=%i\n", err);
@@ -521,7 +524,7 @@ public:
     {
         bool fRet = false;
         {
-            LOCK(cs);
+            LOCK(cs_addrman);
             Check();
             fRet |= Add_(addr, source, nTimePenalty);
             Check();
@@ -537,7 +540,7 @@ public:
     {
         int nAdd = 0;
         {
-            LOCK(cs);
+            LOCK(cs_addrman);
             Check();
             for (std::vector<CAddress>::const_iterator it = vAddr.begin(); it != vAddr.end(); it++)
                 nAdd += Add_(*it, source, nTimePenalty) ? 1 : 0;
@@ -552,7 +555,7 @@ public:
     void Good(const CService &addr, bool test_before_evict = true, int64_t nTime = GetAdjustedTime())
     {
         {
-            LOCK(cs);
+            LOCK(cs_addrman);
             Check();
             Good_(addr, test_before_evict, nTime);
             Check();
@@ -563,7 +566,7 @@ public:
     void Attempt(const CService &addr, bool fCountFailure, int64_t nTime = GetAdjustedTime())
     {
         {
-            LOCK(cs);
+            LOCK(cs_addrman);
             Check();
             Attempt_(addr, fCountFailure, nTime);
             Check();
@@ -573,7 +576,7 @@ public:
     //! See if any to-be-evicted tried table entries have been tested and if so resolve the collisions.
     void ResolveCollisions()
     {
-        LOCK(cs);
+        LOCK(cs_addrman);
         Check();
         ResolveCollisions_();
         Check();
@@ -584,7 +587,7 @@ public:
     {
         CAddrInfo ret;
         {
-            LOCK(cs);
+            LOCK(cs_addrman);
             Check();
             ret = SelectTriedCollision_();
             Check();
@@ -599,7 +602,7 @@ public:
     {
         CAddrInfo addrRet;
         {
-            LOCK(cs);
+            LOCK(cs_addrman);
             Check();
             addrRet = Select_(newOnly);
             Check();
@@ -613,7 +616,7 @@ public:
         Check();
         std::vector<CAddress> vAddr;
         {
-            LOCK(cs);
+            LOCK(cs_addrman);
             GetAddr_(vAddr);
         }
         Check();
@@ -624,7 +627,7 @@ public:
     void Connected(const CService &addr, int64_t nTime = GetAdjustedTime())
     {
         {
-            LOCK(cs);
+            LOCK(cs_addrman);
             Check();
             Connected_(addr, nTime);
             Check();

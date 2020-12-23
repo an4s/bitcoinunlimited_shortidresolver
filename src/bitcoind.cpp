@@ -1,5 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2017 The Bitcoin developers
+// Copyright (c) 2009-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -18,7 +19,6 @@
 #include "init.h"
 #include "noui.h"
 #include "rpc/server.h"
-#include "unlimited.h"
 #include "unlimited.h"
 #include "util.h"
 #include "utilstrencodings.h"
@@ -50,7 +50,7 @@
 
 static bool fDaemon;
 
-void WaitForShutdown(thread_group *threadGroup)
+void WaitForShutdown()
 {
     bool fShutdown = ShutdownRequested();
     // Tell the main threads to shutdown.
@@ -59,11 +59,8 @@ void WaitForShutdown(thread_group *threadGroup)
         MilliSleep(200);
         fShutdown = ShutdownRequested();
     }
-    if (threadGroup)
-    {
-        Interrupt(*threadGroup);
-        threadGroup->join_all();
-    }
+    Interrupt();
+    threadGroup.join_all();
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -72,8 +69,6 @@ void WaitForShutdown(thread_group *threadGroup)
 //
 bool AppInit(int argc, char *argv[])
 {
-    thread_group threadGroup;
-
     auto &config = const_cast<Config &>(GetConfig());
 
     bool fRet = false;
@@ -249,7 +244,7 @@ bool AppInit(int argc, char *argv[])
         }
 
         InitParameterInteraction();
-        fRet = AppInit2(config, threadGroup);
+        fRet = AppInit2(config);
     }
     catch (const std::exception &e)
     {
@@ -257,19 +252,19 @@ bool AppInit(int argc, char *argv[])
     }
     catch (...)
     {
-        PrintExceptionContinue(NULL, "AppInit()");
+        PrintExceptionContinue(nullptr, "AppInit()");
     }
 
     if (!fRet)
     {
-        Interrupt(threadGroup);
+        Interrupt();
         // threadGroup.join_all(); was left out intentionally here, because we didn't re-test all of
         // the startup-failure cases to make sure they don't result in a hang due to some
         // thread-blocking-waiting-for-another-thread-during-startup case
     }
     else
     {
-        WaitForShutdown(&threadGroup);
+        WaitForShutdown();
     }
     Shutdown();
 

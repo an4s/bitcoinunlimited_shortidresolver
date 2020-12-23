@@ -1,10 +1,14 @@
 // Copyright (c) 2018 The Bitcoin developers
+// Copyright (c) 2018-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 #ifndef BITCOIN_RESPEND_RESPENDRELAYER_H
 #define BITCOIN_RESPEND_RESPENDRELAYER_H
 
 #include "respend/respendaction.h"
+#include "txmempool.h"
+
+extern CTxMemPool mempool;
 
 namespace respend
 {
@@ -17,19 +21,20 @@ public:
     RespendRelayer();
 
     bool AddOutpointConflict(const COutPoint &,
-        const CTxMemPool::txiter,
-        const CTransactionRef &pRespendTx,
+        const uint256 hash,
+        const CTransactionRef pRespendTx,
         bool seenBefore,
         bool isEquivalent) override;
 
     bool IsInteresting() const override;
     void SetValid(bool v) override;
 
-    void Trigger() override;
+    void Trigger(CTxMemPool &pool) override;
 
 private:
     bool interesting;
     bool valid;
+    uint256 spendhash;
     CTransactionRef pRespend;
 };
 

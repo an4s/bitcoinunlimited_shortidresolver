@@ -1,9 +1,13 @@
 // Copyright (c) 2018 The Bitcoin developers
+// Copyright (c) 2018-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include "respend/respenddetector.h"
+#include "DoubleSpendProof.h"
+#include "DoubleSpendProofStorage.h"
 #include "bloom.h"
+#include "dosman.h"
 #include "respend/respendaction.h"
 #include "respend/respendlogger.h"
 #include "respend/respendrelayer.h"
@@ -11,6 +15,8 @@
 #include "util.h"
 
 #include <algorithm>
+
+extern CTweak<uint32_t> doubleSpendProofs;
 
 namespace respend
 {
@@ -31,7 +37,7 @@ std::vector<RespendActionPtr> CreateDefaultActions()
 }
 
 RespendDetector::RespendDetector(const CTxMemPool &pool,
-    const CTransactionRef &ptx,
+    const CTransactionRef ptx,
     std::vector<RespendActionPtr> _actions)
     : actions(_actions)
 {
@@ -53,7 +59,7 @@ RespendDetector::~RespendDetector()
     {
         try
         {
-            a->Trigger();
+            a->Trigger(mempool);
         }
         catch (const std::exception &e)
         {
@@ -62,13 +68,59 @@ RespendDetector::~RespendDetector()
     }
 }
 
-void RespendDetector::CheckForRespend(const CTxMemPool &pool, const CTransactionRef &ptx)
+void RespendDetector::CheckForRespend(const CTxMemPool &pool, const CTransactionRef ptx)
 {
-    READLOCK(pool.cs); // protect pool.mapNextTx
+    READLOCK(pool.cs_txmempool); // protect pool.mapNextTx
 
     for (const CTxIn &in : ptx->vin)
     {
         const COutPoint outpoint = in.prevout;
+
+        if (doubleSpendProofs.Value())
+        {
+            // Check first if there are already double spend orphans. If there are
+            // then we can broadcast them here and continue without needing to check
+            // further for conflicts for this outpoint.
+            auto orphans = pool.doubleSpendProofStorage()->findOrphans(outpoint);
+            if (!orphans.empty())
+            {
+                for (auto iter = orphans.begin(); iter != orphans.end(); iter++)
+                {
+                    const int proofId = iter->first;
+                    auto dsp = pool.doubleSpendProofStorage()->proof(proofId);
+                    LOG(DSPROOF, "Rescued a DoubleSpendProof orphan %d", proofId);
+                    auto rc = dsp.validate(pool, ptx);
+                    DbgAssert(rc == DoubleSpendProof::Valid || rc == DoubleSpendProof::Invalid, );
+
+                    if (rc == DoubleSpendProof::Valid)
+                    {
+                        LOG(DSPROOF, "DoubleSpendProof for orphan validated correctly %d", proofId);
+                        pool.doubleSpendProofStorage()->claimOrphan(proofId);
+                        {
+                            std::lock_guard<std::mutex> lock(respentBeforeMutex);
+                            dsproof = proofId;
+                        }
+
+                        // remove all other orphans since we only need one
+                        while (++iter != orphans.end())
+                        {
+                            pool.doubleSpendProofStorage()->remove(iter->first);
+                            LOG(DSPROOF, "Removing DoubleSpendProof orphan, we only need one %d", proofId);
+                        }
+
+                        // Finally, send the dsp inventory message
+                        broadcastDspInv(ptx, dsp.GetHash());
+                        break;
+                    }
+                    else
+                    {
+                        LOG(DSPROOF, "DoubleSpendProof did not validate %s", dsp.GetHash().ToString());
+                        pool.doubleSpendProofStorage()->remove(proofId);
+                        dosMan.Misbehaving(iter->second, 5);
+                    }
+                }
+            }
+        }
 
         // Is there a conflicting spend?
         auto spendIter = pool.mapNextTx.find(outpoint);
@@ -91,7 +143,8 @@ void RespendDetector::CheckForRespend(const CTxMemPool &pool, const CTransaction
         {
             // Actions can return true if they want to check more
             // outpoints for conflicts.
-            bool m = a->AddOutpointConflict(outpoint, poolIter, ptx, seen, ptx->IsEquivalentTo(poolIter->GetTx()));
+            bool m = a->AddOutpointConflict(
+                outpoint, poolIter->GetSharedTx()->GetHash(), ptx, seen, ptx->IsEquivalentTo(poolIter->GetTx()));
             collectMore = collectMore || m;
         }
         if (!collectMore)
@@ -121,4 +174,5 @@ bool RespendDetector::IsInteresting() const
     return std::any_of(begin(actions), end(actions), [](const RespendActionPtr &a) { return a->IsInteresting(); });
 }
 
+int RespendDetector::GetDsproof() const { return dsproof; }
 } // ns respend

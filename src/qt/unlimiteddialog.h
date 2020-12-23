@@ -1,4 +1,4 @@
-// Copyright (c) 2011-2017 The Bitcoin Unlimited developers
+// Copyright (c) 2011-2018 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -26,7 +26,7 @@ class LessThanValidator : public QIntValidator
 
 public:
     LessThanValidator(int minimum, int maximum, QObject *parent = 0)
-        : QIntValidator(minimum, maximum, parent), other(NULL), errorDisplay(NULL)
+        : QIntValidator(minimum, maximum, parent), other(nullptr), errorDisplay(nullptr)
     {
     }
 
@@ -59,8 +59,10 @@ private Q_SLOTS:
     void validateBlockSize();
     // Pushes the traffic shaping slider changes into the traffic shaping edit boxes
     void shapingSliderChanged();
-    void shapingMaxEditFinished(void); // auto-corrects cases where max is lower then average
-    void shapingAveEditFinished(void); // auto-corrects cases where max is lower then average
+    // auto-corrects cases where max is lower then average and force the input for those
+    // fields to be greater than zero
+    bool shapingMaxEditFinished(void);
+    bool shapingAveEditFinished(void);
     // Pushes the traffic shaping slider changes into the traffic shaping edit boxes
     void shapingEnableChanged(bool val);
 

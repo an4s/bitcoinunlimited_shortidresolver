@@ -38,6 +38,7 @@ import logging
 import copy
 import traceback
 
+from test_framework.util import waitFor, waitForBlockInChainTips
 from .nodemessages import *
 from .bumessages import *
 
@@ -97,7 +98,7 @@ class NodeConnCB(object):
     def wait_for_verack(self):
         self.wait_for(lambda : self.verack_received)
 
-    def wait_for_xverack(self):
+    def wait_for_xverack_old(self):
         self.wait_for(lambda : self.xverack_received)
 
     def deliver(self, conn, message):
@@ -172,11 +173,13 @@ class NodeConnCB(object):
 
     def on_blocktxn(self, conn, message): pass
 
-    def on_xverack(self, conn, message):
+    def on_xverack_old(self, conn, message):
         self.xverack_received = True
-        conn.send_message(msg_xverack())
 
     def on_xversion(self, conn, message):
+        conn.xver = message
+
+    def on_xversion_old(self, conn, message):
         conn.xver = message
 
 
@@ -195,6 +198,7 @@ class SingleNodeConnCB(NodeConnCB):
 
     # Wrapper for the NodeConn's send_message function
     def send_message(self, message, pushbuf = False):
+        assert self.connection is not None, 'forgot to .add_connection'
         self.connection.send_message(message, pushbuf)
 
     def send_and_ping(self, message):
@@ -252,8 +256,9 @@ class NodeConn(asyncore.dispatcher):
         b"reject": msg_reject,
         b"mempool": msg_mempool,
         b"sendheaders": msg_sendheaders,
-        b"xversion" : msg_xversion,
-        b"xverack" : msg_xverack,
+        b"extversion" : msg_xversion,
+        b"xversion" : msg_xversion_old,
+        b"xverack" : msg_xverack_old,
         b"xupdate" : msg_xupdate,
         b"sendcmpct": msg_sendcmpct,
         b"cmpctblock": msg_cmpctblock,
@@ -273,7 +278,7 @@ class NodeConn(asyncore.dispatcher):
         "regtest": b"\xda\xb5\xbf\xfa",
     }
 
-    def __init__(self, dstaddr, dstport, rpc, callback, net="regtest", services=1, bitcoinCash=True, send_initial_version = True):
+    def __init__(self, dstaddr, dstport, rpc, callback, net="regtest", services=1, bitcoinCash=True, send_initial_version = True, send_xversion = False):
         self.bitcoinCash = bitcoinCash
         if self.bitcoinCash:
             self.MAGIC_BYTES = self.CASH_MAGIC_BYTES
@@ -300,6 +305,8 @@ class NodeConn(asyncore.dispatcher):
         if send_initial_version:
             # stuff version msg into sendbuf
             vt = msg_version()
+            if send_xversion:
+                services = services | (1<<11)
             vt.nServices = services
             vt.addrTo.ip = self.dstaddr
             vt.addrTo.port = self.dstport
@@ -488,3 +495,155 @@ class EarlyDisconnectError(Exception):
 
     def __str__(self):
         return repr(self.value)
+
+class P2PDataStore(SingleNodeConnCB):
+    """A P2P data store class.
+
+    Keeps a block and transaction store and responds correctly to getdata and getheaders requests."""
+
+    def __init__(self):
+        super().__init__()
+        # store of blocks. key is block hash, value is a CBlock object
+        self.block_store = {}
+        self.last_block_hash = ''
+        # store of txs. key is txid, value is a CTransaction object
+        self.tx_store = {}
+        self.getdata_requests = []
+
+    def on_getdata(self, conn, message):
+        """Check for the tx/block in our stores and if found, reply with an inv message."""
+        for inv in message.inv:
+            self.getdata_requests.append(inv.hash)
+            if inv.type == CInv.MSG_TX and inv.hash in self.tx_store.keys():
+                self.send_message(msg_tx(self.tx_store[inv.hash]))
+            elif inv.type == CInv.MSG_BLOCK and inv.hash in self.block_store.keys():
+                self.send_message(msg_block(self.block_store[inv.hash]))
+            else:
+                logging.debug(
+                    'getdata message type {} received.'.format(hex(inv.type)))
+
+    def on_getheaders(self, conn, message):
+        """Search back through our block store for the locator, and reply with a headers message if found."""
+
+        locator, hash_stop = message.locator, message.hashstop
+
+        # Assume that the most recent block added is the tip
+        if not self.block_store:
+            return
+
+        headers_list = [self.block_store[self.last_block_hash]]
+        maxheaders = 2000
+        while headers_list[-1].sha256 not in locator.vHave:
+            # Walk back through the block store, adding headers to headers_list
+            # as we go.
+            prev_block_hash = headers_list[-1].hashPrevBlock
+            if prev_block_hash in self.block_store:
+                prev_block_header = CBlockHeader(
+                    self.block_store[prev_block_hash])
+                headers_list.append(prev_block_header)
+                if prev_block_header.sha256 == hash_stop:
+                    # if this is the hashstop header, stop here
+                    break
+            else:
+                logging.debug('block hash {} not found in block store'.format(
+                    hex(prev_block_hash)))
+                break
+
+        # Truncate the list if there are too many headers
+        headers_list = headers_list[:-maxheaders - 1:-1]
+        response = msg_headers(headers_list)
+
+        if response is not None:
+            self.send_message(response)
+
+    def send_blocks_and_test(self, blocks, node, *, success=True, request_block=True, reject_reason=None, expect_ban=False, expect_disconnect=False, timeout=60):
+        """Send blocks to test node and test whether the tip advances.
+
+         - add all blocks to our block_store
+         - send all headers
+         - the on_getheaders handler will ensure that any getheaders are responded to
+         - if request_block is True: wait for getdata for each of the blocks. The on_getdata handler will
+           ensure that any getdata messages are responded to
+         - if success is True: assert that the node's tip advances to the most recent block
+         - if success is False: assert that the node's tip doesn't advance
+         - if reject_reason is set: assert that the correct reject message is logged"""
+
+        with mininode_lock:
+            for block in blocks:
+                self.block_store[block.sha256] = block
+                self.last_block_hash = block.sha256
+
+        def to_headers(blocks):
+            return [CBlockHeader(b) for b in blocks]
+
+        BAN_MSG = "BAN THRESHOLD EXCEEDED"
+        expected_msgs = []
+        unexpected_msgs = []
+        if reject_reason:
+            expected_msgs.append(reject_reason)
+        if expect_ban:
+            expected_msgs.append(BAN_MSG)
+        else:
+            unexpected_msgs.append(BAN_MSG)
+        with node.assert_debug_log(expected_msgs = expected_msgs, unexpected_msgs = unexpected_msgs):
+            self.send_message(msg_headers(to_headers(blocks)))
+
+            if request_block:
+                ok = wait_until(
+                    lambda: blocks[-1].sha256 in self.getdata_requests, timeout=timeout)
+                assert ok, "did not receive getdata for {}".format(blocks[-1].sha256)
+
+            if expect_disconnect:
+                self.wait_for_disconnect()
+            else:
+                self.sync_with_ping()
+
+            if success:
+                ok = wait_until(lambda: node.getbestblockhash() ==
+                           blocks[-1].hash, timeout=timeout)
+                assert ok, "node failed to sync to block {}".format(blocks[-1].gethash('hex'))
+            else:
+                ct = waitForBlockInChainTips(node, blockHash, timeout)
+                assert ct["status"] == 'invalid'  # Was expecting failure but block is not invalid
+                gbbh = node.getbestblockhash()
+                assert gbbh != blocks[-1].hash
+
+    def send_txs_and_test(self, txs, node, *, success=True, expect_ban=False, reject_reason=None, timeout=60):
+        """Send txs to test node and test whether they're accepted to the mempool.
+
+         - add all txs to our tx_store
+         - send tx messages for all txs
+         - if success is True/False: assert that the txs are/are not accepted to the mempool
+         - if expect_disconnect is True: Skip the sync with ping
+         - if reject_reason is set: assert that the correct reject message is logged."""
+        assert(len(txs))
+        with mininode_lock:
+            for tx in txs:
+                self.tx_store[tx.sha256] = tx
+
+        BAN_MSG = "BAN THRESHOLD EXCEEDED"
+        expected_msgs = []
+        unexpected_msgs = []
+        if reject_reason:
+            expected_msgs.append(reject_reason)
+        if expect_ban:
+            expected_msgs.append(BAN_MSG)
+        else:
+            unexpected_msgs.append(BAN_MSG)
+        with node.assert_debug_log(
+            expected_msgs = expected_msgs,
+            unexpected_msgs = unexpected_msgs):
+
+            for tx in txs:
+                self.send_message(msg_tx(tx))
+
+            self.sync_with_ping()
+
+            if success:
+                # Check that all txs are now in the mempool
+                for tx in txs:
+                    waitFor(timeout, lambda: tx.hash in node.getrawmempool(), onError="{} tx not found in mempool".format(tx.hash))
+            else:
+                # Check that none of the txs are now in the mempool
+                for tx in txs:
+                    waitFor(timeout, lambda: tx.hash not in node.getrawmempool(), onError="{} tx not found in mempool".format(tx.hash))

@@ -1,6 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Copyright (c) 2017 The Bitcoin developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
@@ -283,13 +283,13 @@ DBErrors CWalletDB::ReorderTransactions(CWallet *pwallet)
     for (map<uint256, CWalletTx>::iterator it = pwallet->mapWallet.begin(); it != pwallet->mapWallet.end(); ++it)
     {
         CWalletTx *wtx = &((*it).second);
-        txByTime.insert(make_pair(wtx->nTimeReceived, TxPair(wtx, (CAccountingEntry *)0)));
+        txByTime.insert(make_pair(wtx->nTimeReceived, TxPair(wtx, nullptr)));
     }
     list<CAccountingEntry> acentries;
     ListAccountCreditDebit("", acentries);
     for (CAccountingEntry &entry : acentries)
     {
-        txByTime.insert(make_pair(entry.nTime, TxPair((CWalletTx *)0, &entry)));
+        txByTime.insert(make_pair(entry.nTime, TxPair(nullptr, &entry)));
     }
 
     int64_t &nOrderPosNext = pwallet->nOrderPosNext;
@@ -755,7 +755,7 @@ DBErrors CWalletDB::LoadWallet(CWallet *pwallet)
     ListAccountCreditDebit("*", pwallet->laccentries);
     for (CAccountingEntry &entry : pwallet->laccentries)
     {
-        pwallet->wtxOrdered.insert(make_pair(entry.nOrderPos, CWallet::TxPair((CWalletTx *)0, &entry)));
+        pwallet->wtxOrdered.insert(make_pair(entry.nOrderPos, CWallet::TxPair(nullptr, &entry)));
     }
 
     return result;

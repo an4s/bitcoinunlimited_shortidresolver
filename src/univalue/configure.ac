@@ -23,7 +23,7 @@ m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
 AC_PREREQ(2.60)
 AC_CONFIG_SRCDIR([lib/univalue.cpp])
 AC_CONFIG_AUX_DIR([build-aux])
-AC_CONFIG_MACRO_DIR([build-aux/m4])
+AC_CONFIG_MACRO_DIR([../../build-aux/m4])
 AC_CONFIG_HEADERS([univalue-config.h])
 AM_INIT_AUTOMAKE([subdir-objects foreign])
 
@@ -45,6 +45,9 @@ AC_SUBST(LIBUNIVALUE_AGE)
 LT_INIT
 LT_LANG([C++])
 
+dnl Require C++14 compiler (no GNU extensions)
+AX_CXX_COMPILE_STDCXX([14], [noext], [mandatory], [nodefault])
+
 # Enable debug
 AC_ARG_ENABLE([debug],
     [AS_HELP_STRING([--enable-debug],
@@ -52,8 +55,19 @@ AC_ARG_ENABLE([debug],
     [enable_debug=$enableval],
     [enable_debug=no])
 
+# Enable std library debug
+AC_ARG_ENABLE([std-debug],
+    [AS_HELP_STRING([--enable-std-debug],
+                    [use glib std debug library with range checking on containers, etc.  This requires boost to be built with "./b2 define=_GLIBCXX_DEBUG define=GLIB_CXX_DEBUG_PEDANTIC" options.])],
+    [enable_std_debug=$enableval],
+    [enable_std_debug=no])
+
 if test "x$enable_debug" = xyes; then
     CPPFLAGS="$CPPFLAGS -DDEBUG"
+fi
+
+if test "x$enable_std_debug" = xyes; then
+    CPPFLAGS="$CPPFLAGS -D_GLIBCXX_DEBUG -DGLIB_CXX_DEBUG_PEDANTIC"
 fi
 
 case $host in

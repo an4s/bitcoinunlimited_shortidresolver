@@ -47,7 +47,15 @@ class BitcoinTestFramework(object):
     setup_clean_chain = False
     num_nodes = 4
     extra_args = None
+
+    def __init__(self):
+        super().__init__()
+        self.set_test_params()
+
     # These may be over-ridden by subclasses:
+    def set_test_params(self):
+        pass
+
     def run_test(self):
         for node in self.nodes:
             assert_equal(node.getblockcount(), 200)
@@ -80,6 +88,16 @@ class BitcoinTestFramework(object):
         self.nodes = self.setup_nodes()
 
         if self.num_nodes == 1:
+            self.is_network_split = False
+            return
+
+        if self.num_nodes == 2:
+            if split:
+                raise Exception("split option for 2 nodes NYI")
+
+            connect_nodes_bi(self.nodes, 0, 1)
+            self.is_network_split = False
+            self.sync_all()
             return
 
         if self.num_nodes != 4:
@@ -149,7 +167,6 @@ class BitcoinTestFramework(object):
         wallets: Pass a list of wallet filenames.  Each wallet file will be copied into the node's directory
         before starting the node.
         """
-        import optparse
 
         parser = optparse.OptionParser(usage="%prog [options]")
         parser.add_option("--nocleanup", dest="nocleanup", default=False, action="store_true",
@@ -165,10 +182,10 @@ class BitcoinTestFramework(object):
 
         default_tempdir = tempfile.mkdtemp(prefix="test_"+testname+"_")
 
-        parser.add_option("--tmppfx", dest="tmppfx", default=default_tempdir,
-                          help="Directory prefix for data directories")
-        parser.add_option("--tmpdir", dest="tmpdir", default=None,
-                          help="Root directory for data directories. If specified, overrides tmppfx.")
+        parser.add_option("--tmppfx", dest="tmppfx", default=None,
+                          help="Directory custom prefix for data directories, if specified, overrides tmpdir")
+        parser.add_option("--tmpdir", dest="tmpdir", default=default_tempdir,
+                          help="Root directory for data directories.")
         parser.add_option("--tracerpc", dest="trace_rpc", default=False, action="store_true",
                           help="Print out all RPC calls as they are made")
         parser.add_option("--portseed", dest="port_seed", default=os.getpid(), type='int',
@@ -181,11 +198,24 @@ class BitcoinTestFramework(object):
         parser.add_option("--no-ipv6-rpc-listen", dest="no_ipv6_rpc_listen", default=False, action="store_true",
                           help="Switch off listening on the IPv6 ::1 localhost RPC port. "
                           "This is meant to deal with travis which is currently not supporting IPv6 sockets.")
+        parser.add_option("--electrum.exec", dest="electrumexec",
+            help="Set a custom path to the electrum server executable", default=None)
+        parser.add_option("--gitlab", dest="gitlab", default=False, action="store_true",
+                          help="Changes root directory for gitlab artifact exporting. overrides tmpdir and tmppfx")
+
 
         self.add_options(parser)
         (self.options, self.args) = parser.parse_args(argsOverride)
 
+        if self.options.gitlab is True:
+            basedir = os.path.normpath(os.path.dirname(os.path.realpath(__file__))+"/../../qa_tests")
+            if os.path.exists(basedir) == False:
+                os.mkdir(path=basedir, mode=0o700)
+            self.options.tmpdir = tempfile.mkdtemp(prefix="test_"+testname+"_", dir=basedir)
+
+
         UtilOptions.no_ipv6_rpc_listen = self.options.no_ipv6_rpc_listen
+        UtilOptions.electrumexec = self.options.electrumexec
 
         # BU: initialize RNG seed based on time if no seed specified
         if self.options.randomseed:
@@ -195,8 +225,12 @@ class BitcoinTestFramework(object):
         random.seed(self.randomseed)
         logging.info("Random seed: %s" % self.randomseed)
 
-        if self.options.tmpdir is None:
-            self.options.tmpdir = os.path.join(self.options.tmppfx, str(self.options.port_seed))
+        if self.options.tmppfx is not None and self.options.gitlab is False:
+            i = self.options.port_seed
+            # find a short path that's easy to remember compared to mkdtemp
+            while os.path.exists(self.options.tmppfx + os.sep + testname[0:-2] + str(i)):
+                i+=1
+            self.options.tmpdir = self.options.tmppfx + os.sep + testname[0:-2] + str(i)
 
         if self.options.trace_rpc:
             logging.basicConfig(level=logging.DEBUG, stream=sys.stdout)
@@ -208,7 +242,25 @@ class BitcoinTestFramework(object):
 
         os.environ['PATH'] = self.options.srcdir + ":" + os.path.join(self.options.srcdir, "qt") + ":" + os.environ['PATH']
 
+        self.bitcoindBin = os.path.join(self.options.srcdir, "bitcoind")
+
         check_json_precision()
+
+        # By setting the environment variable BITCOIN_CONF_OVERRIDE to "key=value,key2=value2,..." you can inject bitcoin configuration into every test
+        baseConf = os.environ.get("BITCOIN_CONF_OVERRIDE")
+        if baseConf is None:
+            baseConf= {}
+        else:
+            lines = baseConf.split(",")
+            baseConf = {}
+            for line in lines:
+                (key,val) = line.split("=")
+                baseConf[key.strip()] = val.strip()
+
+        if bitcoinConfDict is None:
+            bitcoinConfDict = {}
+
+        bitcoinConfDict.update(baseConf)
 
         success = False
         try:
@@ -284,10 +336,10 @@ class BitcoinTestFramework(object):
 
         if success:
             logging.info("Tests successful")
-            sys.exit(0)
+            return 0
         else:
             logging.error("Failed")
-            sys.exit(1)
+            return 1
 
 
 # Test framework for doing p2p comparison testing, which sets up some bitcoind

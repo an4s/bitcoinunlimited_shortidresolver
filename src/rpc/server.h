@@ -4,8 +4,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_RPCSERVER_H
-#define BITCOIN_RPCSERVER_H
+#ifndef BITCOIN_RPC_SERVER_H
+#define BITCOIN_RPC_SERVER_H
 
 #include "amount.h"
 #include "rpc/protocol.h"
@@ -27,7 +27,6 @@ namespace RPCServer
 void OnStarted(boost::function<void()> slot);
 void OnStopped(boost::function<void()> slot);
 void OnPreCommand(boost::function<void(const CRPCCommand &)> slot);
-void OnPostCommand(boost::function<void(const CRPCCommand &)> slot);
 }
 
 class CBlockIndex;
@@ -188,7 +187,7 @@ extern std::vector<unsigned char> ParseHexO(const UniValue &o, std::string strKe
 extern int64_t nWalletUnlockTime;
 extern CAmount AmountFromValue(const UniValue &value);
 extern UniValue ValueFromAmount(const CAmount &amount);
-extern double GetDifficulty(const CBlockIndex *blockindex = NULL);
+extern double GetDifficulty(const CBlockIndex *blockindex = nullptr);
 extern std::string HelpRequiringPassphrase();
 extern std::string HelpExampleCli(const std::string &methodname, const std::string &args);
 extern std::string HelpExampleRpc(const std::string &methodname, const std::string &args);
@@ -200,4 +199,4 @@ void InterruptRPC();
 void StopRPC();
 std::string JSONRPCExecBatch(const UniValue &vReq);
 
-#endif // BITCOIN_RPCSERVER_H
+#endif // BITCOIN_RPC_SERVER_H

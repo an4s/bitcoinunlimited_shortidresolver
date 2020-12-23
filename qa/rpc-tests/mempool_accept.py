@@ -7,6 +7,7 @@ import test_framework.loginit
 
 from threading import Thread
 import time
+import subprocess
 import sys
 if sys.version_info[0] < 3:
     raise "Use Python 3"
@@ -19,9 +20,10 @@ import test_framework.cashlib as cashlib
 from test_framework.nodemessages import *
 from test_framework.script import *
 
+BitcoinCli = "bitcoin-cli"  # Will be amended with the path during initialization
 
 class PayDest:
-    """A payment destination.  All the info you need to send a payment here and make a subsequent payment 
+    """A payment destination.  All the info you need to send a payment here and make a subsequent payment
        from this address"""
 
     def __init__(self, node=None):
@@ -80,14 +82,14 @@ def createConflictingTx(dests, source, count, fee=1):
 
 
 def createTx(dests, sources, node, maxx=None, fee=1, nextWallet=None, generatedTx=None):
-    """ Create "maxx" transactions that spend from individual "sources" to every "dests" evenly (many fan-out 
+    """ Create "maxx" transactions that spend from individual "sources" to every "dests" evenly (many fan-out
     transactions).  If "generatedTx" is a list the created transactions are put into it.  Otherwise they are
     sent to "node".  If "nextWallet" is a list the outputs of all these created tx are put into it in a format
     compatible with "sources" (you can use nextWallet as the sources input in a subsequent call to this function).
 
     Change the base "fee" if you want which is actually the fee PER dest.
 
-    sources: list of dictionaries in RPC listunspent format, with optional additional "privkey" field which 
+    sources: list of dictionaries in RPC listunspent format, with optional additional "privkey" field which
        is the private key in bytes.  If "privkey" does not exist, "node" is asked for it.
     dests: a list of PayDest objects.
     fee: what to deduct as the fee (in Satoshi)
@@ -140,7 +142,7 @@ def createTx(dests, sources, node, maxx=None, fee=1, nextWallet=None, generatedT
             txhex = hexlify(tx.serialize()).decode("utf-8")
             txid = None
             try:
-                txid = node.enqueuerawtransaction(txhex)
+                txid = node.sendrawtransaction(txhex)
             except JSONRPCException as e:
                 logging.error("TX submission failed because %s" % str(e))
                 logging.error("tx was: %s" % txhex)
@@ -170,7 +172,7 @@ class MyTest (BitcoinTestFramework):
         initialize_chain(self.options.tmpdir, bitcoinConfDict, wallets)
 
     def setup_network(self, split=False):
-        self.nodes = start_nodes(2, self.options.tmpdir)
+        self.nodes = start_nodes(2, self.options.tmpdir, [["-rpcworkqueue=100"], ["-rpcworkqueue=100"]])
         # Now interconnect the nodes
         connect_nodes_bi(self.nodes, 0, 1)
         self.is_network_split = False
@@ -228,9 +230,9 @@ class MyTest (BitcoinTestFramework):
 
             for n in self.nodes:
                 waitFor(30, lambda: True if n.getmempoolinfo()["size"] >= NTX - 5 else None)
-            time.sleep(1)
             # we have to allow < because bloom filter false positives in the node's
             # sending logic may cause it to not get an INV
+            time.sleep(1)
             for n in self.nodes:
                 assert(n.getmempoolinfo()["size"] <= NTX)  # if its > then a doublespend got through
             self.commitMempool()  # clear out this test
@@ -245,25 +247,35 @@ class MyTest (BitcoinTestFramework):
             # create conflicting tx with slightly different payment amounts
             amt = createTx(dests0, wallet[0:NTX], 1, NTX, 2, wallet3, gtx3)
 
+            # Send two double spending trnasactions using a subprocess. This checks that sendrawtransaction
+            # does not allow double spends into the mempool when multiple threads are sending transactions.
+            conflict_count = 0;
+            rpc_u, rpc_p = rpc_auth_pair(0)
             gtx = zip(gtx2, gtx3)
             for g in gtx:
-                self.nodes[0].enqueuerawtransaction(g[0].toHex())
-                try:
-                    self.nodes[0].enqueuerawtransaction(g[1].toHex())
-                    # assert(0)  # double spend may not return an error because processing happens asynchronously
-                except JSONRPCException as e:
-                    if e.error["code"] != -26:  # txn-mempool-conflict
-                        raise
+                # send first tx
+                # if datadir is not provided, it assumes ~/.bitcoin so this code may sort of work if you
+                # happen to have a ~/.bitcoin since relevant parameters are overloaded.  But that's ugly,
+                # so supply datadir correctly.
+                p1 = subprocess.Popen([BitcoinCli, "-datadir=" + self.options.tmpdir + os.sep + "node0", "-rpcconnect=127.0.0.1", "-rpcport=" + str(rpc_port(0)), "-rpcuser=" + rpc_u, "-rpcpassword=" + rpc_p, "sendrawtransaction", g[0].toHex()], universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                
+                # send double spend
+                p2 = subprocess.Popen([BitcoinCli, "-datadir=" + self.options.tmpdir + os.sep + "node0", "-rpcconnect=127.0.0.1", "-rpcport=" + str(rpc_port(0)), "-rpcuser=" + rpc_u, "-rpcpassword=" + rpc_p, "sendrawtransaction", g[1].toHex()], universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+                stdout_data1, stderr_data1 = p1.communicate(timeout=5)
+                stdout_data2, stderr_data2 = p2.communicate(timeout=5)
+
+                if (stderr_data1.find("txn-mempool-conflict") >= 0):
+                    conflict_count += 1;
+                if (stderr_data2.find("txn-mempool-conflict") >= 0):
+                    conflict_count += 1;
+            waitFor(1, lambda: True if conflict_count == NTX else print("num conflicts found:" + str(conflict_count) + ", node0 mempool size:" + str(self.nodes[0].getmempoolinfo()["size"]) + ", node1 mempool size:" + str(self.nodes[1].getmempoolinfo()["size"])))
+
+            waitFor(30, lambda: True if self.nodes[0].getmempoolinfo()["size"] == NTX else None)
+            waitFor(30, lambda: True if self.nodes[1].getmempoolinfo()["size"] == NTX else None)
 
             # forget about the tx I used above
             wallet = wallet[NTX:]
-
-            waitFor(30, lambda: True if self.nodes[0].getmempoolinfo()["size"] >= NTX else None)
-            waitFor(30, lambda: True if self.nodes[1].getmempoolinfo()["size"] >= NTX else None)
-            time.sleep(2)  # see if any conflicts will be added to the mempool
-
-            assert(self.nodes[0].getmempoolinfo()["size"] == NTX)
-            assert(self.nodes[1].getmempoolinfo()["size"] == NTX)
 
             NTX1 = NTX
 
@@ -287,17 +299,15 @@ class MyTest (BitcoinTestFramework):
                 try:
                     self.nodes[(count + 1) % numNodes].enqueuerawtransaction(g[1].toHex())
                 except JSONRPCException as e:
-                    if e.error["code"] != -26:  # txn-mempool-conflict
+                    if e.error["code"] != -26 or e.error["code"] == -26:  # txn-mempool-conflict
                         pass  # we may get an error or not depending on propagation speed of 1st tx
 
             # There is no good way to tell if the mempool sync process has fully
             # completed because out of testing the process of accepting tx is never
-            # complete
-            waitFor(30, lambda: True if self.nodes[0].getmempoolinfo()["size"] >= NTX + NTX1 else None)
-            waitFor(30, lambda: True if self.nodes[1].getmempoolinfo()["size"] >= NTX + NTX1 else None)
-            time.sleep(2)  # see if any conflicts will be added to the mempool
-            assert(self.nodes[0].getmempoolinfo()["size"] == NTX + NTX1)
-            assert(self.nodes[1].getmempoolinfo()["size"] == NTX + NTX1)
+            # complete so sleep a little while first before checking.
+            time.sleep(2) #wait for all txns to propagate
+            waitFor(30, lambda: True if self.nodes[0].getmempoolinfo()["size"] == NTX + NTX1 else None)
+            waitFor(30, lambda: True if self.nodes[1].getmempoolinfo()["size"] == NTX + NTX1 else None)
 
             # forget about the tx I used
             wallet = wallet[NTX:]
@@ -393,6 +403,23 @@ class MyTest (BitcoinTestFramework):
         end = time.monotonic()
         logging.info("synced %d tx in %s seconds.  Speed %f tx/sec" % (NTX, end - start, float(NTX) / (end - start)))
 
+        # Regression test the stats now.  Ideally this would be in an isolated test, but this can be done here quickly
+        # and Travis runs out of time often.
+        for n in self.nodes:
+            result = n.getstatlist()
+            # logging.info(result)
+            result = n.getstat("memPool/txAdded", "sec10", 100)
+            logging.info(result)
+            result = n.getstat("memPool/size", "min5")
+            logging.info(result)
+            result = n.getstat("net/recv/msg/inv", "sec10", 20)
+            logging.info(result)
+            result = n.getstat("net/recv/total", "sec10", 20)
+            logging.info(result)
+            result = n.getstat("net/send/total", "sec10")
+            logging.info(result)
+
+
         if self.bigTest:
             # Start up node 4
             self.nodes.append(start_node(3, self.options.tmpdir))
@@ -408,8 +435,9 @@ class MyTest (BitcoinTestFramework):
             self.nodes[0].pushtx(destName)
             self.nodes[1].pushtx(destName)
             self.nodes[2].pushtx(destName)
-            mp = waitFor(120, lambda: [x.getmempoolinfo() for x in self.nodes]
-                         if NTX - self.nodes[3].getmempoolinfo()["size"] < 30 else None)
+            # Large mempool sync if running in debug mode (with periodic mempool checking) will be very slow
+            mp = waitFor(300, lambda: [x.getmempoolinfo() for x in self.nodes]
+                         if NTX - self.nodes[3].getmempoolinfo()["size"] < 30 else print ([x.getmempoolinfo()["size"] for x in self.nodes]))
             end = time.monotonic()
             logging.info("synced %d tx in %s seconds.  Speed %f tx/sec" % (NTX, end - start, float(NTX) / (end - start)))
 
@@ -431,6 +459,7 @@ if __name__ == '__main__':
 
     try:
         cashlib.init(path + os.sep + ".libs" + os.sep + "libbitcoincash.so")
+        BitcoinCli = os.getenv("BITCOINCLI", path + os.sep + "bitcoin-cli")
         MyTest().main()
     except OSError as e:
         print("Issue loading shared library.  This is expected during cross compilation since the native python will not load the .so: %s" % str(e))
@@ -438,6 +467,7 @@ if __name__ == '__main__':
 
 # Create a convenient function for an interactive python debugging session
 def Test():
+    global BitcoinCli
     t = MyTest(True)
     bitcoinConf = {
         "debug": ["blk", "mempool", "net", "req"],
@@ -460,5 +490,6 @@ def Test():
 
     # load the cashlib.so from our build directory
     cashlib.init(binpath + os.sep + ".libs" + os.sep + "libbitcoincash.so")
+    BitcoinCli = os.getenv("BITCOINCLI", binpath + os.sep + "bitcoin-cli")
     # start the test
     t.main(flags, bitcoinConf, None)

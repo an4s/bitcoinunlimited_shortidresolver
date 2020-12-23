@@ -4,8 +4,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_BITCOINCONSENSUS_H
-#define BITCOIN_BITCOINCONSENSUS_H
+#ifndef BITCOIN_SCRIPT_BITCOINCONSENSUS_H
+#define BITCOIN_SCRIPT_BITCOINCONSENSUS_H
 
 #if defined(BUILD_BITCOIN_INTERNAL) && defined(HAVE_CONFIG_H)
 #include "config/bitcoin-config.h"
@@ -53,7 +53,7 @@ enum
 /// Returns 1 if the input nIn of the serialized transaction pointed to by
 /// txTo correctly spends the scriptPubKey pointed to by scriptPubKey under
 /// the additional constraints specified by flags.
-/// If not NULL, err will contain an error/success code for the operation
+/// If not nullptr, err will contain an error/success code for the operation
 EXPORT_SYMBOL int bitcoinconsensus_verify_script(const unsigned char *scriptPubKey,
     unsigned int scriptPubKeyLen,
     const unsigned char *txTo,
@@ -71,4 +71,4 @@ EXPORT_SYMBOL unsigned int bitcoinconsensus_version();
 
 #undef EXPORT_SYMBOL
 
-#endif // BITCOIN_BITCOINCONSENSUS_H
+#endif // BITCOIN_SCRIPT_BITCOINCONSENSUS_H

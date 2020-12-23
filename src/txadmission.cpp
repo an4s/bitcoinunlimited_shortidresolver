@@ -1,20 +1,25 @@
-// Copyright (c) 2018 The Bitcoin Unlimited developers
+// Copyright (c) 2018-2019 The Bitcoin Unlimited developers
+// Copyright (C) 2019-2020 Tom Zander <tomz@freedommail.ch>
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-//#include "chainparams.h"
 #include "txadmission.h"
+#include "DoubleSpendProof.h"
+#include "DoubleSpendProofStorage.h"
 #include "blockstorage/blockstorage.h"
 #include "connmgr.h"
 #include "consensus/tx_verify.h"
+#include "core_io.h"
 #include "dosman.h"
 #include "fastfilter.h"
 #include "init.h"
-#include "main.h" // for cs_main
+#include "main.h"
 #include "net.h"
 #include "parallel.h"
+#include "policy/mempool.h"
 #include "requestManager.h"
 #include "respend/respenddetector.h"
+#include "threadgroup.h"
 #include "timedata.h"
 #include "txorphanpool.h"
 #include "unlimited.h"
@@ -31,11 +36,19 @@
 
 using namespace std;
 
+static void TestConflictEnqueueTx(CTxInputData &txd);
+
+// The average commit batch size is used to limit the quantity of transactions that are moved from the defer queue
+// onto the inqueue.  Without this, if received transactions far outstrip processing capacity, transactions can be
+// shuffled between the in queue and the defer queue with little progress being made.
+const uint64_t minCommitBatchSize = 10000;
+
+// avgCommitBatchSize is write protected by csCommitQ and is wrapped in std::atomic for reads.
+std::atomic<uint64_t> avgCommitBatchSize(0);
 
 Snapshot txHandlerSnap;
 
 void ThreadCommitToMempool();
-void ThreadTxAdmission();
 void ProcessOrphans(std::vector<uint256> &vWorkQueue);
 
 CTransactionRef CommitQGet(uint256 hash)
@@ -62,7 +75,7 @@ static inline uint256 IncomingConflictHash(const COutPoint &prevout)
     return hash;
 }
 
-void StartTxAdmission(thread_group &threadGroup)
+void StartTxAdmission()
 {
     if (txCommitQ == nullptr)
         txCommitQ = new std::map<uint256, CTxCommitData>();
@@ -127,6 +140,19 @@ void FlushTxAdmission()
 void EnqueueTxForAdmission(CTxInputData &txd)
 {
     LOCK(csTxInQ);
+    // If I have lots of deferred tx, its probably because there's too much volume, so defer new ones right away
+    if (txDeferQ.size() > 1000)
+    {
+        txDeferQ.push(txd);
+        return;
+    }
+
+    // Otherwise go ahead and put them on the queue
+    TestConflictEnqueueTx(txd);
+}
+
+static void TestConflictEnqueueTx(CTxInputData &txd)
+{
     bool conflict = false;
     for (auto &inp : txd.tx->vin)
     {
@@ -183,6 +209,9 @@ unsigned int TxAlreadyHave(const CInv &inv)
             return 4;
         return 0;
     }
+    case MSG_DOUBLESPENDPROOF:
+        return mempool.doubleSpendProofStorage()->exists(inv.hash) ||
+               mempool.doubleSpendProofStorage()->isRecentlyRejectedProof(inv.hash);
     }
     DbgAssert(0, return false); // this fn should only be called if CInv is a tx
 }
@@ -218,14 +247,12 @@ void ThreadCommitToMempool()
 
                 CValidationState state;
                 FlushStateToDisk(state, FLUSH_STATE_PERIODIC);
-                // The flush to disk above is only periodic therefore we need to continuously trim any excess from the
-                // cache.
-                pcoinsTip->Trim(nCoinCacheMaxSize);
-            }
 
-            // CheckInputs needs cs_main (for static int GetSpendHeight(const CCoinsViewCache &inputs)), but it has
-            // improper order with mempool so skip assert until cs_main dependency removed
-            // LOCK(cs_main);
+                // The flush to disk above is only periodic therefore we need to check if we need to trim
+                // any excess from the cache.
+                if (pcoinsTip->DynamicMemoryUsage() > (size_t)nCoinCacheMaxSize)
+                    pcoinsTip->Trim(nCoinCacheMaxSize * .95);
+            }
 
             mempool.check(pcoinsTip);
         }
@@ -249,46 +276,45 @@ void LimitMempoolSize(CTxMemPool &pool, size_t limit, unsigned long age)
 
 void CommitTxToMempool()
 {
+    // Committing the tx to the mempool takes time.  We can continue to validate non-conflicting tx during this time.
+    // To do so, before the transactions are finally commited to the mempool the txCommitQ pointer is copied
+    // to txCommitQFinal so that the lock on txCommitQ can be released and processing can continue.
+    // However, the incomingConflicts detector is not reset until all the transactions are committed to the mempool.
+    std::map<uint256, CTxCommitData> *txCommitQFinal = nullptr;
+
     std::vector<uint256> vWhatChanged;
-    std::map<uint256, CTxCommitData> *q;
     {
-        boost::unique_lock<boost::mutex> lock(csCommitQ);
-        LOG(MEMPOOL, "txadmission committing %d tx\n", txCommitQ->size());
-        q = txCommitQ;
-        txCommitQ = new std::map<uint256, CTxCommitData>();
-    }
+        // We must hold the mempool lock for the duration because we want to be sure that we don't end up
+        // doing this loop in the middle of a reorg where we might be clearing the mempool.
+        WRITELOCK(mempool.cs_txmempool);
 
-    // These transactions have already been validated so store them directly into the mempool.
-    for (auto &it : *q)
-    {
-        CTxCommitData &data = it.second;
-        mempool.addUnchecked(it.first, data.entry, !IsInitialBlockDownload());
-        vWhatChanged.push_back(data.hash);
-        // Update txn per second only when a txn is valid and accepted to the mempool
-        mempool.UpdateTransactionsPerSecond();
+        {
+            boost::unique_lock<boost::mutex> lock(csCommitQ);
+            avgCommitBatchSize = (avgCommitBatchSize * 24 + txCommitQ->size()) / 25;
+            txCommitQFinal = txCommitQ;
+            txCommitQ = new std::map<uint256, CTxCommitData>();
+        }
 
-        // Indicate that this tx was fully processed/accepted and can now be removed from the
-        // request manager.
-        CInv inv(MSG_TX, data.hash);
-        requester.Received(inv, nullptr);
-    }
-
-#ifdef ENABLE_WALLET
-    {
-        // cs_main is taken again in SyncWithWallets but must be locked before csCommitQ
-        // to maintain correct locking order.
-        LOCK(cs_main);
-
-        for (auto &it : *q)
+        // These transactions have already been validated so store them directly into the mempool.
+        for (auto &it : *txCommitQFinal)
         {
             CTxCommitData &data = it.second;
-            SyncWithWallets(data.entry.GetSharedTx(), nullptr, -1);
+            mempool._addUnchecked(it.first, data.entry, !IsInitialBlockDownload());
+            vWhatChanged.push_back(data.hash);
+
+            // Indicate that this tx was fully processed/accepted and can now be removed from the req mgr.
+            requester.Received(CInv(MSG_TX, data.hash), nullptr);
         }
     }
+    for (auto &it : *txCommitQFinal)
+    {
+        CTxCommitData &data = it.second;
+#ifdef ENABLE_WALLET
+        SyncWithWallets(data.entry.GetSharedTx(), nullptr, -1);
 #endif
-    q->clear();
-    delete q;
-
+    }
+    txCommitQFinal->clear();
+    delete txCommitQFinal;
 
     std::map<uint256, CTxInputData> mapWasDeferred;
     {
@@ -335,26 +361,30 @@ void CommitTxToMempool()
         // from re-requests.
         LOG(MEMPOOL, "popping txdeferQ, size %d\n", txDeferQ.size());
         // this could be a lot more efficient
-        while (!txDeferQ.empty())
+        uint64_t count = 0;
+        uint64_t maxmove = max(avgCommitBatchSize * 2, minCommitBatchSize);
+        while ((!txDeferQ.empty()) && (count < maxmove))
         {
+            count++;
             const uint256 &hash = txDeferQ.front().tx->GetHash();
-            mapWasDeferred.insert(std::pair<uint256, CTxInputData>(hash, txDeferQ.front()));
-
+            mapWasDeferred.emplace(hash, txDeferQ.front());
             txDeferQ.pop();
         }
     }
 
     if (!mapWasDeferred.empty())
-        LOG(MEMPOOL, "%d tx were deferred\n", mapWasDeferred.size());
+        LOG(MEMPOOL, "Enqueueing %d deferred tx\n", mapWasDeferred.size());
 
-    for (auto &it : mapWasDeferred)
     {
-        LOG(MEMPOOL, "attempt enqueue deferred %s\n", it.first.ToString());
-        EnqueueTxForAdmission(it.second);
+        LOCK(csTxInQ);
+        for (auto &it : mapWasDeferred)
+        {
+            // LOG(MEMPOOL, "attempt enqueue deferred %s\n", it.first.ToString());
+            TestConflictEnqueueTx(it.second);
+        }
     }
     ProcessOrphans(vWhatChanged);
 }
-
 
 void ThreadTxAdmission()
 {
@@ -363,6 +393,29 @@ void ThreadTxAdmission()
 
     while (shutdown_threads.load() == false)
     {
+        // Start or Stop threads as determined by the numTxAdmissionThreads tweak
+        {
+            static CCriticalSection cs_threads;
+            static uint32_t numThreads GUARDED_BY(cs_threads) = numTxAdmissionThreads.Value();
+            LOCK(cs_threads);
+            if (numTxAdmissionThreads.Value() >= 1 && numThreads > numTxAdmissionThreads.Value())
+            {
+                // Kill this thread
+                numThreads--;
+                LOGA("Stopping a tx admission thread: Current admission threads are %d\n", numThreads);
+
+                return;
+            }
+            else if (numThreads < numTxAdmissionThreads.Value())
+            {
+                // Launch another thread
+                numThreads++;
+                threadGroup.create_thread(&ThreadTxAdmission);
+                LOGA("Starting a new tx admission thread: Current admission threads are %d\n", numThreads);
+            }
+        }
+
+        // Loop processing starts here
         bool acceptedSomething = false;
         if (shutdown_threads.load() == true)
         {
@@ -375,7 +428,7 @@ void ThreadTxAdmission()
         CTxInputData txd;
 
         {
-            CCriticalBlock lock(csTxInQ, "csTxInQ", __FILE__, __LINE__);
+            CCriticalBlock lock(csTxInQ, "csTxInQ", __FILE__, __LINE__, LockType::RECURSIVE_MUTEX);
             while (txInQ.empty() && shutdown_threads.load() == false)
             {
                 if (shutdown_threads.load() == true)
@@ -398,7 +451,7 @@ void ThreadTxAdmission()
                 // tx must be popped within the TX_PROCESSING corral or the state break between processing
                 // and commitment will not be clean
                 {
-                    CCriticalBlock lock(csTxInQ, "csTxInQ", __FILE__, __LINE__);
+                    CCriticalBlock lock(csTxInQ, "csTxInQ", __FILE__, __LINE__, LockType::RECURSIVE_MUTEX);
                     if (txInQ.empty())
                     {
                         // speed up tx chunk processing when there is nothing else to do
@@ -412,35 +465,22 @@ void ThreadTxAdmission()
                     txInQ.pop();
                 }
 
-                CTransactionRef &tx = txd.tx;
+                CTransactionRef tx = txd.tx;
                 CInv inv(MSG_TX, tx->GetHash());
 
                 if (!TxAlreadyHave(inv))
                 {
-
-                    #if LOG_TRANSACTIONS
-                    logFile(tx, pfrom->GetAddrName());
-                    #endif
-                    #if FALAFEL_RECEIVER
-                                // check if one of the missing transactions that we care about is received
-                                auto findRes = std::find(falafel_missing_invs.begin(),
-                                                        falafel_missing_invs.end(),
-                                                        inv.hash.ToString());
-                                // if transaction is received, log to appropriate file
-                                if(findRes != falafel_missing_invs.end())
-                                {
-                                    logFile(inv.hash.ToString(), "missingInvResTrack.txt");
-                                    falafel_missing_invs.erase(findRes);
-                                }
-                    #endif
-
                     std::vector<COutPoint> vCoinsToUncache;
                     bool isRespend = false;
+                    CTxProperties txProperties;
+                    // If mempool policy aware relay is on, then supply a structure to gather the needed data,
+                    // otherwise nullptr turns it off.
+                    CTxProperties *txProps = (unconfPushAction.Value() == 0) ? nullptr : &txProperties;
                     if (ParallelAcceptToMemoryPool(txHandlerSnap, mempool, state, tx, true, &fMissingInputs, false,
-                            false, TransactionClass::DEFAULT, vCoinsToUncache, &isRespend))
+                            false, TransactionClass::DEFAULT, vCoinsToUncache, &isRespend, nullptr, txProps))
                     {
                         acceptedSomething = true;
-                        RelayTransaction(tx);
+                        RelayTransaction(tx, txProps);
 
                         // LOG(MEMPOOL, "Accepted tx: peer=%s: accepted %s onto Q\n", txd.nodeName,
                         //     tx->GetHash().ToString());
@@ -468,7 +508,7 @@ void ThreadTxAdmission()
 
                         if (fMissingInputs)
                         {
-                            WRITELOCK(orphanpool.cs);
+                            WRITELOCK(orphanpool.cs_orphanpool);
                             orphanpool.AddOrphanTx(tx, txd.nodeId);
 
                             // DoS prevention: do not allow mapOrphanTransactions to grow unbounded
@@ -522,8 +562,8 @@ void ThreadTxAdmission()
                     int nDoS = 0;
                     if (state.IsInvalid(nDoS) && state.GetRejectCode() != REJECT_WAITING)
                     {
-                        LOG(MEMPOOL, "%s from peer=%s was not accepted: %s\n", tx->GetHash().ToString(), txd.nodeName,
-                            FormatStateMessage(state));
+                        LOG(MEMPOOL, "%s from peer=%s was not accepted: %s\ntx: %s", tx->GetHash().ToString(),
+                            txd.nodeName, FormatStateMessage(state), EncodeHexTx(*tx));
                         if (state.GetRejectCode() <
                             REJECT_INTERNAL) // Never send AcceptToMemoryPool's internal codes over P2P
                         {
@@ -556,20 +596,33 @@ bool AcceptToMemoryPool(CTxMemPool &pool,
     bool fRejectAbsurdFee,
     TransactionClass allowedTx)
 {
+    // This lock is here to serialize AcceptToMemoryPool(). This must be done because
+    // we do not enqueue the transaction prior to calling this function, as we do with
+    // the normal multi-threaded tx admission.
+    static CCriticalSection cs_accept;
+    LOCK(cs_accept);
+
     std::vector<COutPoint> vCoinsToUncache;
 
     bool res = false;
 
+    // pause parallel tx entry and commit all txns to the pool so that there are no
+    // other threads running txadmission and to ensure that the mempool state is current.
     CORRAL(txProcessingCorral, CORRAL_TX_PAUSE);
     CommitTxToMempool();
+    txHandlerSnap.Load();
 
     bool isRespend = false;
     bool missingInputs = false;
+    CTxProperties txProperties;
+    // If mempool policy aware relay is on, then supply a structure to gather the needed data,
+    // otherwise nullptr turns it off.
+    CTxProperties *txProps = (unconfPushAction.Value() == 0) ? nullptr : &txProperties;
     res = ParallelAcceptToMemoryPool(txHandlerSnap, pool, state, tx, fLimitFree, &missingInputs, fOverrideMempoolLimit,
-        fRejectAbsurdFee, allowedTx, vCoinsToUncache, &isRespend);
+        fRejectAbsurdFee, allowedTx, vCoinsToUncache, &isRespend, nullptr, txProps);
     if (res)
     {
-        RelayTransaction(tx);
+        RelayTransaction(tx, txProps);
     }
 
     // Uncache any coins for txns that failed to enter the mempool but were NOT orphan txns
@@ -601,8 +654,12 @@ bool ParallelAcceptToMemoryPool(Snapshot &ss,
     bool fRejectAbsurdFee,
     TransactionClass allowedTx,
     std::vector<COutPoint> &vCoinsToUncache,
-    bool *isRespend)
+    bool *isRespend,
+    CValidationDebugger *debugger,
+    CTxProperties *txProps)
 {
+    const CChainParams &chainparams = Params();
+    bool may2020Enabled = IsMay2020Activated(chainparams.GetConsensus(), chainActive.Tip());
     if (isRespend)
         *isRespend = false;
     unsigned int nSigOps = 0;
@@ -612,18 +669,40 @@ bool ParallelAcceptToMemoryPool(Snapshot &ss,
     if (pfMissingInputs)
         *pfMissingInputs = false;
 
-    const CChainParams &chainparams = Params();
+    if (debugger)
+    {
+        debugger->txid = tx->GetHash().ToString();
+    }
 
-    if (!CheckTransaction(tx, state))
+    if (!CheckTransaction(tx, state) || !ContextualCheckTransaction(tx, state, chainActive.Tip(), chainparams))
     {
         if (state.GetDebugMessage() == "")
             state.SetDebugMessage("CheckTransaction failed");
-        return false;
+        if (debugger)
+        {
+            debugger->AddInvalidReason(state.GetRejectReason());
+            state = CValidationState();
+        }
+        else
+        {
+            return false;
+        }
     }
 
     // Coinbase is only valid in a block, not as a loose transaction
     if (tx->IsCoinBase())
-        return state.DoS(100, false, REJECT_INVALID, "coinbase");
+    {
+        if (debugger)
+        {
+            debugger->AddInvalidReason("Coinbase is only valid in a block, not as a loose transaction");
+            debugger->mineable = false;
+            debugger->futureMineable = false;
+        }
+        else
+        {
+            return state.DoS(100, false, REJECT_INVALID, "coinbase");
+        }
+    }
 
     // Reject nonstandard transactions if so configured.
     // (-testnet/-regtest allow nonstandard, and explicit submission via RPC)
@@ -631,38 +710,38 @@ bool ParallelAcceptToMemoryPool(Snapshot &ss,
     bool fRequireStandard = chainparams.RequireStandard();
 
     if (allowedTx == TransactionClass::STANDARD)
+    {
         fRequireStandard = true;
+    }
     else if (allowedTx == TransactionClass::NONSTANDARD)
+    {
         fRequireStandard = false;
+    }
     if (fRequireStandard && !IsStandardTx(tx, reason))
     {
-        state.SetDebugMessage("IsStandardTx failed");
-        return state.DoS(0, false, REJECT_NONSTANDARD, reason);
+        if (debugger)
+        {
+            debugger->AddInvalidReason(reason);
+        }
+        else
+        {
+            state.SetDebugMessage("IsStandardTx failed");
+            return state.DoS(0, false, REJECT_NONSTANDARD, reason);
+        }
     }
 
-    const uint32_t cds_flag = (AreWeOnBCHChain() && IsNov2018Activated(chainparams.GetConsensus(), chainActive.Tip())) ?
-                                  SCRIPT_ENABLE_CHECKDATASIG :
-                                  0;
-    const uint32_t schnorrflag =
-        (AreWeOnBCHChain() && IsMay2019Enabled(chainparams.GetConsensus(), chainActive.Tip())) ? SCRIPT_ENABLE_SCHNORR :
-                                                                                                 0;
-    const uint32_t segwit_flag =
-        (AreWeOnBCHChain() && IsMay2019Enabled(chainparams.GetConsensus(), chainActive.Tip()) && !fRequireStandard) ?
-            SCRIPT_ALLOW_SEGWIT_RECOVERY :
-            0;
-    const uint32_t svflag = (AreWeOnSVChain() && IsSv2018Activated(chainparams.GetConsensus(), chainActive.Tip())) ?
-                                SCRIPT_ENABLE_MUL_SHIFT_INVERT_OPCODES :
-                                0;
-    const uint32_t featureFlags = cds_flag | schnorrflag | segwit_flag | svflag;
-    const uint32_t flags = STANDARD_SCRIPT_VERIFY_FLAGS | featureFlags;
-
-    // Don't relay version 2 transactions until CSV is active, and we can be
-    // sure that such transactions will be mined (unless we're on
-    // -testnet/-regtest).
-    if (fRequireStandard && tx->nVersion >= 2 &&
-        VersionBitsTipState(chainparams.GetConsensus(), Consensus::DEPLOYMENT_CSV) != THRESHOLD_ACTIVE)
+    uint32_t featureFlags = 0;
+    if (may2020Enabled)
     {
-        return state.DoS(0, false, REJECT_NONSTANDARD, "premature-version2-tx");
+        featureFlags |= SCRIPT_ENABLE_OP_REVERSEBYTES | SCRIPT_VERIFY_INPUT_SIGCHECKS;
+    }
+
+    uint32_t flags = STANDARD_SCRIPT_VERIFY_FLAGS | featureFlags;
+
+    // Disable DISALLOW_SEGWIT in case we accept non standard transactions.
+    if (!fRequireStandard)
+    {
+        flags &= ~SCRIPT_DISALLOW_SEGWIT_RECOVERY;
     }
 
     // Only accept nLockTime-using transactions that can be mined in the next
@@ -670,23 +749,50 @@ bool ParallelAcceptToMemoryPool(Snapshot &ss,
     // be mined yet.
     if (!CheckFinalTx(tx, STANDARD_LOCKTIME_VERIFY_FLAGS, &ss))
     {
-        if (!IsChainSyncd() && IsChainNearlySyncd())
-            return state.DoS(0, false, REJECT_WAITING, "non-final");
+        if (debugger)
+        {
+            debugger->AddInvalidReason("non-final");
+            debugger->mineable = false;
+        }
         else
-            return state.DoS(0, false, REJECT_NONSTANDARD, "non-final");
+        {
+            if (!IsChainSyncd() && IsChainNearlySyncd())
+                return state.DoS(0, false, REJECT_WAITING, "non-final");
+            else
+                return state.DoS(0, false, REJECT_NONSTANDARD, "non-final");
+        }
     }
 
     // Make sure tx size is acceptable after Nov 15, 2018 fork
-    if (AreWeOnBCHChain() && IsNov2018Activated(chainparams.GetConsensus(), chainActive.Tip()))
+    if (IsNov2018Activated(chainparams.GetConsensus(), chainActive.Tip()))
     {
         if (tx->GetTxSize() < MIN_TX_SIZE)
-            return state.DoS(0, false, REJECT_INVALID, "txn-undersize");
+        {
+            if (debugger)
+            {
+                debugger->AddInvalidReason("txn-undersize");
+                debugger->mineable = false;
+            }
+            else
+            {
+                return state.DoS(0, false, REJECT_INVALID, "txn-undersize");
+            }
+        }
     }
 
     // is it already in the memory pool?
     uint256 hash = tx->GetHash();
     if (pool.exists(hash))
-        return state.Invalid(false, REJECT_ALREADY_KNOWN, "txn-already-in-mempool");
+    {
+        if (debugger)
+        {
+            debugger->AddInvalidReason("txn-already-in-mempool");
+        }
+        else
+        {
+            return state.Invalid(false, REJECT_ALREADY_KNOWN, "txn-already-in-mempool");
+        }
+    }
 
     // Check for conflicts with in-memory transactions and triggers actions at
     // end of scope (relay tx, sync wallet, etc)
@@ -695,9 +801,20 @@ bool ParallelAcceptToMemoryPool(Snapshot &ss,
 
     if (respend.IsRespend() && !respend.IsInteresting())
     {
-        // Tx is a respend, and it's not an interesting one (we don't care to
-        // validate it further)
-        return state.Invalid(false, REJECT_CONFLICT, "txn-mempool-conflict");
+        if (debugger)
+        {
+            debugger->mineable = false;
+            debugger->futureMineable = false;
+            // debugger->AddInvalidReason(
+            // "tx-mempool-conflict: " + txin.prevout.hash.ToString() + ":" + std::to_string(txin.prevout.n));
+            debugger->AddInvalidReason("txn-mempool-conflict");
+        }
+        else
+        {
+            // Tx is a respend, and it's not an interesting one (we don't care to
+            // validate it further)
+            return state.Invalid(false, REJECT_CONFLICT, "txn-mempool-conflict");
+        }
     }
     {
         CCoinsView dummy;
@@ -706,10 +823,10 @@ bool ParallelAcceptToMemoryPool(Snapshot &ss,
         CAmount nValueIn = 0;
         LockPoints lp;
         {
-            READLOCK(pool.cs);
+            READLOCK(ss.cs_snapshot);
+            READLOCK(pool.cs_txmempool);
             CCoinsViewMemPool &viewMemPool(*ss.cvMempool);
             view.SetBackend(viewMemPool);
-
             // do all inputs exist?
             if (pfMissingInputs)
             {
@@ -725,24 +842,47 @@ bool ParallelAcceptToMemoryPool(Snapshot &ss,
                     // We still want to keep orphantx coins in the event the orphantx is finally accepted into the
                     // mempool or shows up in a block that is mined.  Therefore if pfMissingInputs returns true then
                     // any coins in vCoinsToUncache will NOT be uncached.
-                    if (!ss.coins->HaveCoinInCache(txin.prevout))
+                    bool fSpent = false;
+                    bool fMissingOrSpent = false;
+                    if (!ss.coins->HaveCoinInCache(txin.prevout, fSpent))
                     {
                         vCoinsToUncache.push_back(txin.prevout);
+                        if (!view.GetCoinFromDB(txin.prevout))
+                        {
+                            fMissingOrSpent = true;
+                        }
                     }
-
-                    if (!view.HaveCoin(txin.prevout))
+                    if (fSpent || fMissingOrSpent)
                     {
+                        if (debugger)
+                        {
+                            debugger->mineable = false;
+                            debugger->futureMineable = false;
+                            debugger->AddInvalidReason("input-does-not-exist: " + txin.prevout.hash.ToString() + ":" +
+                                                       std::to_string(txin.prevout.n));
+                        }
                         // fMissingInputs and not state.IsInvalid() is used to detect this condition, don't set
                         // state.Invalid()
                         *pfMissingInputs = true;
-                        break; // There is no point checking any more once one fails, for orphans we will recheck
+                        if (debugger == nullptr)
+                        {
+                            break; // There is no point checking any more once one fails, for orphans we will recheck
+                        }
                     }
                 }
                 if (*pfMissingInputs == true)
                 {
-                    state.SetDebugMessage("Inputs are missing");
-                    return false; // state.Invalid(false, REJECT_MISSING_INPUTS, "bad-txns-missing-inputs", "Inputs
-                    // unavailable in ParallelAcceptToMemoryPool", false);
+                    if (debugger)
+                    {
+                        debugger->AddInvalidReason("Inputs are missing");
+                        return false;
+                    }
+                    else
+                    {
+                        state.SetDebugMessage("Inputs are missing");
+                        return false; // state.Invalid(false, REJECT_MISSING_INPUTS, "bad-txns-missing-inputs", "Inputs
+                        // unavailable in ParallelAcceptToMemoryPool", false);
+                    }
                 }
             }
 
@@ -760,15 +900,31 @@ bool ParallelAcceptToMemoryPool(Snapshot &ss,
             // Must keep pool.cs for this unless we change CheckSequenceLocks to take a
             // CoinsViewCache instead of create its own
             if (!CheckSequenceLocks(tx, STANDARD_LOCKTIME_VERIFY_FLAGS, &lp, false, &ss))
-                return state.DoS(0, false, REJECT_NONSTANDARD, "non-BIP68-final");
+            {
+                if (debugger)
+                {
+                    debugger->AddInvalidReason("non-BIP68-final");
+                }
+                else
+                {
+                    return state.DoS(0, false, REJECT_NONSTANDARD, "non-BIP68-final");
+                }
+            }
         }
 
         // Check for non-standard pay-to-script-hash in inputs
-        if (fRequireStandard && !AreInputsStandard(tx, view))
-            return state.Invalid(false, REJECT_NONSTANDARD, "bad-txns-nonstandard-inputs");
-
-        nSigOps = GetLegacySigOpCount(tx, STANDARD_CHECKDATASIG_VERIFY_FLAGS);
-        nSigOps += GetP2SHSigOpCount(tx, view, STANDARD_CHECKDATASIG_VERIFY_FLAGS);
+        if (fRequireStandard && !AreInputsStandard(tx, view, may2020Enabled))
+        {
+            if (debugger)
+            {
+                debugger->AddInvalidReason("bad-txns-nonstandard-inputs");
+                debugger->standard = false;
+            }
+            else
+            {
+                return state.Invalid(false, REJECT_NONSTANDARD, "bad-txns-nonstandard-inputs");
+            }
+        }
 
         CAmount nValueOut = tx->GetValueOut();
         CAmount nFees = nValueIn - nValueOut;
@@ -793,32 +949,114 @@ bool ParallelAcceptToMemoryPool(Snapshot &ss,
             }
         }
 
-        CTxCommitData eData; // TODO awkward construction in these 4 lines
-        CTxMemPoolEntry entryTemp(tx, nFees, GetTime(), dPriority, chainActive.Height(), pool.HasNoInputsOf(*tx),
-            inChainInputValue, fSpendsCoinbase, nSigOps, lp);
-        eData.entry = entryTemp;
-        CTxMemPoolEntry &entry(eData.entry);
-        nSize = entry.GetTxSize();
+        // Check that input script constraints are satisfied
+        unsigned char sighashType = 0;
+        if (!CheckInputs(tx, state, view, true, flags, maxScriptOps.Value(), true, &resourceTracker, nullptr,
+                &sighashType, debugger))
+        {
+            if (debugger && debugger->InputsCheck1IsValid())
+            {
+                debugger->AddInvalidReason("input-script-failed");
+                debugger->mineable = false;
+                debugger->futureMineable = false;
+            }
+            else
+            {
+                LOG(MEMPOOL, "CheckInputs failed for tx: %s\n", hash.ToString());
+                if (state.GetDebugMessage() == "")
+                    state.SetDebugMessage("CheckInputs failed");
+                return false;
+            }
+        }
 
-        // Check that the transaction doesn't have an excessive number of
-        // sigops, making it impossible to mine.
-        if (nSigOps > MAX_TX_SIGOPS)
-            return state.DoS(0, false, REJECT_NONSTANDARD, "bad-txns-too-many-sigops", false, strprintf("%d", nSigOps));
+        // Check that the transaction doesn't have an excessive number of sigops, making it impossible to mine.
+        if (may2020Enabled) // Enforce May 2020 consensus sigchecks rule
+        {
+            nSigOps = resourceTracker.GetConsensusSigChecks();
+            if (nSigOps > MAY2020_MAX_TX_SIGCHECK_COUNT)
+            {
+                if (debugger)
+                {
+                    debugger->AddInvalidReason("bad-txns-too-many-sigchecks");
+                    debugger->mineable = false;
+                }
+                else
+                {
+                    return state.DoS(
+                        0, false, REJECT_INVALID, "bad-txns-too-many-sigchecks", false, strprintf("%d", nSigOps));
+                }
+            }
+            // Place sigchecks into the mempool sigops field, since these are not cotemporaneous
+            LOG(MEMPOOL, "Mempool is tracking sigchecks.  Tx %s has %d\n", hash.ToString(), nSigOps);
+        }
+        else // Old sigop counting
+        {
+            nSigOps = GetLegacySigOpCount(tx, STANDARD_SCRIPT_VERIFY_FLAGS);
+            nSigOps += GetP2SHSigOpCount(tx, view, STANDARD_SCRIPT_VERIFY_FLAGS);
+            LOG(MEMPOOL, "Mempool is tracking sigops.  Tx %s has %d\n", hash.ToString(), nSigOps);
+
+            if (nSigOps > MAX_TX_SIGOPS_COUNT)
+            {
+                if (debugger)
+                {
+                    debugger->AddInvalidReason("bad-txns-too-many-sigops");
+                    debugger->mineable = false;
+                }
+                else
+                {
+                    return state.DoS(
+                        0, false, REJECT_NONSTANDARD, "bad-txns-too-many-sigops", false, strprintf("%d", nSigOps));
+                }
+            }
+        }
+
+        // Create a commit data entry
+        CTxMemPoolEntry entry(tx, nFees, GetTime(), dPriority, chainActive.Height(), pool.HasNoInputsOf(tx),
+            inChainInputValue, fSpendsCoinbase, nSigOps, lp);
+        // Record the actual number of sigops executed for statistical purposes only
+        entry.UpdateRuntimeSigOps(resourceTracker.GetSigOps(), resourceTracker.GetSighashBytes());
+
+        nSize = entry.GetTxSize();
 
         CAmount mempoolRejectFee =
             pool.GetMinFee(GetArg("-maxmempool", DEFAULT_MAX_MEMPOOL_SIZE) * 1000000).GetFee(nSize);
         if (mempoolRejectFee > 0 && nModifiedFees < mempoolRejectFee)
         {
-            return state.DoS(0, false, REJECT_INSUFFICIENTFEE, "mempool min fee not met", false,
-                strprintf("%d < %d", nFees, mempoolRejectFee));
+            if (debugger)
+            {
+                debugger->AddInvalidReason("mempool min fee not met");
+                debugger->standard = false;
+            }
+            else
+            {
+                return state.DoS(0, false, REJECT_INSUFFICIENTFEE, "mempool min fee not met", false,
+                    strprintf("%d < %d", nFees, mempoolRejectFee));
+            }
         }
         else if (GetBoolArg("-relaypriority", DEFAULT_RELAYPRIORITY) && nModifiedFees < ::minRelayTxFee.GetFee(nSize) &&
                  !AllowFree(entry.GetPriority(chainActive.Height() + 1)))
         {
-            // Require that free transactions have sufficient priority to be mined in the next block.
-            LOG(MEMPOOL, "Txn fee %lld (%d - %d), priority fee delta was %lld\n", nFees, nValueIn, nValueOut,
-                nModifiedFees - nFees);
-            return state.DoS(0, false, REJECT_INSUFFICIENTFEE, "insufficient priority");
+            if (debugger)
+            {
+                debugger->AddInvalidReason("insufficient-priority");
+                debugger->AddInvalidReason("insufficient-fee: need " + std::to_string(minRelayTxFee.GetFee(nSize)) +
+                                           " was only " + std::to_string(nModifiedFees));
+                debugger->AddInvalidReason("minimum-fee: " + std::to_string(minRelayTxFee.GetFee(nSize)));
+                debugger->standard = false;
+            }
+            else
+            {
+                // Require that free transactions have sufficient priority to be mined in the next block.
+                LOG(MEMPOOL, "Txn fee %lld (%d - %d), priority fee delta was %lld\n", nFees, nValueIn, nValueOut,
+                    nModifiedFees - nFees);
+                return state.DoS(0, false, REJECT_INSUFFICIENTFEE, "insufficient priority");
+            }
+        }
+        if (debugger)
+        {
+            debugger->txMetadata.emplace("size", std::to_string(nSize));
+            debugger->txMetadata.emplace("txfee", std::to_string(nModifiedFees));
+            debugger->txMetadata.emplace("txfeeneeded", std::to_string(minRelayTxFee.GetFee(nSize)));
         }
 
         // BU - Xtreme Thinblocks Auto Mempool Limiter - begin section
@@ -827,6 +1065,9 @@ bool ParallelAcceptToMemoryPool(Snapshot &ss,
          * be annoying or make others' transactions take longer to confirm. */
         // maximum nMinRelay in satoshi per byte
         static const int nLimitFreeRelay = GetArg("-limitfreerelay", DEFAULT_LIMITFREERELAY);
+        // In case nLimitFreeRelay is defined less than the DEFAULT_MIN_LIMITFREERELAY we have to use the lower value
+        static const int nMinLimitFreeRelay = std::min((int)DEFAULT_MIN_LIMITFREERELAY, nLimitFreeRelay);
+
 
         // get current memory pool size
         uint64_t poolBytes = pool.GetTotalTxSize();
@@ -866,8 +1107,6 @@ bool ParallelAcceptToMemoryPool(Snapshot &ss,
             }
 
             // When the mempool starts falling use an exponentially decaying ~24 hour window:
-            // nFreeLimit = nFreeLimit + ((double)(DEFAULT_LIMIT_FREE_RELAY - nFreeLimit) / pow(1.0 - 1.0/86400,
-            // (double)(nNow - nLastTime)));
             nFreeLimit /= std::pow(1.0 - 1.0 / 86400, (double)(nNow - nLastTime));
 
             // When the mempool starts falling use an exponentially decaying ~24 hour window:
@@ -887,26 +1126,28 @@ bool ParallelAcceptToMemoryPool(Snapshot &ss,
                     _dMinLimiterTxFee + ((_dMaxLimiterTxFee - _dMinLimiterTxFee) * (poolBytes - nLargestBlockSeen) /
                                             (nLargestBlockSeen * (MAX_BLOCK_SIZE_MULTIPLIER - 1))));
 
-                // Gradually choke off the nFreeLimit as well but leave at least DEFAULT_MIN_LIMITFREERELAY
+                // Gradually choke off the nFreeLimit as well but leave at least nMinLimitFreeRelay
                 // So that some free transactions can still get through
                 nFreeLimit = std::min(
-                    nFreeLimit, ((double)nLimitFreeRelay - ((double)(nLimitFreeRelay - DEFAULT_MIN_LIMITFREERELAY) *
+                    nFreeLimit, ((double)nLimitFreeRelay - ((double)(nLimitFreeRelay - nMinLimitFreeRelay) *
                                                                (double)(poolBytes - nLargestBlockSeen) /
                                                                (nLargestBlockSeen * (MAX_BLOCK_SIZE_MULTIPLIER - 1)))));
-                if (nFreeLimit < DEFAULT_MIN_LIMITFREERELAY)
-                    nFreeLimit = DEFAULT_MIN_LIMITFREERELAY;
+                if (nFreeLimit < nMinLimitFreeRelay)
+                    nFreeLimit = nMinLimitFreeRelay;
             }
             else
             {
                 nMinRelay = _dMaxLimiterTxFee;
-                nFreeLimit = DEFAULT_MIN_LIMITFREERELAY;
+                nFreeLimit = nMinLimitFreeRelay;
             }
 
-            minRelayTxFee = CFeeRate(nMinRelay * 1000);
-            LOG(MEMPOOL, "MempoolBytes:%d  LimitFreeRelay:%.5g  nMinRelay:%.4g  FeesSatoshiPerByte:%.4g  TxBytes:%d  "
-                         "TxFees:%d\n",
-                poolBytes, nFreeLimit, nMinRelay, ((double)nFees) / nSize, nSize, nFees);
-            if (fLimitFree && nFees < ::minRelayTxFee.GetFee(nSize))
+            minRelayTxFee = CFeeRate((CAmount)(nMinRelay * 1000));
+            // useful but spammy
+            // LOG(MEMPOOL, "MempoolBytes:%d  LimitFreeRelay:%.5g  nMinRelay:%.4g  FeesSatoshiPerByte:%.4g  TxBytes:%d "
+            //                         "TxFees:%d\n",
+            //                poolBytes, nFreeLimit, nMinRelay, ((double)nFees) / nSize, nSize, nFees);
+            if ((fLimitFree && nFees < ::minRelayTxFee.GetFee(nSize)) ||
+                (nLimitFreeRelay == 0 && nFees < ::minRelayTxFee.GetFee(nSize)))
             {
                 static double dFreeCount = 0;
 
@@ -919,10 +1160,18 @@ bool ParallelAcceptToMemoryPool(Snapshot &ss,
                 if ((dFreeCount + nSize) >=
                     (nFreeLimit * 10 * 1000 * nLargestBlockSeen / BLOCKSTREAM_CORE_MAX_BLOCK_SIZE))
                 {
-                    thindata.UpdateMempoolLimiterBytesSaved(nSize);
-                    LOG(MEMPOOL, "AcceptToMemoryPool : free transaction %s rejected by rate limiter\n",
-                        hash.ToString());
-                    return state.DoS(0, false, REJECT_INSUFFICIENTFEE, "rate limited free transaction");
+                    if (debugger)
+                    {
+                        debugger->AddInvalidReason("rate limited free transaction");
+                        debugger->standard = false;
+                    }
+                    else
+                    {
+                        thindata.UpdateMempoolLimiterBytesSaved(nSize);
+                        LOG(MEMPOOL, "AcceptToMemoryPool : free transaction %s rejected by rate limiter\n",
+                            hash.ToString());
+                        return state.DoS(0, false, REJECT_INSUFFICIENTFEE, "rate limited free transaction");
+                    }
                 }
                 dFreeCount += nSize;
             }
@@ -934,29 +1183,79 @@ bool ParallelAcceptToMemoryPool(Snapshot &ss,
         // empty mempool.  So set the minimum "absurd" fee to 10000 satoshies per byte.  If for some reason fees rise
         // above that, you can specify up to 100x what other txns are paying in the mempool
         if (fRejectAbsurdFee && nFees > std::max((int64_t)100L * nSize, maxTxFee.Value()) * 100)
-            return state.Invalid(false, REJECT_HIGHFEE, "absurdly-high-fee",
-                strprintf("%d > %d", nFees, std::max((int64_t)1L, maxTxFee.Value()) * 10000));
-
-        eData.hash = hash;
-        // Calculate in-mempool ancestors, up to a limit.
-        size_t nLimitAncestors = GetArg("-limitancestorcount", DEFAULT_ANCESTOR_LIMIT);
-        size_t nLimitAncestorSize = GetArg("-limitancestorsize", DEFAULT_ANCESTOR_SIZE_LIMIT) * 1000;
-        size_t nLimitDescendants = GetArg("-limitdescendantcount", DEFAULT_DESCENDANT_LIMIT);
-        size_t nLimitDescendantSize = GetArg("-limitdescendantsize", DEFAULT_DESCENDANT_SIZE_LIMIT) * 1000;
-        std::string errString;
-
-        // Check against previous transactions
-        // This is done last to help prevent CPU exhaustion denial-of-service attacks.
-        unsigned char sighashType = 0;
-        if (!CheckInputs(
-                tx, state, view, true, flags, maxScriptOps.Value(), true, &resourceTracker, nullptr, &sighashType))
         {
-            LOG(MEMPOOL, "CheckInputs failed for tx: %s\n", tx->GetHash().ToString().c_str());
-            if (state.GetDebugMessage() == "")
-                state.SetDebugMessage("CheckInputs failed");
-            return false;
+            if (debugger)
+            {
+                debugger->AddInvalidReason("absurdly-high-fee");
+                debugger->standard = false;
+            }
+            else
+            {
+                return state.Invalid(false, REJECT_HIGHFEE, "absurdly-high-fee",
+                    strprintf("%d > %d", nFees, std::max((int64_t)1L, maxTxFee.Value()) * 10000));
+            }
         }
-        entry.UpdateRuntimeSigOps(resourceTracker.GetSigOps(), resourceTracker.GetSighashBytes());
+
+        // Calculate in-mempool ancestors, up to a limit.
+        size_t nLimitAncestors = GetArg("-limitancestorcount", BU_DEFAULT_ANCESTOR_LIMIT);
+        size_t nLimitAncestorSize = GetArg("-limitancestorsize", BU_DEFAULT_ANCESTOR_SIZE_LIMIT) * 1000;
+        size_t nLimitDescendants = GetArg("-limitdescendantcount", BU_DEFAULT_DESCENDANT_LIMIT);
+        size_t nLimitDescendantSize = GetArg("-limitdescendantsize", BU_DEFAULT_DESCENDANT_SIZE_LIMIT) * 1000;
+        std::string errString;
+        CTxMemPool::setEntries setAncestors;
+        {
+            READLOCK(pool.cs_txmempool);
+            // note we could resolve ancestors to hashes and return those if that saves time in the txc thread
+            if (!pool._CalculateMemPoolAncestors(entry, setAncestors, nLimitAncestors, nLimitAncestorSize,
+                    nLimitDescendants, nLimitDescendantSize, errString))
+            {
+                if (debugger)
+                {
+                    debugger->AddInvalidReason("too-long-mempool-chain");
+                    debugger->mineable = false;
+                }
+                else
+                {
+                    // this is effectively "missing inputs" since they are not usable due to unconf depth, so set the
+                    // flag so that this tx gets on the orphan queue
+                    *pfMissingInputs = true;
+                    // If the chain is not sync'd entirely then we'll defer this tx until the new block is processed.
+                    if (!IsChainSyncd() && IsChainNearlySyncd())
+                        return state.DoS(0, false, REJECT_WAITING, "too-long-mempool-chain");
+                    else
+                        return state.DoS(0, false, REJECT_NONSTANDARD, "too-long-mempool-chain", false, errString);
+                }
+            }
+        }
+        // If restrict inputs is enabled and we are extending a long unconfirmed chain past the network
+        // default limit, then make sure to check that the txn only has one input. This prevents the reverse
+        // double spend attack.
+        if (setAncestors.size() >= BCH_DEFAULT_ANCESTOR_LIMIT && restrictInputs.Value() == true)
+        {
+            if (tx->vin.size() > 1)
+            {
+                // this is effectively "missing inputs" since they are not usable due to unconf depth, so set the
+                // flag so that this tx gets on the orphan queue
+                *pfMissingInputs = true;
+
+                return state.DoS(0, false, REJECT_NONSTANDARD, "bad-txn-too-many-inputs");
+            }
+        }
+
+        if (txProps) // This is inefficient since _CalculateMemPoolAncestors also calculates this
+        {
+            txProps->countWithAncestors = setAncestors.size();
+            uint64_t size = tx->GetTxSize();
+            for (auto ancestor : setAncestors)
+            {
+                size += ancestor->GetTxSize();
+            }
+            txProps->sizeWithAncestors = size;
+
+            // How can something we are just adding have any descendants?  It can't so these values are just this tx
+            txProps->countWithDescendants = 1;
+            txProps->sizeWithDescendants = tx->GetTxSize();
+        }
 
         // Check again against just the consensus-critical mandatory script
         // verification flags, in case of bugs in the standard flags that cause
@@ -969,14 +1268,23 @@ bool ParallelAcceptToMemoryPool(Snapshot &ss,
         // can be exploited as a DoS attack.
         unsigned char sighashType2 = 0;
         if (!CheckInputs(tx, state, view, true, MANDATORY_SCRIPT_VERIFY_FLAGS | featureFlags, maxScriptOps.Value(),
-                true, nullptr, nullptr, &sighashType2))
+                true, nullptr, nullptr, &sighashType2, debugger))
         {
-            if (state.GetDebugMessage() == "")
-                state.SetDebugMessage("CheckInputs failed against mandatory but not standard flags");
+            if (debugger && debugger->InputsCheck1IsValid())
+            {
+                debugger->AddInvalidReason("CheckInputs failed against mandatory but not standard flags");
+                debugger->mineable = false;
+                debugger->futureMineable = false;
+            }
+            else
+            {
+                if (state.GetDebugMessage() == "")
+                    state.SetDebugMessage("CheckInputs failed against mandatory but not standard flags");
 
-            return error(
-                "%s: BUG! PLEASE REPORT THIS! ConnectInputs failed against MANDATORY but not STANDARD flags %s, %s",
-                __func__, hash.ToString(), FormatStateMessage(state));
+                return error(
+                    "%s: BUG! PLEASE REPORT THIS! ConnectInputs failed against MANDATORY but not STANDARD flags %s, %s",
+                    __func__, hash.ToString(), FormatStateMessage(state));
+            }
         }
 
         entry.sighashType = sighashType | sighashType2;
@@ -984,33 +1292,41 @@ bool ParallelAcceptToMemoryPool(Snapshot &ss,
         // This code denies old style tx from entering the mempool as soon as we fork
         if (!IsTxUAHFOnly(entry))
         {
-            return state.Invalid(false, REJECT_WRONG_FORK, "txn-uses-old-sighash-algorithm");
-        }
-
-        respend.SetValid(true);
-        if (respend.IsRespend())
-        {
-            return state.Invalid(false, REJECT_CONFLICT, "txn-mempool-conflict");
-        }
-
-        {
-            READLOCK(pool.cs);
-            CTxMemPool::setEntries setAncestors;
-            // note we could resolve ancestors to hashes and return those if that saves time in the txc thread
-            if (!pool._CalculateMemPoolAncestors(entry, setAncestors, nLimitAncestors, nLimitAncestorSize,
-                    nLimitDescendants, nLimitDescendantSize, errString))
+            if (debugger)
             {
-                // If the chain is not sync'd entirely then we'll defer this tx until the new block is processed.
-                if (!IsChainSyncd() && IsChainNearlySyncd())
-                    return state.DoS(0, false, REJECT_WAITING, "too-long-mempool-chain");
-                else
-                    return state.DoS(0, false, REJECT_NONSTANDARD, "too-long-mempool-chain", false, errString);
+                debugger->AddInvalidReason("txn-uses-old-sighash-algorithm");
+            }
+            else
+            {
+                return state.Invalid(false, REJECT_WRONG_FORK, "txn-uses-old-sighash-algorithm");
             }
         }
 
+        // Check for repend before committing the tx to the mempool
+        respend.SetValid(true);
+        if (respend.IsRespend())
         {
+            if (debugger)
+            {
+                debugger->AddInvalidReason("txn-mempool-conflict");
+            }
+            else
+            {
+                return state.Invalid(false, REJECT_CONFLICT, "txn-mempool-conflict");
+            }
+        }
+        else if (debugger == nullptr)
+        {
+            // If it's not a respend it may have a reclaimed orphan associated with it
+            entry.dsproof = respend.GetDsproof();
+
+            // Add entry to the commit queue
+            CTxCommitData eData;
+            eData.entry = std::move(entry);
+            eData.hash = hash;
+
             boost::unique_lock<boost::mutex> lock(csCommitQ);
-            (*txCommitQ)[eData.hash] = eData;
+            (*txCommitQ).emplace(eData.hash, eData);
         }
     }
     uint64_t interval = (GetStopwatch() - start) / 1000;
@@ -1020,6 +1336,11 @@ bool ParallelAcceptToMemoryPool(Snapshot &ss,
         interval, tx->GetHash().ToString(), nSize, resourceTracker.GetSigOps(), (unsigned int)nSigOps,
         resourceTracker.GetSighashBytes(), tx->vin.size(), tx->vout.size());
     nTxValidationTime << interval;
+
+    // Update txn per second. We must do it here although technically the txn isn't in the mempool yet but
+    // rather in the CommitQ. However, if we don't do it here then we'll end up with very bursty and not very
+    // realistic processing throughput data.
+    mempool.UpdateTransactionsPerSecond();
 
     return true;
 }
@@ -1047,12 +1368,11 @@ TransactionClass ParseTransactionClass(const std::string &s)
 
 void ProcessOrphans(std::vector<uint256> &vWorkQueue)
 {
-    std::vector<uint256> vEraseQueue;
-
-    // Recursively process any orphan transactions that depended on this one
+    // Recursively process any orphan transactions that depended on this one.
+    // NOTE: you must not return early since EraseOrphansByTime() must always be checked
+    std::map<uint256, CTxInputData> mapEnqueue;
     {
-        READLOCK(orphanpool.cs);
-        std::set<NodeId> setMisbehaving;
+        READLOCK(orphanpool.cs_orphanpool);
         for (unsigned int i = 0; i < vWorkQueue.size(); i++)
         {
             std::map<uint256, std::set<uint256> >::iterator itByPrev =
@@ -1067,45 +1387,45 @@ void ProcessOrphans(std::vector<uint256> &vWorkQueue)
                 // we always erase orphans and any mapOrphanTransactionsByPrev at the same time, still we need to
                 // be sure.
                 bool fOk = true;
-                DbgAssert(orphanpool.mapOrphanTransactions.count(orphanHash), fOk = false);
+                std::map<uint256, CTxOrphanPool::COrphanTx>::iterator iter =
+                    orphanpool.mapOrphanTransactions.find(orphanHash);
+                DbgAssert(iter != orphanpool.mapOrphanTransactions.end(), fOk = false);
                 if (!fOk)
                     continue;
 
-                const CTransactionRef &orphanTx = orphanpool.mapOrphanTransactions[orphanHash].ptx;
-                NodeId fromPeer = orphanpool.mapOrphanTransactions[orphanHash].fromPeer;
-                // Use a dummy CValidationState so someone can't setup nodes to counter-DoS based on orphan
-                // resolution (that is, feeding people an invalid transaction based on LegitTxX in order to get
-                // anyone relaying LegitTxX banned)
-                CValidationState stateDummy;
-
-                if (setMisbehaving.count(fromPeer))
-                    continue;
                 {
                     CTxInputData txd;
-                    txd.tx = orphanTx;
-                    txd.nodeId = fromPeer;
+                    txd.tx = iter->second.ptx;
+                    txd.nodeId = iter->second.fromPeer;
                     txd.nodeName = "orphan";
-                    LOG(MEMPOOL, "Resubmitting orphan tx: %s\n", orphanTx->GetHash().ToString().c_str());
-                    EnqueueTxForAdmission(txd);
+                    LOG(MEMPOOL, "Resubmitting orphan tx: %s\n", orphanHash.ToString());
+                    mapEnqueue.emplace(std::move(orphanHash), std::move(txd));
                 }
-                vEraseQueue.push_back(orphanHash);
             }
         }
     }
 
+    // First delete the orphans before enqueuing them otherwise we may end up putting them
+    // in the queue twice.
     {
-        WRITELOCK(orphanpool.cs);
-        for (auto hash : vEraseQueue)
-            orphanpool.EraseOrphanTx(hash);
-        //  BU: Xtreme thinblocks - purge orphans that are too old
+        WRITELOCK(orphanpool.cs_orphanpool);
+        for (auto it = mapEnqueue.begin(); it != mapEnqueue.end(); it++)
+        {
+            // If the orphan was not erased then it must already have been erased/enqueued by another thread
+            // so do not enqueue this orphan again.
+            if (!orphanpool.EraseOrphanTx(it->first))
+                it = mapEnqueue.erase(it);
+        }
         orphanpool.EraseOrphansByTime();
     }
+    for (auto &it : mapEnqueue)
+        EnqueueTxForAdmission(it.second);
 }
 
 
 void Snapshot::Load(void)
 {
-    LOCK(cs);
+    WRITELOCK(cs_snapshot);
     tipHeight = chainActive.Height();
     tip = chainActive.Tip();
     if (tip)
@@ -1121,12 +1441,12 @@ void Snapshot::Load(void)
     if (cvMempool)
         delete cvMempool;
 
-    READLOCK(mempool.cs);
+    READLOCK(mempool.cs_txmempool);
     // ss.coins contains the UTXO set for the tip in ss
     cvMempool = new CCoinsViewMemPool(coins, mempool);
 }
 
-bool CheckSequenceLocks(const CTransactionRef &tx,
+bool CheckSequenceLocks(const CTransactionRef tx,
     int flags,
     LockPoints *lp,
     bool useExistingLockPoints,
@@ -1134,7 +1454,7 @@ bool CheckSequenceLocks(const CTransactionRef &tx,
 {
     if (ss == nullptr)
         AssertLockHeld(cs_main);
-    AssertLockHeld(mempool.cs);
+    AssertLockHeld(mempool.cs_txmempool);
 
     CBlockIndex *tip = (ss != nullptr) ? ss->tip : chainActive.Tip();
     CBlockIndex index;
@@ -1212,7 +1532,7 @@ bool CheckSequenceLocks(const CTransactionRef &tx,
     return EvaluateSequenceLocks(index, lockPair);
 }
 
-bool CheckFinalTx(const CTransactionRef &tx, int flags, const Snapshot *ss)
+bool CheckFinalTx(const CTransactionRef tx, int flags, const Snapshot *ss)
 {
     // By convention a negative value for flags indicates that the
     // current network-enforced consensus rules should be used. In
@@ -1228,7 +1548,7 @@ bool CheckFinalTx(const CTransactionRef &tx, int flags, const Snapshot *ss)
     // evaluated is what is used. Thus if we want to know if a
     // transaction can be part of the *next* block, we need to call
     // IsFinalTx() with one more than chainActive.Height().
-    const int nBlockHeight = (ss != nullptr) ? ss->tipHeight + 1 : chainActive.Height() + 1;
+    const int nBlockHeight = max((int)((ss != nullptr) ? ss->tipHeight + 1 : 0), chainActive.Height() + 1);
 
     // BIP113 will require that time-locked transactions have nLockTime set to
     // less than the median time of the previous block they're contained in.

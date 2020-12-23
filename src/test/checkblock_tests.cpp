@@ -1,5 +1,5 @@
 // Copyright (c) 2013-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2017 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -41,24 +41,36 @@ bool read_block(const std::string &filename, CBlock &block)
     return true;
 }
 
+bool LockAndContextualCheckBlock(CBlock &block, CValidationState &state)
+{
+    LOCK(cs_main);
+    return ContextualCheckBlock(block, state, nullptr);
+}
+
 BOOST_FIXTURE_TEST_SUITE(checkblock_tests, BasicTestingSetup) // BU harmonize suite name with filename
 
 
 BOOST_AUTO_TEST_CASE(TestBlock)
 {
     CBlock testblock;
-    if (read_block("testblock.dat", testblock))
+    bool fReadBlock = read_block("testblock.dat", testblock);
+    BOOST_CHECK_MESSAGE(fReadBlock, "Failed to read testblock.dat");
+    if (fReadBlock)
     {
         CValidationState state;
 
         uint64_t blockSize = ::GetSerializeSize(testblock, SER_NETWORK, PROTOCOL_VERSION); // 53298 B for test.dat
 
         BOOST_CHECK_MESSAGE(CheckBlock(testblock, state, false, false), "Basic CheckBlock failed");
+        // NOTE: setting of fExcessive was moved from CheckBlock to ContextualCheckBlock in c64d44b7
+        BOOST_CHECK_MESSAGE(LockAndContextualCheckBlock(testblock, state), "Contextual CheckBlock failed");
         BOOST_CHECK_MESSAGE(!testblock.fExcessive,
             "Block with size " << blockSize << " ought not to have been excessive when excessiveBlockSize is "
                                << excessiveBlockSize);
         excessiveBlockSize = blockSize - 1;
         BOOST_CHECK_MESSAGE(CheckBlock(testblock, state, false, false), "Basic CheckBlock failed");
+        // NOTE: setting of fExcessive was moved from CheckBlock to ContextualCheckBlock in c64d44b7
+        BOOST_CHECK_MESSAGE(LockAndContextualCheckBlock(testblock, state), "Contextual CheckBlock failed");
         BOOST_CHECK_MESSAGE(testblock.fExcessive,
             "Block with size " << blockSize << " ought to have been excessive when excessiveBlockSize is "
                                << excessiveBlockSize);

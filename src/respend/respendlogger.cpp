@@ -1,4 +1,5 @@
 // Copyright (c) 2018 The Bitcoin developers
+// Copyright (c) 2018-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -9,12 +10,12 @@ namespace respend
 {
 RespendLogger::RespendLogger() : equivalent(false), valid("indeterminate"), newConflict(false) {}
 bool RespendLogger::AddOutpointConflict(const COutPoint &,
-    const CTxMemPool::txiter mempoolEntry,
-    const CTransactionRef &pRespendTx,
+    const uint256 hash,
+    const CTransactionRef pRespendTx,
     bool seen,
     bool isEquivalent)
 {
-    orig = mempoolEntry->GetTx().GetHash().ToString();
+    orig = hash.ToString();
     respend = pRespendTx->GetHash().ToString();
     equivalent = isEquivalent;
     newConflict = newConflict || !seen;
@@ -29,7 +30,7 @@ bool RespendLogger::IsInteresting() const
     return false;
 }
 
-void RespendLogger::Trigger()
+void RespendLogger::Trigger(CTxMemPool &pool)
 {
     if (respend.empty())
         return;

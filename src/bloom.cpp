@@ -1,11 +1,11 @@
 // Copyright (c) 2012-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include "bloom.h"
 
-#include "hash.h"
+#include "hashwrapper.h"
 #include "primitives/transaction.h"
 #include "random.h"
 #include "script/script.h"
@@ -182,7 +182,8 @@ bool CBloomFilter::IsWithinSizeConstraints() const
     return vData.size() <= SMALLEST_MAX_BLOOM_FILTER_SIZE && nHashFuncs <= MAX_HASH_FUNCS;
 }
 
-bool CBloomFilter::IsRelevantAndUpdate(const CTransactionRef &tx)
+#ifndef ANDROID // We do not want to pull "Solver" into the Android cashlib compile
+bool CBloomFilter::MatchAndInsertOutputs(const CTransactionRef &tx)
 {
     bool fFound = false;
     // Match if the filter contains the hash of tx
@@ -227,9 +228,13 @@ bool CBloomFilter::IsRelevantAndUpdate(const CTransactionRef &tx)
         }
     }
 
-    if (fFound)
-        return true;
+    return (fFound);
+}
 
+bool CBloomFilter::MatchInputs(const CTransactionRef &tx)
+{
+    if (isEmpty)
+        return false;
     for (const CTxIn &txin : tx->vin)
     {
         // Match if the filter contains an outpoint tx spends
@@ -251,6 +256,7 @@ bool CBloomFilter::IsRelevantAndUpdate(const CTransactionRef &tx)
 
     return false;
 }
+#endif
 
 void CBloomFilter::UpdateEmptyFull()
 {
@@ -366,7 +372,9 @@ bool CRollingBloomFilter::contains(const uint256 &hash) const
 bool CRollingBloomFilter::contains(const COutPoint &outpoint) const { return contains(ToVector(outpoint)); }
 void CRollingBloomFilter::reset()
 {
+#ifndef ANDROID // On Android don't pick a new tweak value because we don't have GetRand
     nTweak = GetRand(std::numeric_limits<unsigned int>::max());
+#endif
     nEntriesThisGeneration = 0;
     nGeneration = 1;
     for (std::vector<uint64_t>::iterator it = data.begin(); it != data.end(); it++)

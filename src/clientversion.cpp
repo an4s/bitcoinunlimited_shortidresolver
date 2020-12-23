@@ -16,7 +16,7 @@
  * for both bitcoind and bitcoin-core, to make it harder for attackers to
  * target servers or GUI users specifically.
  */
-const std::string CLIENT_NAME("BUCash");
+const std::string CLIENT_NAME("BCH Unlimited");
 
 // BU added
 /**
@@ -24,6 +24,11 @@ const std::string CLIENT_NAME("BUCash");
  * this can be used to hide
  */
 std::string subverOverride("");
+
+/**
+ * Tweak to turn on/off the display of node architecture on subver string
+ */
+bool fDisplayArchInSubver = true;
 
 // BU move instantiation to a single file
 const int CLIENT_VERSION = 1000000 * CLIENT_VERSION_MAJOR + 10000 * CLIENT_VERSION_MINOR +
@@ -116,17 +121,42 @@ std::string FormatSubVersion(const std::string &name, int nClientVersion, const 
     if (!subverOverride.empty())
         return subverOverride;
 
+    std::vector<std::string> uacomments = mapMultiArgs["-uacomment"];
+
+    // If this is a 32bit build then append an identifier since we'd like to know
+    // how many still run this configuration.
+    // We are going to put it at the front of uacomments so it immediately
+    // follows the EB/AD parameters and won't get truncated
+    {
+        int temp = 0;
+        int *ptemp = &temp;
+        std::string arch = (sizeof(ptemp) == 4) ? "32bit" : "64bit";
+        if (fDisplayArchInSubver)
+        {
+            uacomments.insert(std::begin(uacomments), arch);
+        }
+    }
+
+    std::vector<std::string> vTotComments = comments;
+    vTotComments.insert(std::end(vTotComments), std::begin(uacomments), std::end(uacomments));
+
     std::ostringstream ss;
     ss << "/";
     ss << name << ":" << FormatVersion(nClientVersion);
-    if (!comments.empty())
+    if (!vTotComments.empty())
     {
-        std::vector<std::string>::const_iterator it(comments.begin());
+        std::vector<std::string>::const_iterator it(vTotComments.begin());
         ss << "(" << *it;
-        for (++it; it != comments.end(); ++it)
+        for (++it; it != vTotComments.end(); ++it)
             ss << "; " << *it;
         ss << ")";
     }
     ss << "/";
-    return ss.str();
+
+    std::string subver = ss.str();
+    if (subver.size() > MAX_SUBVERSION_LENGTH)
+    {
+        subver = subver.substr(0, MAX_SUBVERSION_LENGTH - 2) + ")/";
+    }
+    return subver;
 }

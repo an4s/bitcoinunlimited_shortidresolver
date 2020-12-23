@@ -199,6 +199,11 @@ void saveWindowGeometry(const QString &strSetting, QWidget *parent);
 /** Restore window size and position */
 void restoreWindowGeometry(const QString &strSetting, const QSize &defaultSizeIn, QWidget *parent);
 
+/** Save table column header configuration */
+void saveColumnConfiguration(const QString &strSetting, QHeaderView *header);
+/** Restore table column header configuration */
+bool restoreColumnConfiguration(const QString &strSetting, QHeaderView *header);
+
 /* Convert QString to OS specific boost path through UTF-8 */
 fs::path qstringToBoostPath(const QString &path);
 
@@ -217,6 +222,9 @@ QString formatPingTime(double dPingTime);
 /* Format a CNodeCombinedStats.nTimeOffset into a user-readable string. */
 QString formatTimeOffset(int64_t nTimeOffset);
 
+/* Represent time from last generated block in human readable text */
+QString formateNiceTimeOffset(qint64 secs);
+
 #if defined(Q_OS_MAC)
 // workaround for Qt OSX Bug:
 // https://bugreports.qt-project.org/browse/QTBUG-15631
@@ -225,6 +233,7 @@ class ProgressBar : public QProgressBar
 {
     bool event(QEvent *e) { return (e->type() != QEvent::StyleAnimationUpdate) ? QProgressBar::event(e) : false; }
 };
+
 #else
 typedef QProgressBar ProgressBar;
 #endif

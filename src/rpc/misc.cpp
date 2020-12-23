@@ -1,10 +1,12 @@
 // Copyright (c) 2010 Satoshi Nakamoto
 // Copyright (c) 2009-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include "blockrelay/blockrelay_common.h"
 #include "dstencode.h"
+#include "index/txindex.h"
 #include "init.h"
 #include "main.h"
 #include "net.h"
@@ -54,6 +56,9 @@ UniValue getinfo(const UniValue &params, bool fHelp)
             "  \"blocks\": xxxxxx,           (numeric) the current number of blocks processed in the server\n"
             "  \"timeoffset\": xxxxx,        (numeric) the time offset\n"
             "  \"connections\": xxxxx,       (numeric) the number of connections\n"
+            "  \"peers_graphene\": xxxxx     (numeric) the number of grapheneblock peers\n"
+            "  \"peers_xthinblock\": xxxxx,  (numeric) the number of xthinblock peers\n"
+            "  \"peers_cmpctblock\": xxxxx,  (numeric) the number of compactblock peers\n"
             "  \"proxy\": \"host:port\",     (string, optional) the proxy used by the server\n"
             "  \"difficulty\": xxxxxx,       (numeric) the current difficulty\n"
             "  \"testnet\": true|false,      (boolean) if the server is using testnet or not\n"
@@ -68,10 +73,10 @@ UniValue getinfo(const UniValue &params, bool fHelp)
             "  \"relayfee\": x.xxxx,         (numeric) minimum relay fee for non-free transactions in " +
             CURRENCY_UNIT +
             "/kB\n"
-            "  \"fork\": \"...\"             (string) \"Bitcoin Cash\" or \"Bitcoin\".  Will display as Bitcoin "
-            "pre-fork.\n"
             "  \"status\":\"...\"            (string) long running operations are indicated here (rescan).\n"
             "  \"errors\": \"...\"           (string) any error messages\n"
+            "  \"fork\": \"...\"             (string) \"Bitcoin Cash\" or \"Bitcoin\".  Will display as Bitcoin "
+            "pre-fork.\n"
             "}\n"
             "\nExamples:\n" +
             HelpExampleCli("getinfo", "") + HelpExampleRpc("getinfo", ""));
@@ -85,9 +90,7 @@ UniValue getinfo(const UniValue &params, bool fHelp)
     }
 
 #ifdef ENABLE_WALLET
-    LOCK2(cs_main, pwalletMain ? &pwalletMain->cs_wallet : nullptr);
-#else
-    LOCK(cs_main);
+    LOCK(pwalletMain ? &pwalletMain->cs_wallet : nullptr);
 #endif
 
     proxyType proxy;
@@ -106,6 +109,9 @@ UniValue getinfo(const UniValue &params, bool fHelp)
     obj.pushKV("blocks", (int)chainActive.Height());
     obj.pushKV("timeoffset", GetTimeOffset());
     obj.pushKV("connections", nNodes);
+    obj.pushKV("peers_graphene", (int)thinrelay.GetGraphenePeers());
+    obj.pushKV("peers_xthinblock", (int)thinrelay.GetThinBlockPeers());
+    obj.pushKV("peers_cmpctblock", (int)thinrelay.GetCompactBlockPeers());
     obj.pushKV("proxy", (proxy.IsValid() ? proxy.proxy.ToStringIPPort() : string()));
     obj.pushKV("difficulty", (double)GetDifficulty());
     obj.pushKV("testnet", Params().TestnetToBeDeprecatedFieldRPC());
@@ -121,6 +127,7 @@ UniValue getinfo(const UniValue &params, bool fHelp)
 #endif
     obj.pushKV("relayfee", ValueFromAmount(::minRelayTxFee.GetFeePerK()));
     obj.pushKV("status", statusStrings.GetPrintable());
+    obj.pushKV("txindex", IsTxIndexReady() ? "synced" : "not ready");
     obj.pushKV("errors", GetWarnings("statusbar"));
     obj.pushKV("fork", "Bitcoin Cash");
 
@@ -134,6 +141,7 @@ UniValue logline(const UniValue &params, bool fHelp)
                             "Writes a string into the log (prefixed with 'rpc-logline: ').\n"
                             "\nResult: None\n");
     LOGA("rpc-logline: %s\n", params[0].get_str());
+    LogFlush();
     return NullUniValue;
 }
 

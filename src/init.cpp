@@ -1,6 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -28,12 +28,17 @@
 #include "httprpc.h"
 #include "httpserver.h"
 #include "httpserver.h"
+#include "index/txindex.h"
 #include "key.h"
 #include "main.h"
 #include "miner.h"
 #include "net.h"
 #include "parallel.h"
+#include "policy/fees.h"
+#include "policy/mempool.h"
 #include "policy/policy.h"
+#include "requestManager.h"
+#include "rpc/blockchain.h"
 #include "rpc/register.h"
 #include "rpc/server.h"
 #include "script/sigcache.h"
@@ -51,7 +56,6 @@
 #include "validation/validation.h"
 #include "validation/verifydb.h"
 #include "validationinterface.h"
-#include "logFile.h"
 
 #ifdef ENABLE_WALLET
 #include "wallet/db.h"
@@ -69,7 +73,7 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/algorithm/string/split.hpp>
-#include <boost/bind.hpp>
+#include <boost/bind/bind.hpp>
 #include <boost/function.hpp>
 #include <boost/interprocess/sync/file_lock.hpp>
 #include <openssl/crypto.h>
@@ -83,8 +87,11 @@ using namespace std;
 
 bool fFeeEstimatesInitialized = false;
 
+/** Has the AppInit2() startup phase returned */
+std::atomic<bool> fAppInit2{false};
+
 #if ENABLE_ZMQ
-static CZMQNotificationInterface *pzmqNotificationInterface = NULL;
+static CZMQNotificationInterface *pzmqNotificationInterface = nullptr;
 #endif
 
 #ifdef WIN32
@@ -167,10 +174,10 @@ public:
     // Writes do not need similar protection, as failure to write is handled by the caller.
 };
 
-static CCoinsViewErrorCatcher *pcoinscatcher = NULL;
+static CCoinsViewErrorCatcher *pcoinscatcher = nullptr;
 static std::unique_ptr<ECCVerifyHandle> globalVerifyHandle;
 
-void Interrupt(thread_group &threadGroup)
+void Interrupt()
 {
     // Interrupt Parallel Block Validation threads if there are any running.
     if (PV)
@@ -188,6 +195,10 @@ void Interrupt(thread_group &threadGroup)
     // stop TxAdmission needs to be done before threadGroup tries to join_all
     // we only join_all after Interrupt so call StopTxAdmission here
     StopTxAdmission();
+    if (g_txindex)
+    {
+        g_txindex->Stop();
+    }
 }
 
 void Shutdown()
@@ -205,6 +216,16 @@ void Shutdown()
     RenameThread("shutoff");
     mempool.AddTransactionsUpdated(1);
 
+    // Call every async stop function before flushing to disk
+    StopHTTPRPC();
+    StopREST();
+    StopRPC();
+    StopHTTPServer();
+    StopTxAdmission();
+    StopNode();
+    PV.reset(nullptr); // clean up scriptcheck threads
+
+    // This is the longest running shutdown procedure
     {
         LOCK(cs_main);
         if (pcoinsTip != nullptr)
@@ -215,18 +236,18 @@ void Shutdown()
         }
     }
 
-    StopHTTPRPC();
-    StopREST();
-    StopRPC();
-    StopHTTPServer();
     electrum::ElectrumServer::Instance().Stop();
 #ifdef ENABLE_WALLET
     if (pwalletMain)
         pwalletMain->Flush(false);
 #endif
     GenerateBitcoins(false, 0, Params());
-    StopTxAdmission();
-    StopNode();
+
+    if (g_txindex)
+    {
+        g_txindex.reset();
+    }
+
     StopTorControl();
     UnregisterNodeSignals(GetNodeSignals());
     if (fDumpMempoolLater && GetArg("-persistmempool", DEFAULT_PERSIST_MEMPOOL))
@@ -247,16 +268,16 @@ void Shutdown()
 
     {
         LOCK(cs_main);
-        if (pcoinsTip != NULL)
+        if (pcoinsTip != nullptr)
         {
             FlushStateToDisk();
         }
         delete pcoinsTip;
-        pcoinsTip = NULL;
+        pcoinsTip = nullptr;
         delete pcoinscatcher;
-        pcoinscatcher = NULL;
+        pcoinscatcher = nullptr;
         delete pcoinsdbview;
-        pcoinsdbview = NULL;
+        pcoinsdbview = nullptr;
         delete pblocktree;
         pblocktree = nullptr;
         delete pblockdb;
@@ -272,7 +293,7 @@ void Shutdown()
     {
         UnregisterValidationInterface(pzmqNotificationInterface);
         delete pzmqNotificationInterface;
-        pzmqNotificationInterface = NULL;
+        pzmqNotificationInterface = nullptr;
     }
 #endif
 
@@ -289,12 +310,13 @@ void Shutdown()
     UnregisterAllValidationInterfaces();
 #ifdef ENABLE_WALLET
     delete pwalletMain;
-    pwalletMain = NULL;
+    pwalletMain = nullptr;
 #endif
     globalVerifyHandle.reset();
     ECC_Stop();
-
+    requester.Cleanup();
     NetCleanup();
+    connmgr.reset(nullptr); // clean up connection manager
     MainCleanup();
     UnlimitedCleanup();
     LOGA("%s: done\n", __func__);
@@ -335,7 +357,7 @@ void OnRPCPreCommand(const CRPCCommand &cmd)
 
 // BU LicenseInfo() is moved to unlimited.cpp
 
-static void BlockNotifyCallback(bool initialSync, const CBlockIndex *pBlockIndex)
+static void BlockNotifyCallback(bool initialSync, const CBlockIndex *pBlockIndex, bool fHeader)
 {
     if (initialSync || !pBlockIndex)
         return;
@@ -344,6 +366,22 @@ static void BlockNotifyCallback(bool initialSync, const CBlockIndex *pBlockIndex
 
     boost::replace_all(strCmd, "%s", pBlockIndex->GetBlockHash().GetHex());
     boost::thread t(runCommand, strCmd); // thread runs free
+}
+
+static void NotifyElectrumCallback(bool initialSync, const CBlockIndex *pBlockIndex, bool)
+{
+    if (initialSync || !pBlockIndex)
+        return;
+
+    if (!GetArg("-electrum.blocknotify", true))
+    {
+        // When using with ElectrsCash < 2.0.0, this must be set to false, as
+        // the signal is intepreted as "shutdown", rather than as block
+        // notification.
+        return;
+    }
+
+    electrum::ElectrumServer::Instance().NotifyNewBlock();
 }
 
 struct CImportingNow
@@ -405,7 +443,22 @@ void CleanupBlockRevFiles()
     }
 }
 
-void ThreadImport(std::vector<fs::path> vImportFiles)
+static void ReconsiderChainOnStartup()
+{
+    if (!fReindex && !(avoidReconsiderMostWorkChain.Value()))
+    {
+        try
+        {
+            bool fOverride = false;
+            ReconsiderMostWorkChain(fOverride);
+        }
+        catch (...)
+        {
+        }
+    }
+}
+
+void ThreadImport(std::vector<fs::path> vImportFiles, uint64_t nTxIndexCache)
 {
     const CChainParams &chainparams = Params();
     RenameThread("loadblk");
@@ -473,13 +526,86 @@ void ThreadImport(std::vector<fs::path> vImportFiles)
     {
         LOGA("Stopping after block import\n");
         StartShutdown();
+        return;
     }
 
+    // At this point the genesis block should have been loaded. We pause here and allow
+    // the node to complete StartNode() before continuing with ActivateBestChain(). For some
+    // reason QT will get hung while activating the chain if we don't do this wait, and it
+    // may be some time before the node appears as up and running giving the operator the impression
+    // that startup is very slow.
+    while (!fAppInit2.load())
+    {
+        MilliSleep(100);
+        if (fRequestShutdown)
+            return;
+    }
+
+    // In case a previous shutdown left the chain in an incorrect state, reconsider
+    // the most work chain.
+    ReconsiderChainOnStartup();
+
+    // scan for better chains in the block chain database, that are not yet connected in the active best chain
+    uiInterface.InitMessage(_("Activating best chain..."));
+    CValidationState state;
+    if (!ActivateBestChain(state, chainparams))
+    {
+        LOGA("WARNING: ActivateBestChain failed on startup\n");
+    }
+
+    // Reconsider the most work chain if we're not already synced. This is necessary
+    // when switching from an ABC/BCHN client or when a operator failed to upgrade their BU
+    // node before a hardfork. This must be done directly after ActivateBestChain() or
+    // a switch from ABC/BCHN to a BU node may not work because some blocks may have been parked.
+    ReconsiderChainOnStartup();
+
+    // Initialize the atomic flags used for determining whether we are in IBD or whether the chain
+    // is almost synced.
+    IsChainNearlySyncdInit();
+    IsInitialBlockDownloadInit();
+
+#ifdef ENABLE_WALLET
+    uiInterface.InitMessage(_("Reaccepting Wallet Transactions"));
+    if (pwalletMain)
+    {
+        {
+            TxAdmissionPause pause; // Get an initial state to use during wallet tx acceptance
+            // Add wallet transactions that aren't already in a block to mapTransactions
+            pwalletMain->ReacceptWalletTransactions();
+        }
+    }
+#endif
+
+    // Load the mempool if necessary
     if (GetArg("-persistmempool", DEFAULT_PERSIST_MEMPOOL))
     {
         LoadMempool();
         fDumpMempoolLater = !fRequestShutdown;
     }
+
+    // Startup txindex. If we start it earlier and before ActivateBestChain
+    // we can end up grinding slowly through ActivateBestChain when txindex still has unfinished
+    // compaction to do from a prior run.
+    fTxIndex = GetBoolArg("-txindex", DEFAULT_TXINDEX);
+    if (fTxIndex)
+    {
+        uiInterface.InitMessage(_("Starting txindex"));
+
+        // When reindexing we want to wipe the previous txindex database however we don't want to
+        // rely on the fReindex flag since it's possible that by the time we get to this point in the
+        // node startup that the reindex is already completed (in the case of a very small reindex) and
+        // therefore fReindex would already be false and the txindex would not get rebuilt.
+        bool fWipeDatabase = GetBoolArg("-reindex", DEFAULT_REINDEX);
+        auto txindex_db = new TxIndexDB(nTxIndexCache, false, fWipeDatabase);
+
+        g_txindex = std::make_unique<TxIndex>(txindex_db);
+        g_txindex->Start();
+    }
+
+    // This should be done last in init. If not, then RPC's could be allowed before the wallet
+    // is ready.
+    uiInterface.InitMessage(_("Done loading"));
+    SetRPCWarmupFinished();
 }
 
 /** Sanity checks
@@ -493,13 +619,20 @@ bool InitSanityCheck(void)
         InitError("Elliptic curve cryptography sanity check failure. Aborting.");
         return false;
     }
+
     if (!glibc_sanity_test() || !glibcxx_sanity_test())
         return false;
+
+    if (!Random_SanityCheck())
+    {
+        InitError("OS cryptographic RNG sanity check failure. Aborting.");
+        return false;
+    }
 
     return true;
 }
 
-bool AppInitServers(thread_group &threadGroup, int rpcport, const std::string &network)
+bool AppInitServers(int rpcport, const std::string &network)
 {
     RPCServer::OnStopped(&OnRPCStopped);
     RPCServer::OnPreCommand(&OnRPCPreCommand);
@@ -592,7 +725,8 @@ void InitParameterInteraction()
     }
 
     // disable walletbroadcast and whitelistrelay in blocksonly mode
-    if (GetBoolArg("-blocksonly", DEFAULT_BLOCKSONLY))
+    fBlocksOnly = GetBoolArg("-blocksonly", DEFAULT_BLOCKSONLY);
+    if (fBlocksOnly)
     {
         if (SoftSetBoolArg("-whitelistrelay", false))
             LOGA("%s: parameter interaction: -blocksonly=1 -> setting -whitelistrelay=0\n", __func__);
@@ -613,19 +747,31 @@ void InitParameterInteraction()
 void InitLogging()
 {
     fPrintToConsole = GetBoolArg("-printtoconsole", DEFAULT_PRINTTOCONSOLE);
+
+    // Some QA tests depend on debug.log being written to, so default
+    // to always print to log file on regtest.
+    const bool regtest = Params().NetworkIDString() == CBaseChainParams::REGTEST;
+    fPrintToDebugLog = GetBoolArg("-printtologfile", !fPrintToConsole || regtest);
+
     fLogTimestamps = GetBoolArg("-logtimestamps", DEFAULT_LOGTIMESTAMPS);
     fLogTimeMicros = GetBoolArg("-logtimemicros", DEFAULT_LOGTIMEMICROS);
     fLogIPs = GetBoolArg("-logips", DEFAULT_LOGIPS);
     Logging::LogInit();
 
     LOGA("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n");
-    LOGA("Bitcoin version %s (%s)\n", FormatFullVersion(), CLIENT_DATE);
+    std::string version_string = FormatFullVersion();
+#ifdef DEBUG
+    version_string += " (debug build)";
+#else
+    version_string += " (release build)";
+#endif
+    LOGA(PACKAGE_NAME " version %s (%s)\n", version_string, CLIENT_DATE);
 }
 
 /** Initialize bitcoin.
  *  @pre Parameters should be parsed and config file should be read.
  */
-bool AppInit2(Config &config, thread_group &threadGroup)
+bool AppInit2(Config &config)
 {
     // ********************************************************* Step 1: setup
 
@@ -634,7 +780,7 @@ bool AppInit2(Config &config, thread_group &threadGroup)
 #ifdef _MSC_VER
     // Turn off Microsoft heap dump noise
     _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
-    _CrtSetReportFile(_CRT_WARN, CreateFileA("NUL", GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, 0));
+    _CrtSetReportFile(_CRT_WARN, CreateFileA("NUL", GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, 0));
 #endif
 #if _MSC_VER >= 1400
     // Disable confusing "helpful" text message on abort, Ctrl-C
@@ -652,7 +798,7 @@ bool AppInit2(Config &config, thread_group &threadGroup)
     typedef BOOL(WINAPI * PSETPROCDEPPOL)(DWORD);
     PSETPROCDEPPOL setProcDEPPol =
         (PSETPROCDEPPOL)GetProcAddress(GetModuleHandleA("Kernel32.dll"), "SetProcessDEPPolicy");
-    if (setProcDEPPol != NULL)
+    if (setProcDEPPol != nullptr)
         setProcDEPPol(PROCESS_DEP_ENABLE);
 #endif
 
@@ -677,15 +823,15 @@ bool AppInit2(Config &config, thread_group &threadGroup)
     sa.sa_handler = HandleSIGTERM;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
-    sigaction(SIGTERM, &sa, NULL);
-    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGINT, &sa, nullptr);
 
     // Reopen debug.log on SIGHUP
     struct sigaction sa_hup;
     sa_hup.sa_handler = HandleSIGHUP;
     sigemptyset(&sa_hup.sa_mask);
     sa_hup.sa_flags = 0;
-    sigaction(SIGHUP, &sa_hup, NULL);
+    sigaction(SIGHUP, &sa_hup, nullptr);
 
     // Ignore SIGPIPE, otherwise it will bring the daemon down if the client closes unexpectedly
     signal(SIGPIPE, SIG_IGN);
@@ -712,6 +858,14 @@ bool AppInit2(Config &config, thread_group &threadGroup)
         }
 #endif
     }
+    else
+    {
+        // raise preallocation size of block and undo files
+        blockfile_chunk_size = MAX_BLOCKFILE_SIZE;
+        // multiply by 8 as this is the same difference between default and max blockfile size
+        // we do not have a define max undofile size
+        undofile_chunk_size = undofile_chunk_size * 8;
+    }
 
     // Make sure enough file descriptors are available
     int nBind = std::max((int)mapArgs.count("-bind") + (int)mapArgs.count("-whitebind"), 1);
@@ -719,15 +873,30 @@ bool AppInit2(Config &config, thread_group &threadGroup)
     nMaxConnections = std::max(nUserMaxConnections, 0);
 
     // Trim requested connection counts, to fit into system limitations
-    nMaxConnections = std::max(std::min(nMaxConnections, (int)(FD_SETSIZE - nBind - MIN_CORE_FILEDESCRIPTORS)), 0);
-    int nFD = RaiseFileDescriptorLimit(nMaxConnections + MIN_CORE_FILEDESCRIPTORS);
+    int nFD = RaiseFileDescriptorLimit(nMaxConnections + MIN_CORE_FILEDESCRIPTORS + nBind);
     if (nFD < MIN_CORE_FILEDESCRIPTORS)
         return InitError(_("Not enough file descriptors available."));
-    nMaxConnections = std::min(nFD - MIN_CORE_FILEDESCRIPTORS, nMaxConnections);
+
+    nMaxConnections = std::min(nFD - MIN_CORE_FILEDESCRIPTORS - nBind, nMaxConnections);
 
     if (nMaxConnections < nUserMaxConnections)
-        InitWarning(strprintf(_("Reducing -maxconnections from %d to %d, because of system limitations."),
+        InitWarning(strprintf(_("Reducing -maxconnections from %d to %d because of file descriptor limitations (unix) "
+                                "or winsocket fd_set limitations (windows). If you are a windows user there is a hard "
+                                "upper limit of 1024 which cannot be changed by adjusting the node's configuration."),
             nUserMaxConnections, nMaxConnections));
+
+
+    // make outbound conns modifiable by the user
+    int nUserMaxOutConnections = GetArg("-maxoutconnections", DEFAULT_MAX_OUTBOUND_CONNECTIONS);
+    nMaxOutConnections = std::max(nUserMaxOutConnections, 0);
+    if (nMaxConnections < nMaxOutConnections)
+    {
+        LOGA(
+            "Reducing -maxoutconnections from %d to %d, because this value is higher than max available connections.\n",
+            nUserMaxOutConnections, nMaxConnections);
+        nMaxOutConnections = nMaxConnections;
+    }
+
 
     // ********************************************************* Step 3: parameter-to-internal-flags
 
@@ -752,7 +921,7 @@ bool AppInit2(Config &config, thread_group &threadGroup)
 
     // mempool limits
     int64_t nMempoolSizeMax = GetArg("-maxmempool", DEFAULT_MAX_MEMPOOL_SIZE) * 1000000;
-    int64_t nMempoolSizeMin = GetArg("-limitdescendantsize", DEFAULT_DESCENDANT_SIZE_LIMIT) * 1000 * 40;
+    int64_t nMempoolSizeMin = GetArg("-limitdescendantsize", BU_DEFAULT_DESCENDANT_SIZE_LIMIT) * 1000 * 40;
     if (nMempoolSizeMax < 0 || nMempoolSizeMax < nMempoolSizeMin)
         return InitError(strprintf(_("-maxmempool must be at least %d MB"), std::ceil(nMempoolSizeMin / 1000000.0)));
 
@@ -793,7 +962,7 @@ bool AppInit2(Config &config, thread_group &threadGroup)
     // a transaction spammer can cheaply fill blocks using
     // 1-satoshi-fee transactions. It should be set above the real
     // cost to you of processing a transaction.
-    ::minRelayTxFee = CFeeRate(dMinLimiterTxFee.Value() * 1000);
+    ::minRelayTxFee = CFeeRate((CAmount)(dMinLimiterTxFee.Value()) * 1000);
 
     // -minrelaytxfee is no longer a command line option however it is still used in Bitcon Core so we want to tell
     // any users that migrate from Core to BU that this option is not used.
@@ -851,6 +1020,9 @@ bool AppInit2(Config &config, thread_group &threadGroup)
 
     // BitcoinCash service bit
     nLocalServices |= NODE_BITCOIN_CASH;
+    // we use xversion by default
+    if (GetBoolArg("-use-xversion", DEFAULT_USE_XVERSION))
+        nLocalServices |= NODE_XVERSION;
 
     nMaxTipAge = GetArg("-maxtipage", DEFAULT_MAX_TIP_AGE);
 
@@ -865,6 +1037,7 @@ bool AppInit2(Config &config, thread_group &threadGroup)
 
     // Initialize elliptic curve code
     std::string sha256_algo = SHA256AutoDetect();
+    RandomInit();
     LOGA("Using the '%s' SHA256 implementation\n", sha256_algo);
     ECC_Start();
     globalVerifyHandle.reset(new ECCVerifyHandle());
@@ -912,7 +1085,7 @@ bool AppInit2(Config &config, thread_group &threadGroup)
     LOGA("Default data directory %s\n", GetDefaultDataDir().string());
     LOGA("Using data directory %s\n", strDataDir);
     LOGA("Using config file %s\n", GetConfigFile(GetArg("-conf", BITCOIN_CONF_FILENAME)).string());
-    LOGA("Using at most %i connections (%i file descriptors available)\n", nMaxConnections, nFD);
+    LOGA("Using at most %i connections\n", nMaxConnections);
     std::ostringstream strErrors;
 
     // bip135 begin
@@ -1002,7 +1175,7 @@ bool AppInit2(Config &config, thread_group &threadGroup)
     if (fServer)
     {
         uiInterface.InitMessage.connect(SetRPCWarmupStatus);
-        if (!AppInitServers(threadGroup, BaseParams().RPCPort(), chainparams.NetworkIDString()))
+        if (!AppInitServers(BaseParams().RPCPort(), chainparams.NetworkIDString()))
         {
             return InitError(_("Unable to start RPC services. See debug log for details."));
         }
@@ -1067,20 +1240,18 @@ bool AppInit2(Config &config, thread_group &threadGroup)
     }
 
     // Return the initial values for the various in memory caches.
-    int64_t nBlockDBCache = 0;
-    int64_t nBlockUndoDBCache = 0;
-    int64_t nBlockTreeDBCache = 0;
-    int64_t nCoinDBCache = 0;
-    GetCacheConfiguration(nBlockDBCache, nBlockUndoDBCache, nBlockTreeDBCache, nCoinDBCache, nCoinCacheMaxSize);
+    CacheConfig cacheConfig = DiscoverCacheConfiguration();
     LOGA("Cache configuration:\n");
-    LOGA("* Using %.1fMiB for block database\n", nBlockDBCache * (1.0 / 1024 / 1024));
-    LOGA("* Using %.1fMiB for block undo database\n", nBlockUndoDBCache * (1.0 / 1024 / 1024));
-    LOGA("* Using %.1fMiB for block index database\n", nBlockTreeDBCache * (1.0 / 1024 / 1024));
-    LOGA("* Using %.1fMiB for chain state database\n", nCoinDBCache * (1.0 / 1024 / 1024));
+    LOGA("* Using %.1fMiB for block database\n", cacheConfig.nBlockDBCache * (1.0 / 1024 / 1024));
+    LOGA("* Using %.1fMiB for block undo database\n", cacheConfig.nBlockUndoDBCache * (1.0 / 1024 / 1024));
+    LOGA("* Using %.1fMiB for block index database\n", cacheConfig.nBlockTreeDBCache * (1.0 / 1024 / 1024));
+    LOGA("* Using %.1fMiB for txindex database\n", cacheConfig.nTxIndexCache * (1.0 / 1024 / 1024));
+    LOGA("* Using %.1fMiB for chain state database\n", cacheConfig.nCoinDBCache * (1.0 / 1024 / 1024));
     LOGA("* Using %.1fMiB for in-memory UTXO set\n", nCoinCacheMaxSize * (1.0 / 1024 / 1024));
 
     bool fLoaded = false;
-    StartTxAdmission(threadGroup);
+    StartTxAdmission();
+
     while (!fLoaded)
     {
         bool fReset = fReindex;
@@ -1100,10 +1271,14 @@ bool AppInit2(Config &config, thread_group &threadGroup)
                 delete pblockdb;
 
                 uiInterface.InitMessage(_("Opening Block database..."));
-                InitializeBlockStorage(nBlockTreeDBCache, nBlockDBCache, nBlockUndoDBCache);
+                InitializeBlockStorage(
+                    cacheConfig.nBlockTreeDBCache, cacheConfig.nBlockDBCache, cacheConfig.nBlockUndoDBCache);
 
                 uiInterface.InitMessage(_("Opening UTXO database..."));
-                pcoinsdbview = new CCoinsViewDB(nCoinDBCache, false, fReindex);
+                COverrideOptions overridecache;
+                overridecache.block_size = 128;
+                pcoinsdbview = new CCoinsViewDB(cacheConfig.nCoinDBCache, false, fReindex, true, &overridecache);
+
                 pcoinscatcher = new CCoinsViewErrorCatcher(pcoinsdbview);
                 uiInterface.InitMessage(_("Opening Coins Cache database..."));
                 pcoinsTip = new CCoinsViewCache(pcoinscatcher);
@@ -1144,13 +1319,6 @@ bool AppInit2(Config &config, thread_group &threadGroup)
                 if (!InitBlockIndex(chainparams))
                 {
                     strLoadError = _("Error initializing block database");
-                    break;
-                }
-
-                // Check for changed -txindex state
-                if (fTxIndex != GetBoolArg("-txindex", DEFAULT_TXINDEX))
-                {
-                    strLoadError = _("You need to rebuild the database using -reindex to change -txindex");
                     break;
                 }
 
@@ -1243,20 +1411,20 @@ bool AppInit2(Config &config, thread_group &threadGroup)
         mempool.ReadFeeEstimates(est_filein);
     fFeeEstimatesInitialized = true;
 
-    // Set EB and MAX_OPS_PER_SCRIPT for the SV chain
-    if (AreWeOnSVChain() && IsSv2018Activated(Params().GetConsensus(), chainActive.Tip()))
+    // Set fCanonicalTxsOrder for the BCH early in the bootstrap phase
+    if (IsNov2018Activated(Params().GetConsensus(), chainActive.Tip()))
     {
-        maxScriptOps = SV_MAX_OPS_PER_SCRIPT;
-        excessiveBlockSize = SV_EXCESSIVE_BLOCK_SIZE;
-        settingsToUserAgentString();
-        enableCanonicalTxOrder = false;
+        if (chainparams.NetworkIDString() != "regtest")
+        {
+            fCanonicalTxsOrder = true;
+        }
     }
-
-    // Set enableCanonicalTxOrder for the BCH early in the bootstrap phase
-    if (AreWeOnBCHChain() && IsNov2018Activated(Params().GetConsensus(), chainActive.Tip()) &&
-        chainparams.NetworkIDString() != "regtest")
+    else
     {
-        enableCanonicalTxOrder = true;
+        if (chainparams.NetworkIDString() != "regtest")
+        {
+            fCanonicalTxsOrder = false;
+        }
     }
 
 
@@ -1265,12 +1433,13 @@ bool AppInit2(Config &config, thread_group &threadGroup)
 #ifdef ENABLE_WALLET
 
     // Encoded addresses using cashaddr instead of base58
-    // Activates by default on Jan, 14
-    config.SetCashAddrEncoding(GetBoolArg("-usecashaddr", GetAdjustedTime() > 1515900000));
+    // The default behaviour is to use this encoding. This will help
+    // to avoid confusion with other currencies the base58 encoding
+    config.SetCashAddrEncoding(GetBoolArg("-usecashaddr", true));
 
     if (fDisableWallet)
     {
-        pwalletMain = NULL;
+        pwalletMain = nullptr;
         LOGA("Wallet disabled!\n");
     }
     else
@@ -1300,63 +1469,27 @@ bool AppInit2(Config &config, thread_group &threadGroup)
         }
     }
 
-    // ********************************************************* Step 9: import blocks
-
-    if (mapArgs.count("-blocknotify"))
-        uiInterface.NotifyBlockTip.connect(BlockNotifyCallback);
-
-    uiInterface.InitMessage(_("Activating best chain..."));
-    // scan for better chains in the block chain database, that are not yet connected in the active best chain
-
-    CValidationState state;
-    if (!ActivateBestChain(state, chainparams))
-    {
-        if (fRequestShutdown)
-            return false;
-        else
-            strErrors << "Failed to connect best block";
-    }
-    IsChainNearlySyncdInit(); // BUIP010 XTHIN: initialize fIsChainNearlySyncd
-    IsInitialBlockDownloadInit();
-
-    std::vector<fs::path> vImportFiles;
-    if (mapArgs.count("-loadblock"))
-    {
-        for (const std::string &strFile : mapMultiArgs["-loadblock"])
-            vImportFiles.push_back(strFile);
-    }
-    threadGroup.create_thread(boost::bind(&ThreadImport, vImportFiles));
-
-    LOGA("Waiting for genesis block to be imported...\n");
-    CBlockIndex *tip = nullptr;
-    while (!fRequestShutdown && !tip)
-    {
-        {
-            LOCK(cs_main);
-            tip = chainActive.Tip();
-        }
-        if (!tip)
-            MilliSleep(10);
-    }
-
     // ********************************************************* Step 10: network initialization
 
     RegisterNodeSignals(GetNodeSignals());
 
     // sanitize comments per BIP-0014, format user agent and check total size
-    std::vector<string> uacomments;
+    std::vector<string> uacomments = {};
     for (string &cmt : mapMultiArgs["-uacomment"])
     {
         if (cmt != SanitizeString(cmt, SAFE_CHARS_UA_COMMENT))
             return InitError(strprintf(_("User Agent comment (%s) contains unsafe characters."), cmt));
         uacomments.push_back(SanitizeString(cmt, SAFE_CHARS_UA_COMMENT));
     }
-    strSubVersion = FormatSubVersion(CLIENT_NAME, CLIENT_VERSION, uacomments);
-    if (strSubVersion.size() > MAX_SUBVERSION_LENGTH)
+
+    std::string strSubVersion = FormatSubVersion(CLIENT_NAME, CLIENT_VERSION, BUComments);
+    if (strSubVersion.size() == MAX_SUBVERSION_LENGTH)
     {
-        return InitError(strprintf(_("Total length of network version string (%i) exceeds maximum length (%i). Reduce "
-                                     "the number or size of uacomments."),
-            strSubVersion.size(), MAX_SUBVERSION_LENGTH));
+        InitWarning(
+            strprintf(_("Total length of network version string with uacomments added exceeded "
+                        "the maximum length (%i) and have been truncated.  Reduce the number or size of uacomments "
+                        "to avoid truncation."),
+                MAX_SUBVERSION_LENGTH));
     }
 
     if (mapArgs.count("-onlynet"))
@@ -1508,15 +1641,56 @@ bool AppInit2(Config &config, thread_group &threadGroup)
     }
 
 
-    // ********************************************************* Step 11: start node
+    // Monitor the chain, and alert if we get blocks much quicker or slower than expected
+    // The "bad chain alert" scheduler has been disabled because the current system gives far
+    // too many false positives, such that users are starting to ignore them.
+    // This code will be disabled for 0.12.1 while a fix is deliberated in #7568
+    // this was discussed in the IRC meeting on 2016-03-31.
+    //
+    // --- disabled ---
+    // int64_t nPowTargetSpacing = Params().GetConsensus().nPowTargetSpacing;
+    // CScheduler::Function f = boost::bind(&PartitionCheck, &IsInitialBlockDownload,
+    //                                     boost::ref(cs_main), boost::cref(pindexBestHeader), nPowTargetSpacing);
+    // scheduler.scheduleEvery(f, nPowTargetSpacing);
+    // --- end disabled ---
+
+
+    // ********************************************************* Step 9: import blocks
+
+    if (mapArgs.count("-blocknotify"))
+        uiInterface.NotifyBlockTip.connect(BlockNotifyCallback);
+
+    if (mapArgs.count("-electrum"))
+    {
+        uiInterface.NotifyBlockTip.connect(NotifyElectrumCallback);
+    }
+
+    std::vector<fs::path> vImportFiles;
+    if (mapArgs.count("-loadblock"))
+    {
+        for (const std::string &strFile : mapMultiArgs["-loadblock"])
+            vImportFiles.push_back(strFile);
+    }
+    threadGroup.create_thread(boost::bind(&ThreadImport, vImportFiles, cacheConfig.nTxIndexCache));
+
+    uiInterface.InitMessage(_("Waiting for Genesis Block..."));
+    CBlockIndex *tip = nullptr;
+    while (!fRequestShutdown && !tip)
+    {
+        tip = chainActive.Tip();
+        MilliSleep(10);
+
+        if (fRequestShutdown)
+            return false;
+    }
+
+    // ********************************************************* Step 10: start node
 
     if (!CheckDiskSpace())
         return false;
 
     if (!strErrors.str().empty())
         return InitError(strErrors.str());
-
-    RandAddSeedPerfmon();
 
     //// debug print
     {
@@ -1532,99 +1706,21 @@ bool AppInit2(Config &config, thread_group &threadGroup)
 #endif
 
     if (GetBoolArg("-listenonion", DEFAULT_LISTEN_ONION))
-        StartTorControl(threadGroup);
-
-    StartNode(threadGroup);
-
-// Monitor the chain, and alert if we get blocks much quicker or slower than expected
-// The "bad chain alert" scheduler has been disabled because the current system gives far
-// too many false positives, such that users are starting to ignore them.
-// This code will be disabled for 0.12.1 while a fix is deliberated in #7568
-// this was discussed in the IRC meeting on 2016-03-31.
-//
-// --- disabled ---
-// int64_t nPowTargetSpacing = Params().GetConsensus().nPowTargetSpacing;
-// CScheduler::Function f = boost::bind(&PartitionCheck, &IsInitialBlockDownload,
-//                                     boost::ref(cs_main), boost::cref(pindexBestHeader), nPowTargetSpacing);
-// scheduler.scheduleEvery(f, nPowTargetSpacing);
-// --- end disabled ---
-
-    if(!initLogger())
-    {
-        LogPrintStr(">> ERROR : initLogger failed");
-        StartShutdown();
-    }
-    else
-        LogPrintStr(">>  Logger system initialized");
-
-    #if LOG_NEIGHBOR_ADDRESSES
-
-        if(initAddrLogger())
-        {
-            LogPrintStr(">> Neighbor address logger initialized");
-            threadGroup.create_thread(boost::bind(AddrLoggerThread));
-            LogPrintStr(">> Neighbor address logger thread created");
-        }
-        else
-        {
-            LogPrintStr(">> ERROR : initAddrLogger failed");
-            StartShutdown();
-        }
-
-    #endif
-
-    #if LOG_CPU_USAGE
-
-        if(initProcessCPUUsageLogger())
-        {
-            LogPrintStr(">> Process CPU usage logger initialized");
-            threadGroup.create_thread(CPUUsageLoggerThread);
-            LogPrintStr(">> Process CPU usage logger thread created");
-        }
-        else
-        {
-            LogPrintStr(">> ERROR : initProcessCPUUsageLogger failed");
-            StartShutdown();
-        }
-
-    #endif
-
-    #if FALAFEL_SENDER
-
-        if(initMempoolSyncTriggerTimer())
-        {
-            LogPrintStr(">> Mempool Sync trigger timer initialized");
-            threadGroup.create_thread(mempoolSyncTriggerTimerThread);
-            LogPrintStr(">> Mempool Sync trigger timer thread created");
-        }
-        else
-        {
-            LogPrintStr(">> ERROR: initTimerThread failed");
-        }
-
-    #endif
+        StartTorControl();
 
 
-
-// ********************************************************* Step 12: finished
+    StartNode();
 
 #ifdef ENABLE_WALLET
-    uiInterface.InitMessage(_("Reaccepting Wallet Transactions"));
     if (pwalletMain)
     {
-        // Add wallet transactions that aren't already in a block to mapTransactions
-        pwalletMain->ReacceptWalletTransactions();
-
         // Run a thread to flush wallet periodically
         threadGroup.create_thread(&ThreadFlushWalletDB, boost::ref(pwalletMain->strWalletFile));
     }
 #endif
 
-    uiInterface.InitMessage(_("Done loading"));
-
-    // This should be done last in init. If not, then RPC's could be allowed before the wallet
-    // is ready.
-    SetRPCWarmupFinished();
+    // Done with intialization. Set flag so that threadimport can begin.
+    fAppInit2.store(true);
 
     return true;
 }

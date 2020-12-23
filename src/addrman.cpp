@@ -1,10 +1,11 @@
 // Copyright (c) 2012 Pieter Wuille
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include "addrman.h"
 
-#include "hash.h"
+#include "hashwrapper.h"
 #include "serialize.h"
 #include "streams.h"
 
@@ -77,13 +78,13 @@ CAddrInfo *CAddrMan::Find(const CNetAddr &addr, int *pnId)
 {
     std::map<CNetAddr, int>::iterator it = mapAddr.find(addr);
     if (it == mapAddr.end())
-        return NULL;
+        return nullptr;
     if (pnId)
         *pnId = (*it).second;
     std::map<int, CAddrInfo>::iterator it2 = mapInfo.find((*it).second);
     if (it2 != mapInfo.end())
         return &(*it2).second;
-    return NULL;
+    return nullptr;
 }
 
 CAddrInfo *CAddrMan::Create(const CAddress &addr, const CNetAddr &addrSource, int *pnId)
@@ -230,7 +231,7 @@ void CAddrMan::Good_(const CService &addr, bool test_before_evict, int64_t nTime
         return;
 
     // find a bucket it is in now
-    int nRnd = RandomInt(ADDRMAN_NEW_BUCKET_COUNT);
+    int nRnd = insecure_rand.randrange(ADDRMAN_NEW_BUCKET_COUNT);
     int nUBucket = -1;
     for (unsigned int n = 0; n < ADDRMAN_NEW_BUCKET_COUNT; n++)
     {
@@ -307,7 +308,7 @@ bool CAddrMan::Add_(const CAddress &addr, const CNetAddr &source, int64_t nTimeP
         int nFactor = 1;
         for (int n = 0; n < pinfo->nRefCount; n++)
             nFactor *= 2;
-        if (nFactor > 1 && (RandomInt(nFactor) != 0))
+        if (nFactor > 1 && (insecure_rand.randrange(nFactor) != 0))
             return false;
     }
     else
@@ -390,7 +391,7 @@ CAddrInfo CAddrMan::Select_(bool newOnly)
     int nTries = 0;
 
     // Use a 50% chance for choosing between tried and new table entries.
-    if (!newOnly && (nTried > 0 && (nNew == 0 || RandomInt(2) == 0)))
+    if (!newOnly && (nTried > 0 && (nNew == 0 || insecure_rand.randbool() == 0)))
     {
         // use a tried node
         double fChanceFactor = 1.0;
@@ -399,17 +400,18 @@ CAddrInfo CAddrMan::Select_(bool newOnly)
             nTries++;
             if (nTries > 10000)
                 return CAddrInfo();
-            int nKBucket = RandomInt(ADDRMAN_TRIED_BUCKET_COUNT);
-            int nKBucketPos = RandomInt(ADDRMAN_BUCKET_SIZE);
+            int nKBucket = insecure_rand.randrange(ADDRMAN_TRIED_BUCKET_COUNT);
+            int nKBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);
             while (vvTried[nKBucket][nKBucketPos] == -1)
             {
-                nKBucket = (nKBucket + insecure_rand.rand32()) % ADDRMAN_TRIED_BUCKET_COUNT;
-                nKBucketPos = (nKBucketPos + insecure_rand.rand32()) % ADDRMAN_BUCKET_SIZE;
+                nKBucket =
+                    (nKBucket + insecure_rand.randbits(ADDRMAN_TRIED_BUCKET_COUNT_LOG2)) % ADDRMAN_TRIED_BUCKET_COUNT;
+                nKBucketPos = (nKBucketPos + insecure_rand.randbits(ADDRMAN_BUCKET_SIZE_LOG2)) % ADDRMAN_BUCKET_SIZE;
             }
             int nId = vvTried[nKBucket][nKBucketPos];
             assert(mapInfo.count(nId) == 1);
             CAddrInfo &info = mapInfo[nId];
-            if (RandomInt(1 << 30) < fChanceFactor * info.GetChance() * (1 << 30))
+            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30))
                 return info;
             fChanceFactor *= 1.2;
         }
@@ -423,17 +425,18 @@ CAddrInfo CAddrMan::Select_(bool newOnly)
             nTries++;
             if (nTries > 10000)
                 return CAddrInfo();
-            int nUBucket = RandomInt(ADDRMAN_NEW_BUCKET_COUNT);
-            int nUBucketPos = RandomInt(ADDRMAN_BUCKET_SIZE);
+            int nUBucket = insecure_rand.randrange(ADDRMAN_NEW_BUCKET_COUNT);
+            int nUBucketPos = insecure_rand.randrange(ADDRMAN_BUCKET_SIZE);
             while (vvNew[nUBucket][nUBucketPos] == -1)
             {
-                nUBucket = (nUBucket + insecure_rand.rand32()) % ADDRMAN_NEW_BUCKET_COUNT;
-                nUBucketPos = (nUBucketPos + insecure_rand.rand32()) % ADDRMAN_BUCKET_SIZE;
+                nUBucket =
+                    (nUBucket + insecure_rand.randbits(ADDRMAN_NEW_BUCKET_COUNT_LOG2)) % ADDRMAN_NEW_BUCKET_COUNT;
+                nUBucketPos = (nUBucketPos + insecure_rand.randbits(ADDRMAN_BUCKET_SIZE_LOG2)) % ADDRMAN_BUCKET_SIZE;
             }
             int nId = vvNew[nUBucket][nUBucketPos];
             assert(mapInfo.count(nId) == 1);
             CAddrInfo &info = mapInfo[nId];
-            if (RandomInt(1 << 30) < fChanceFactor * info.GetChance() * (1 << 30))
+            if (insecure_rand.randbits(30) < fChanceFactor * info.GetChance() * (1 << 30))
                 return info;
             fChanceFactor *= 1.2;
         }
@@ -540,7 +543,7 @@ void CAddrMan::GetAddr_(std::vector<CAddress> &vAddr)
         if (vAddr.size() >= nNodes)
             break;
 
-        int nRndPos = RandomInt(vRandom.size() - n) + n;
+        int nRndPos = insecure_rand.randrange(vRandom.size() - n) + n;
         SwapRandom(n, nRndPos);
         assert(mapInfo.count(vRandom[n]) == 1);
 
@@ -570,7 +573,6 @@ void CAddrMan::Connected_(const CService &addr, int64_t nTime)
         info.nTime = nTime;
 }
 
-int CAddrMan::RandomInt(int nMax) { return GetRandInt(nMax); }
 void CAddrMan::ResolveCollisions_()
 {
     for (std::set<int>::iterator it = m_tried_collisions.begin(); it != m_tried_collisions.end();)
@@ -647,7 +649,7 @@ CAddrInfo CAddrMan::SelectTriedCollision_()
     std::set<int>::iterator it = m_tried_collisions.begin();
 
     // Selects a random element from m_tried_collisions
-    std::advance(it, GetRandInt(m_tried_collisions.size()));
+    std::advance(it, insecure_rand.randrange(m_tried_collisions.size()));
     int id_new = *it;
 
     // If id_new not found in mapInfo remove it from m_tried_collisions

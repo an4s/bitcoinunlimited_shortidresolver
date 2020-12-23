@@ -38,23 +38,22 @@ bool IsUAHFforkActiveOnNextBlock(int height);
 /** Check is Cash HF has activated. */
 bool IsDAAEnabled(const Consensus::Params &consensusparams, const CBlockIndex *pindexTip);
 
-/** Test if this node is configured to follow the BCH chain (miningForkTime tweak is nonzero),
-    or whether the operator is enabling/disabling features manually. */
-bool AreWeOnBCHChain();
-
 /** Check if Nov 15th, 2018 protocol upgrade is activated using block height */
 bool IsNov2018Activated(const Consensus::Params &consensusparams, const int32_t nHeight);
 bool IsNov2018Activated(const Consensus::Params &consensusparams, const CBlockIndex *pindexTip);
 
+/** Check if Nov 15th, 2019 protocol upgrade is activated using block height */
+bool IsNov2019Activated(const Consensus::Params &consensusparams, const int32_t nHeight);
+bool IsNov2019Activated(const Consensus::Params &consensusparams, const CBlockIndex *pindexTip);
+
+/** Check if May 15th, 2020 protocol upgrade is activated using block height */
+bool IsMay2020Activated(const Consensus::Params &consensusparams, const int32_t nHeight);
+bool IsMay2020Activated(const Consensus::Params &consensusparams, const CBlockIndex *pindexTip);
+
+/** Test if Nov 15th 2020 fork has activated */
+bool IsNov2020Enabled(const Consensus::Params &consensusparams, const CBlockIndex *pindexTip);
+
 /** Check if the next will be the first block where the new set of rules will be enforced */
-bool IsMay2019Next(const Consensus::Params &consensusparams, const CBlockIndex *pindexTip);
+bool IsNov2020Next(const Consensus::Params &consensusparams, const CBlockIndex *pindexTip);
 
-/** Test if May 15th 2019 fork has actived */
-bool IsMay2019Enabled(const Consensus::Params &consensusparams, const CBlockIndex *pindexTip);
-
-/** Test if this node is configured to follow the Bitcoin SV defined hard fork */
-bool AreWeOnSVChain();
-/** Check if SV Nov 15th, 2018 protocol upgrade is activated using block height */
-bool IsSv2018Activated(const Consensus::Params &consensusparams, const int32_t nHeight);
-bool IsSv2018Activated(const Consensus::Params &consensusparams, const CBlockIndex *pindexTip);
 #endif

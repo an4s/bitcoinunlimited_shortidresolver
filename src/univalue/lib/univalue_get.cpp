@@ -35,7 +35,7 @@ bool ParseInt32(const std::string& str, int32_t *out)
     errno = 0; // strtol will not set errno if valid
     long int n = strtol(str.c_str(), &endp, 10);
     if(out) *out = (int32_t)n;
-    // Note that strtol returns a *long int*, so even if strtol doesn't report a over/underflow
+    // Note that strtol returns a *long int*, so even if strtol doesn't report an over/underflow
     // we still have to check that the returned value is within the range of an *int32_t*. On 64-bit
     // platforms the size of these types may be different.
     return endp && *endp == 0 && !errno &&
@@ -89,11 +89,16 @@ bool ParseDouble(const std::string& str, double *out)
 }
 }
 
-const std::vector<std::string>& UniValue::getKeys() const
+const std::vector<std::string> UniValue::getKeys() const
 {
     if (typ != VOBJ)
         throw std::runtime_error("JSON value is not an object as expected");
-    return keys;
+    std::vector<std::string> retkeys;
+    for (auto &key : keys)
+    {
+        retkeys.push_back(key.first);
+    }
+    return retkeys;
 }
 
 const std::vector<UniValue>& UniValue::getValues() const

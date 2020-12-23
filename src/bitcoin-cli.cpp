@@ -1,6 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2017 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -27,17 +27,12 @@
 
 #include <univalue.h>
 
-using namespace std;
-
 #ifdef DEBUG_LOCKORDER
-#include <boost/thread/tss.hpp>
-// BU add lockstack stuff here for bitcoin-cli, because I need to carefully
-// order it in globals.cpp for bitcoind and bitcoin-qt
-boost::mutex dd_mutex;
-std::map<std::pair<void *, void *>, LockStack> lockorders;
-boost::thread_specific_ptr<LockStack> lockstack;
+std::atomic<bool> lockdataDestructed{false};
+LockData lockdata;
 #endif
 
+using namespace std;
 
 int CommandLineRPC(int argc, char *argv[])
 {
@@ -62,7 +57,12 @@ int CommandLineRPC(int argc, char *argv[])
         if (args.size() < 1)
             throw runtime_error("too few parameters (need at least command)");
         std::string strMethod = args[0];
-        UniValue params = RPCConvertValues(strMethod, std::vector<std::string>(args.begin() + 1, args.end()));
+        UniValue params(UniValue::VARR);
+        for (unsigned int idx = 1; idx < args.size(); idx++)
+        {
+            const std::string &strVal = args[idx];
+            params.push_back(strVal);
+        }
 
         // Execute and handle connection failures with -rpcwait
         const bool fWait = GetBoolArg("-rpcwait", false);
@@ -127,7 +127,7 @@ int CommandLineRPC(int argc, char *argv[])
     }
     catch (...)
     {
-        PrintExceptionContinue(NULL, "CommandLineRPC()");
+        PrintExceptionContinue(nullptr, "CommandLineRPC()");
         throw;
     }
 
@@ -166,7 +166,7 @@ int main(int argc, char *argv[])
     }
     catch (...)
     {
-        PrintExceptionContinue(NULL, "AppInitRPC()");
+        PrintExceptionContinue(nullptr, "AppInitRPC()");
         return EXIT_FAILURE;
     }
 
@@ -181,7 +181,7 @@ int main(int argc, char *argv[])
     }
     catch (...)
     {
-        PrintExceptionContinue(NULL, "CommandLineRPC()");
+        PrintExceptionContinue(nullptr, "CommandLineRPC()");
     }
     return ret;
 }

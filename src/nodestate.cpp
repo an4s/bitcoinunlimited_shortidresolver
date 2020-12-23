@@ -1,6 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -35,10 +35,20 @@ CNodeState::CNodeState(CAddress addrIn, std::string addrNameIn) : address(addrIn
 */
 CNodeState *CState::_GetNodeState(const NodeId id)
 {
+// no need to lock explictly here cause CNodeStateAccessor
+// hence we are using clang pragma to silence it when it will be used
+// from CNodeStateAccessor
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wthread-safety-analysis"
+#endif
     std::map<NodeId, CNodeState>::iterator it = mapNodeState.find(id);
     if (it == mapNodeState.end())
         return nullptr;
     return &it->second;
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
 }
 
 /**
@@ -49,7 +59,7 @@ CNodeState *CState::_GetNodeState(const NodeId id)
 */
 void CState::InitializeNodeState(const CNode *pnode)
 {
-    LOCK(cs);
+    LOCK(cs_cstate);
     mapNodeState.emplace_hint(mapNodeState.end(), std::piecewise_construct, std::forward_as_tuple(pnode->GetId()),
         std::forward_as_tuple(pnode->addr, pnode->addrName));
 }
@@ -62,7 +72,7 @@ void CState::InitializeNodeState(const CNode *pnode)
 */
 void CState::RemoveNodeState(const NodeId id)
 {
-    LOCK2(cs, requester.cs_objDownloader);
+    LOCK2(cs_cstate, requester.cs_objDownloader);
     mapNodeState.erase(id);
 
     // Remove any other types of nodestate
@@ -79,6 +89,6 @@ void CState::RemoveNodeState(const NodeId id)
 
 void CState::Clear()
 {
-    LOCK(cs);
+    LOCK(cs_cstate);
     mapNodeState.clear();
 }

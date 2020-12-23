@@ -1,6 +1,6 @@
 // Copyright (c) 2010 Satoshi Nakamoto
 // Copyright (c) 2009-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -28,6 +28,7 @@
 #include "validation/validation.h"
 #include "validationinterface.h"
 
+#include <cstdlib>
 #include <stdint.h>
 
 #include <boost/assign/list_of.hpp>
@@ -49,7 +50,7 @@ UniValue GetNetworkHashPS(int lookup, int height)
     if (height >= 0 && height < chainActive.Height())
         pb = chainActive[height];
 
-    if (pb == NULL || !pb->nHeight)
+    if (pb == nullptr || !pb->nHeight)
         return 0;
 
     // If lookup is -1, then use blocks since last difficulty change.
@@ -157,7 +158,7 @@ UniValue generateBlocks(boost::shared_ptr<CReserveScript> coinbaseScript,
         PV->StopAllValidationThreads(pblock->GetBlockHeader().nBits);
 
         CValidationState state;
-        if (!ProcessNewBlock(state, Params(), NULL, pblock, true, NULL, false))
+        if (!ProcessNewBlock(state, Params(), nullptr, pblock, true, nullptr, false))
             throw JSONRPCError(RPC_INTERNAL_ERROR, "ProcessNewBlock, block not accepted");
         ++nHeight;
         blockHashes.push_back(pblock->GetHash().GetHex());
@@ -174,7 +175,7 @@ UniValue generateBlocks(boost::shared_ptr<CReserveScript> coinbaseScript,
     LOCK(cs_main);
     FlushStateToDisk(state, FLUSH_STATE_ALWAYS); // we made lots of blocks
     CBlockIndex *pindexNewTip = chainActive.Tip();
-    uiInterface.NotifyBlockTip(false, pindexNewTip);
+    uiInterface.NotifyBlockTip(false, pindexNewTip, false);
     return blockHashes;
 }
 
@@ -430,6 +431,7 @@ static UniValue MkFullMiningCandidateJson(std::set<std::string> setClientRules,
     const int nMaxVersionPreVB,
     const unsigned int nTransactionsUpdatedLast)
 {
+    bool may2020Enabled = IsMay2020Activated(Params().GetConsensus(), pindexPrev);
     CBlock *pblock = &pblocktemplate->block; // pointer for convenience
     UniValue aCaps(UniValue::VARR);
     aCaps.push_back("proposal");
@@ -437,6 +439,7 @@ static UniValue MkFullMiningCandidateJson(std::set<std::string> setClientRules,
     UniValue transactions(UniValue::VARR);
     map<uint256, int64_t> setTxIndex;
     int i = 0;
+    int sigcheckTotal = 0;
     for (const auto &it : pblock->vtx)
     {
         const CTransaction &tx = *it;
@@ -462,7 +465,15 @@ static UniValue MkFullMiningCandidateJson(std::set<std::string> setClientRules,
 
         int index_in_template = i - 1;
         entry.pushKV("fee", pblocktemplate->vTxFees[index_in_template]);
-        entry.pushKV("sigops", pblocktemplate->vTxSigOps[index_in_template]);
+        if (!may2020Enabled)
+            entry.pushKV("sigops", pblocktemplate->vTxSigOps[index_in_template]);
+        else
+        {
+            // sigops is deprecated and not part of this block's consensus so report 0
+            entry.pushKV("sigops", 0);
+            entry.pushKV("sigchecks", pblocktemplate->vTxSigOps[index_in_template]);
+            sigcheckTotal += pblocktemplate->vTxSigOps[index_in_template];
+        }
 
         transactions.push_back(entry);
     }
@@ -514,7 +525,15 @@ static UniValue MkFullMiningCandidateJson(std::set<std::string> setClientRules,
     result.pushKV("mintime", (int64_t)pindexPrev->GetMedianTimePast() + 1);
     result.pushKV("mutable", aMutable);
     result.pushKV("noncerange", "00000000ffffffff");
-    result.pushKV("sigoplimit", (int64_t)BLOCKSTREAM_CORE_MAX_BLOCK_SIGOPS);
+
+    // Deprecated after may 2020 but leave it in in case miners are using it in their code.
+    result.pushKV("sigoplimit", (int64_t)MAX_BLOCK_SIGOPS_PER_MB);
+    if (may2020Enabled)
+    {
+        result.pushKV("sigchecklimit", maxSigChecks.Value());
+        result.pushKV("sigchecktotal", sigcheckTotal);
+    }
+
     result.pushKV("sizelimit", (int64_t)maxGeneratedBlock);
     result.pushKV("curtime", pblock->GetBlockTime());
     result.pushKV("bits", strprintf("%08x", pblock->nBits));
@@ -530,8 +549,8 @@ params
 coinbaseSize -Set the size of coinbase if >=0
 
 Outputs:
-returns JSON if pblockOut is NULL
-pblockOut -A copy of the block if not NULL
+returns JSON if pblockOut is nullptr
+pblockOut -A copy of the block if not nullptr
 */
 
 bool forceTemplateRecalc GUARDED_BY(cs_main) = false;
@@ -542,7 +561,10 @@ void SignalBlockTemplateChange()
 
     forceTemplateRecalc = true;
 }
-UniValue mkblocktemplate(const UniValue &params, int64_t coinbaseSize, CBlock *pblockOut)
+UniValue mkblocktemplate(const UniValue &params,
+    int64_t coinbaseSize,
+    CBlock *pblockOut,
+    const CScript &coinbaseScriptIn)
 {
     LOCK(cs_main);
 
@@ -550,6 +572,8 @@ UniValue mkblocktemplate(const UniValue &params, int64_t coinbaseSize, CBlock *p
     UniValue lpval = NullUniValue;
     std::set<std::string> setClientRules;
     int64_t nMaxVersionPreVB = -1;
+    CScript coinbaseScript(coinbaseScriptIn); // non-const copy (we may modify this below)
+
     if (params.size() > 0)
     {
         const UniValue &oparam = params[0].get_obj();
@@ -577,6 +601,7 @@ UniValue mkblocktemplate(const UniValue &params, int64_t coinbaseSize, CBlock *p
             {
                 uint256 hash = block.GetHash();
                 CBlockIndex *pindex = LookupBlockIndex(hash);
+                READLOCK(cs_mapBlockIndex);
                 if (pindex)
                 {
                     if (pindex->IsValid(BLOCK_VALID_SCRIPTS))
@@ -677,36 +702,70 @@ UniValue mkblocktemplate(const UniValue &params, int64_t coinbaseSize, CBlock *p
         // miners?
     }
 
+    const Consensus::Params &consensusParams = Params().GetConsensus();
+
     // Update block
-    static CBlockIndex *pindexPrev = NULL;
+    static CBlockIndex *pindexPrev = nullptr;
     static int64_t nStart = 0;
     static std::unique_ptr<CBlockTemplate> pblocktemplate(new CBlockTemplate());
-    if (pindexPrev != chainActive.Tip() || forceTemplateRecalc ||
-        (mempool.GetTransactionsUpdated() != nTransactionsUpdatedLast && GetTime() - nStart > 5))
+    static CScript prevCoinbaseScript;
+    static int64_t prevCoinbaseSize = -1;
+    // We cache the previous block templates returned, but we invalidate the
+    // cache below (generate a new block) if any of:
+    // 1. Global forceTemplateRecalc is true.
+    // 2. Cached block points to a different chaintip.
+    // 3. Is testnet and 30 seconds have elapsed (so we pick up the testnet
+    //    minimum difficulty -> 1.0 after 20 mins).
+    // 4. Mempool has changed and 5 seconds has elapsed.
+    // 5. Passed-in coinbaseSize differs from cached.
+    // 6. Passed-in coinbaseScript differs from cached.
+    if (pindexPrev != chainActive.Tip() || forceTemplateRecalc || // 1 & 2 above
+        (consensusParams.fPowAllowMinDifficultyBlocks && std::abs(GetTime() - nStart) > 30) || // 3 above
+        // 4 above
+        (mempool.GetTransactionsUpdated() != nTransactionsUpdatedLast && std::abs(GetTime() - nStart) > 5) ||
+        prevCoinbaseSize != coinbaseSize || prevCoinbaseScript != coinbaseScript) // 5 & 6 above
     {
         forceTemplateRecalc = false;
         // Clear pindexPrev so future calls make a new block, despite any failures from here on
-        pindexPrev = NULL;
+        pindexPrev = nullptr;
+
+        // Saved passed-in values for coinbase (also used to determine if we need to create new block)
+        prevCoinbaseScript = coinbaseScript;
+        prevCoinbaseSize = coinbaseSize;
 
         // Store the pindexBest used before CreateNewBlock, to avoid races
         nTransactionsUpdatedLast = mempool.GetTransactionsUpdated();
         CBlockIndex *pindexPrevNew = chainActive.Tip();
         nStart = GetTime();
 
+        // If client code didn't specify a coinbase address for the mining reward, grab one from the wallet.
+        if (coinbaseScript.empty())
+        {
+            // Note that we don't cache the exact script from this to the prevCoinbaseScript -- it's sufficient
+            // to cache the fact that client code didn't specify a coinbase address (by caching the empty script).
+            boost::shared_ptr<CReserveScript> tmpScriptPtr;
+            GetMainSignals().ScriptForMining(tmpScriptPtr);
+
+            // throw an error if shared_ptr is not valid -- this means no wallet support was compiled-in
+            if (!tmpScriptPtr)
+                throw JSONRPCError(RPC_INTERNAL_ERROR,
+                    "Wallet support is not compiled-in, please specify an address for the coinbase tx");
+
+            // If the keypool is exhausted, the shared_ptr is valid but no actual script is generated; catch this.
+            if (tmpScriptPtr->reserveScript.empty())
+                throw JSONRPCError(
+                    RPC_WALLET_KEYPOOL_RAN_OUT, "Error: Keypool ran out, please call keypoolrefill first");
+
+            // Everything checks out, proceed with the wallet-generated address. Note that we don't tell the wallet to
+            // "KeepKey" this address -- which means future calls will return the same address from the wallet for
+            // future mining candidates, which is fine and good (since these are, after all, mining *candidates*).
+            // This also means that the bitcoin-miner program will continue to mine to the same key for all blocks,
+            // which is fine. If client code wants something more sophisticated, it can always specify coinbaseScript.
+            coinbaseScript = tmpScriptPtr->reserveScript;
+        }
+
         // Create new block
-        boost::shared_ptr<CReserveScript> coinbaseScript;
-        GetMainSignals().ScriptForMining(coinbaseScript);
-
-        // If the keypool is exhausted, no script is returned at all.  Catch this.
-        if (!coinbaseScript)
-            throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT, "Error: Keypool ran out, please call keypoolrefill first");
-
-        // throw an error if no script was provided
-        if (coinbaseScript->reserveScript.empty())
-            throw JSONRPCError(RPC_INTERNAL_ERROR, "No coinbase script available (mining requires a wallet)");
-
-
-        pblocktemplate = BlockAssembler(Params()).CreateNewBlock(coinbaseScript->reserveScript, coinbaseSize);
+        pblocktemplate = BlockAssembler(Params()).CreateNewBlock(coinbaseScript, coinbaseSize);
         if (!pblocktemplate)
             throw JSONRPCError(RPC_OUT_OF_MEMORY, "Out of memory");
 
@@ -719,7 +778,6 @@ UniValue mkblocktemplate(const UniValue &params, int64_t coinbaseSize, CBlock *p
             mempool.GetTransactionsUpdated(), nTransactionsUpdatedLast, GetTime(), nStart);
     }
     CBlock *pblock = &pblocktemplate->block; // pointer for convenience
-    const Consensus::Params &consensusParams = Params().GetConsensus();
 
     // Update nTime
     UpdateTime(pblock, consensusParams, pindexPrev);
@@ -853,6 +911,7 @@ UniValue SubmitBlock(CBlock &block)
     bool fBlockPresent = false;
     {
         CBlockIndex *pindex = LookupBlockIndex(hash);
+        READLOCK(cs_mapBlockIndex);
         if (pindex)
         {
             if (pindex->IsValid(BLOCK_VALID_SCRIPTS))
@@ -875,7 +934,7 @@ UniValue SubmitBlock(CBlock &block)
     // that has more work than our block.
     PV->StopAllValidationThreads(block.GetBlockHeader().nBits);
 
-    bool fAccepted = ProcessNewBlock(state, Params(), NULL, &block, true, NULL, false);
+    bool fAccepted = ProcessNewBlock(state, Params(), nullptr, &block, true, nullptr, false);
     UnregisterValidationInterface(&sc);
     if (fBlockPresent)
     {
@@ -947,21 +1006,27 @@ UniValue estimatefee(const UniValue &params, bool fHelp)
     return ValueFromAmount(feeRate.GetFeePerK());
 }
 
-UniValue estimatepriority(const UniValue &params, bool fHelp)
+UniValue estimatesmartfee(const UniValue &params, bool fHelp)
 {
     if (fHelp || params.size() != 1)
-        throw runtime_error("estimatepriority nblocks\n"
-                            "\nEstimates the approximate priority a zero-fee transaction needs to begin\n"
+        throw runtime_error("estimatesmartfee nblocks\n"
+                            "\nWARNING: This interface is unstable and may disappear or change!\n"
+                            "\nThis rpc call now does the same thing as estimatefee, It has not been removed for\n"
+                            "compatibility reasons\n"
+                            "\nEstimates the approximate fee per kilobyte needed for a transaction to begin\n"
                             "confirmation within nblocks blocks.\n"
                             "\nArguments:\n"
                             "1. nblocks     (numeric)\n"
                             "\nResult:\n"
-                            "n              (numeric) estimated priority\n"
+                            "{\n"
+                            "  \"feerate\" : x.x,     (numeric) estimate fee-per-kilobyte (in BCH)\n"
+                            "  \"blocks\" : 1         (numeric) hardcoded to 1 for backwards compatibility reasons\n"
+                            "}\n"
                             "\n"
                             "A negative value is returned if not enough transactions and blocks\n"
                             "have been observed to make an estimate.\n"
                             "\nExample:\n" +
-                            HelpExampleCli("estimatepriority", "6"));
+                            HelpExampleCli("estimatesmartfee", "6"));
 
     RPCTypeCheck(params, boost::assign::list_of(UniValue::VNUM));
 
@@ -969,76 +1034,13 @@ UniValue estimatepriority(const UniValue &params, bool fHelp)
     if (nBlocks < 1)
         nBlocks = 1;
 
-    return mempool.estimatePriority(nBlocks);
-}
-
-UniValue estimatesmartfee(const UniValue &params, bool fHelp)
-{
-    if (fHelp || params.size() != 1)
-        throw runtime_error("estimatesmartfee nblocks\n"
-                            "\nWARNING: This interface is unstable and may disappear or change!\n"
-                            "\nEstimates the approximate fee per kilobyte needed for a transaction to begin\n"
-                            "confirmation within nblocks blocks if possible and return the number of blocks\n"
-                            "for which the estimate is valid.\n"
-                            "\nArguments:\n"
-                            "1. nblocks     (numeric)\n"
-                            "\nResult:\n"
-                            "{\n"
-                            "  \"feerate\" : x.x,     (numeric) estimate fee-per-kilobyte (in BCH)\n"
-                            "  \"blocks\" : n         (numeric) block number where estimate was found\n"
-                            "}\n"
-                            "\n"
-                            "A negative value is returned if not enough transactions and blocks\n"
-                            "have been observed to make an estimate for any number of blocks.\n"
-                            "However it will not return a value below the mempool reject fee.\n"
-                            "\nExample:\n" +
-                            HelpExampleCli("estimatesmartfee", "6"));
-
-    RPCTypeCheck(params, boost::assign::list_of(UniValue::VNUM));
-
-    int nBlocks = params[0].get_int();
-
     UniValue result(UniValue::VOBJ);
-    int answerFound;
-    CFeeRate feeRate = mempool.estimateSmartFee(nBlocks, &answerFound);
+    CFeeRate feeRate = mempool.estimateFee(nBlocks);
     result.pushKV("feerate", feeRate == CFeeRate(0) ? -1.0 : ValueFromAmount(feeRate.GetFeePerK()));
-    result.pushKV("blocks", answerFound);
+    result.pushKV("blocks", 1);
     return result;
 }
 
-UniValue estimatesmartpriority(const UniValue &params, bool fHelp)
-{
-    if (fHelp || params.size() != 1)
-        throw runtime_error("estimatesmartpriority nblocks\n"
-                            "\nWARNING: This interface is unstable and may disappear or change!\n"
-                            "\nEstimates the approximate priority a zero-fee transaction needs to begin\n"
-                            "confirmation within nblocks blocks if possible and return the number of blocks\n"
-                            "for which the estimate is valid.\n"
-                            "\nArguments:\n"
-                            "1. nblocks     (numeric)\n"
-                            "\nResult:\n"
-                            "{\n"
-                            "  \"priority\" : x.x,    (numeric) estimated priority\n"
-                            "  \"blocks\" : n         (numeric) block number where estimate was found\n"
-                            "}\n"
-                            "\n"
-                            "A negative value is returned if not enough transactions and blocks\n"
-                            "have been observed to make an estimate for any number of blocks.\n"
-                            "However if the mempool reject fee is set it will return 1e9 * MAX_MONEY.\n"
-                            "\nExample:\n" +
-                            HelpExampleCli("estimatesmartpriority", "6"));
-
-    RPCTypeCheck(params, boost::assign::list_of(UniValue::VNUM));
-
-    int nBlocks = params[0].get_int();
-
-    UniValue result(UniValue::VOBJ);
-    int answerFound;
-    double priority = mempool.estimateSmartPriority(nBlocks, &answerFound);
-    result.pushKV("priority", priority);
-    result.pushKV("blocks", answerFound);
-    return result;
-}
 
 static const CRPCCommand commands[] = {
     //  category              name                      actor (function)         okSafeMode
@@ -1049,9 +1051,7 @@ static const CRPCCommand commands[] = {
 
     {"generating", "generate", &generate, true}, {"generating", "generatetoaddress", &generatetoaddress, true},
 
-    {"util", "estimatefee", &estimatefee, true}, {"util", "estimatepriority", &estimatepriority, true},
-    {"util", "estimatesmartfee", &estimatesmartfee, true},
-    {"util", "estimatesmartpriority", &estimatesmartpriority, true},
+    {"util", "estimatefee", &estimatefee, true}, {"util", "estimatesmartfee", &estimatesmartfee, true},
 };
 
 void RegisterMiningRPCCommands(CRPCTable &table)

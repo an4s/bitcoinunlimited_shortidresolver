@@ -63,6 +63,16 @@
 #include <QFontDatabase>
 #endif
 
+#if defined(Q_OS_MAC)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+
+#include <CoreServices/CoreServices.h>
+#include <QProcess>
+
+void ForceActivation();
+#endif
+
 static fs::detail::utf8_codecvt_facet utf8;
 
 #if defined(Q_OS_MAC)
@@ -129,8 +139,8 @@ void setupAddressWidget(QValidatedLineEdit *widget, QWidget *parent)
     const CChainParams &params = Params();
     // We don't want translators to use own addresses in translations
     // and this is the only place, where this address is supplied.
-    widget->setPlaceholderText(QObject::tr("Enter a Bitcoin address (e.g. %1)")
-                                   .arg(QString::fromStdString(DummyAddress(params, GetConfig()))));
+    widget->setPlaceholderText(
+        QObject::tr("Enter a BCH address (e.g. %1)").arg(QString::fromStdString(DummyAddress(params, GetConfig()))));
     widget->setValidator(new BitcoinAddressEntryValidator(params.CashAddrPrefix(), parent));
     widget->setCheckValidator(new BitcoinAddressCheckValidator(parent));
 }
@@ -443,6 +453,28 @@ bool isObscured(QWidget *w)
              checkPoint(QPoint(w->width() / 2, w->height() / 2), w));
 }
 
+void bringToFront(QWidget *w)
+{
+#ifdef Q_OS_MAC
+    ForceActivation();
+#endif
+
+    if (w)
+    {
+        // activateWindow() (sometimes) helps with keyboard focus on Windows
+        if (w->isMinimized())
+        {
+            w->showNormal();
+        }
+        else
+        {
+            w->show();
+        }
+        w->activateWindow();
+        w->raise();
+    }
+}
+
 void openDebugLogfile()
 {
     fs::path pathDebug = GetDataDir() / "debug.log";
@@ -652,18 +684,18 @@ bool SetStartOnSystemStartup(bool fAutoStart)
 
     if (fAutoStart)
     {
-        CoInitialize(NULL);
+        CoInitialize(nullptr);
 
         // Get a pointer to the IShellLink interface.
-        IShellLink *psl = NULL;
+        IShellLink *psl = nullptr;
         HRESULT hres = CoCreateInstance(
-            CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLink, reinterpret_cast<void **>(&psl));
+            CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLink, reinterpret_cast<void **>(&psl));
 
         if (SUCCEEDED(hres))
         {
             // Get the current executable path
             TCHAR pszExePath[MAX_PATH];
-            GetModuleFileName(NULL, pszExePath, sizeof(pszExePath));
+            GetModuleFileName(nullptr, pszExePath, sizeof(pszExePath));
 
             // Start client minimized
             QString strArgs = "-min";
@@ -692,7 +724,7 @@ bool SetStartOnSystemStartup(bool fAutoStart)
 
             // Query IShellLink for the IPersistFile interface for
             // saving the shortcut in persistent storage.
-            IPersistFile *ppf = NULL;
+            IPersistFile *ppf = nullptr;
             hres = psl->QueryInterface(IID_IPersistFile, reinterpret_cast<void **>(&ppf));
             if (SUCCEEDED(hres))
             {
@@ -795,29 +827,29 @@ bool SetStartOnSystemStartup(bool fAutoStart)
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreServices/CoreServices.h>
 
-// NB: caller must release returned ref if it's not NULL
+// NB: caller must release returned ref if it's not nullptr
 LSSharedFileListItemRef findStartupItemInList(LSSharedFileListRef list, CFURLRef findUrl);
 LSSharedFileListItemRef findStartupItemInList(LSSharedFileListRef list, CFURLRef findUrl)
 {
-    LSSharedFileListItemRef foundItem = NULL;
+    LSSharedFileListItemRef foundItem = nullptr;
 
     // loop through the list of startup items and try to find the app
-    CFArrayRef listSnapshot = LSSharedFileListCopySnapshot(list, NULL);
+    CFArrayRef listSnapshot = LSSharedFileListCopySnapshot(list, nullptr);
     for (int i = 0; !foundItem && i < CFArrayGetCount(listSnapshot); ++i)
     {
         LSSharedFileListItemRef item = (LSSharedFileListItemRef)CFArrayGetValueAtIndex(listSnapshot, i);
         UInt32 resolutionFlags = kLSSharedFileListNoUserInteraction | kLSSharedFileListDoNotMountVolumes;
-        CFURLRef currentItemURL = NULL;
+        CFURLRef currentItemURL = nullptr;
 
 #if defined(MAC_OS_X_VERSION_MAX_ALLOWED) && MAC_OS_X_VERSION_MAX_ALLOWED >= 10100
         if (&LSSharedFileListItemCopyResolvedURL)
-            currentItemURL = LSSharedFileListItemCopyResolvedURL(item, resolutionFlags, NULL);
+            currentItemURL = LSSharedFileListItemCopyResolvedURL(item, resolutionFlags, nullptr);
 #if defined(MAC_OS_X_VERSION_MIN_REQUIRED) && MAC_OS_X_VERSION_MIN_REQUIRED < 10100
         else
-            LSSharedFileListItemResolve(item, resolutionFlags, &currentItemURL, NULL);
+            LSSharedFileListItemResolve(item, resolutionFlags, &currentItemURL, nullptr);
 #endif
 #else
-        LSSharedFileListItemResolve(item, resolutionFlags, &currentItemURL, NULL);
+        LSSharedFileListItemResolve(item, resolutionFlags, &currentItemURL, nullptr);
 #endif
 
         if (currentItemURL && CFEqual(currentItemURL, findUrl))
@@ -837,7 +869,7 @@ LSSharedFileListItemRef findStartupItemInList(LSSharedFileListRef list, CFURLRef
 bool GetStartOnSystemStartup()
 {
     CFURLRef bitcoinAppUrl = CFBundleCopyBundleURL(CFBundleGetMainBundle());
-    LSSharedFileListRef loginItems = LSSharedFileListCreate(NULL, kLSSharedFileListSessionLoginItems, NULL);
+    LSSharedFileListRef loginItems = LSSharedFileListCreate(nullptr, kLSSharedFileListSessionLoginItems, nullptr);
     LSSharedFileListItemRef foundItem = findStartupItemInList(loginItems, bitcoinAppUrl);
     // findStartupItemInList retains the item it returned, need to release
     if (foundItem)
@@ -850,14 +882,14 @@ bool GetStartOnSystemStartup()
 bool SetStartOnSystemStartup(bool fAutoStart)
 {
     CFURLRef bitcoinAppUrl = CFBundleCopyBundleURL(CFBundleGetMainBundle());
-    LSSharedFileListRef loginItems = LSSharedFileListCreate(NULL, kLSSharedFileListSessionLoginItems, NULL);
+    LSSharedFileListRef loginItems = LSSharedFileListCreate(nullptr, kLSSharedFileListSessionLoginItems, nullptr);
     LSSharedFileListItemRef foundItem = findStartupItemInList(loginItems, bitcoinAppUrl);
 
     if (fAutoStart && !foundItem)
     {
         // add bitcoin app to startup item list
         LSSharedFileListInsertItemURL(
-            loginItems, kLSSharedFileListItemBeforeFirst, NULL, NULL, bitcoinAppUrl, NULL, NULL);
+            loginItems, kLSSharedFileListItemBeforeFirst, nullptr, nullptr, bitcoinAppUrl, nullptr, nullptr);
     }
     else if (!fAutoStart && foundItem)
     {
@@ -905,6 +937,21 @@ void restoreWindowGeometry(const QString &strSetting, const QSize &defaultSize, 
 
     if (QApplication::desktop()->screenNumber(parent) == -1)
         parent->move(posCenter);
+}
+
+void saveColumnConfiguration(const QString &strSetting, QHeaderView *header)
+{
+    QSettings settings;
+    settings.setValue(strSetting + "Columns", header->saveState());
+}
+
+bool restoreColumnConfiguration(const QString &strSetting, QHeaderView *header)
+{
+    QSettings settings;
+    if (!settings.contains(strSetting + "Columns"))
+        return false;
+
+    return header->restoreState(settings.value(strSetting + "Columns").toByteArray());
 }
 
 void setClipboard(const QString &str)
@@ -977,6 +1024,9 @@ QString formatServicesStr(quint64 mask, const QStringList &additionalServices)
             case NODE_CF:
                 strList.append("CF");
                 break;
+            case NODE_NETWORK_LIMITED:
+                strList.append("LIMITED");
+                break;
             default:
                 strList.append(QString("%1[%2]").arg("UNKNOWN").arg(check));
             }
@@ -1005,4 +1055,42 @@ QString formatTimeOffset(int64_t nTimeOffset)
 }
 
 QString uriPrefix() { return "bitcoincash"; }
+QString formateNiceTimeOffset(qint64 secs)
+{
+    // Represent time from last generated block in human readable text
+    QString timeBehindText;
+    const int HOUR_IN_SECONDS = 60 * 60;
+    const int DAY_IN_SECONDS = 24 * 60 * 60;
+    const int WEEK_IN_SECONDS = 7 * 24 * 60 * 60;
+    const int YEAR_IN_SECONDS = 31556952; // Average length of year in Gregorian calendar
+    if (secs < 60)
+    {
+        timeBehindText = QObject::tr("%n seconds(s)", "", secs);
+    }
+    else if (secs < 2 * HOUR_IN_SECONDS)
+    {
+        timeBehindText = QObject::tr("%n minutes(s)", "", secs / 60);
+    }
+    else if (secs < 2 * DAY_IN_SECONDS)
+    {
+        timeBehindText = QObject::tr("%n hour(s)", "", secs / HOUR_IN_SECONDS);
+    }
+    else if (secs < 2 * WEEK_IN_SECONDS)
+    {
+        timeBehindText = QObject::tr("%n day(s)", "", secs / DAY_IN_SECONDS);
+    }
+    else if (secs < YEAR_IN_SECONDS)
+    {
+        timeBehindText = QObject::tr("%n week(s)", "", secs / WEEK_IN_SECONDS);
+    }
+    else
+    {
+        qint64 years = secs / YEAR_IN_SECONDS;
+        qint64 remainder = secs % YEAR_IN_SECONDS;
+        timeBehindText = QObject::tr("%1 and %2")
+                             .arg(QObject::tr("%n year(s)", "", years))
+                             .arg(QObject::tr("%n week(s)", "", remainder / WEEK_IN_SECONDS));
+    }
+    return timeBehindText;
+}
 } // namespace GUIUtil

@@ -1,5 +1,6 @@
 // Copyright (c) 2017 The Bitcoin developers
 // Copyright (c) 2018 The Bitcoin SV developers
+// Copyright (c) 2017-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -22,7 +23,6 @@ static std::map<std::string, uint32_t> mapFlagNames =
     {"STRICTENC", SCRIPT_VERIFY_STRICTENC},
     {"DERSIG", SCRIPT_VERIFY_DERSIG},
     {"LOW_S", SCRIPT_VERIFY_LOW_S},
-    {"NULLDUMMY", SCRIPT_VERIFY_NULLDUMMY},
     {"SIGPUSHONLY", SCRIPT_VERIFY_SIGPUSHONLY},
     {"MINIMALDATA", SCRIPT_VERIFY_MINIMALDATA},
     {"DISCOURAGE_UPGRADABLE_NOPS", SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS},
@@ -35,9 +35,9 @@ static std::map<std::string, uint32_t> mapFlagNames =
     {"SIGHASH_FORKID", SCRIPT_ENABLE_SIGHASH_FORKID},
     {"REPLAY_PROTECTION", SCRIPT_ENABLE_REPLAY_PROTECTION},
     {"CHECKDATASIG", SCRIPT_ENABLE_CHECKDATASIG},
-    {"SCHNORR", SCRIPT_ENABLE_SCHNORR},
-    {"ALLOW_SEGWIT_RECOVERY", SCRIPT_ALLOW_SEGWIT_RECOVERY},
-    {"MUL_SHIFT_INV", SCRIPT_ENABLE_MUL_SHIFT_INVERT_OPCODES}
+    {"DISALLOW_SEGWIT_RECOVERY", SCRIPT_DISALLOW_SEGWIT_RECOVERY},
+    {"SCHNORR_MULTISIG", SCRIPT_ENABLE_SCHNORR_MULTISIG},
+    {"REVERSEBYTES", SCRIPT_ENABLE_OP_REVERSEBYTES},
 };
 // clang-format on
 

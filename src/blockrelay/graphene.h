@@ -1,14 +1,16 @@
-// Copyright (c) 2018 The Bitcoin Unlimited developers
+// Copyright (c) 2018-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #ifndef BITCOIN_GRAPHENE_H
 #define BITCOIN_GRAPHENE_H
 
+#include "blockrelay/blockrelay_common.h"
 #include "blockrelay/graphene_set.h"
 #include "bloom.h"
 #include "config.h"
 #include "consensus/validation.h"
+#include "fastfilter.h"
 #include "iblt.h"
 #include "primitives/block.h"
 #include "protocol.h"
@@ -30,9 +32,10 @@ enum FastFilterSupport
 
 const uint8_t GRAPHENE_FAST_FILTER_SUPPORT = EITHER;
 const uint64_t GRAPHENE_MIN_VERSION_SUPPORTED = 0;
-const uint64_t GRAPHENE_MAX_VERSION_SUPPORTED = 4;
+const uint64_t GRAPHENE_MAX_VERSION_SUPPORTED = 6;
 const unsigned char MIN_MEMPOOL_INFO_BYTES = 8;
 const uint8_t SHORTTXIDS_LENGTH = 8;
+const double FAILURE_RECOVERY_SUCCESS_RATE = 0.999;
 
 class CDataStream;
 class CNode;
@@ -61,16 +64,31 @@ private:
     // Entropy used for SipHash secret key; this is distinct from the block nonce
     uint64_t sipHashNonce;
 
+private:
+    // memory only
+    mutable uint64_t nSize; // Serialized grapheneblock size in bytes
+
+public:
+    // memory only
+    mutable unsigned int nWaitingFor; // Number of txns we are still needing to recontruct the block
+
+    // memory only
+    std::vector<uint256> vTxHashes256; // List of all 256 bit transaction hashes in the block
+    std::map<uint64_t, CTransactionRef> mapMissingTx; // Map of transactions that were re-requested
+    std::vector<CTransactionRef> vAdditionalTxs; // vector of transactions receiver probably does not have
+    std::set<CTransactionRef> vRecoveredTxs; // set of transactions collected during failure recovery
+    std::map<uint64_t, uint32_t> mapHashOrderIndex;
+
 public:
     // These describe, in two parts, the 128-bit secret key used for SipHash
     // Note that they are populated by FillShortTxIDSelector, which uses header and sipHashNonce
     uint64_t shorttxidk0, shorttxidk1;
     CBlockHeader header;
-    std::vector<CTransactionRef> vAdditionalTxs; // vector of transactions receiver probably does not have
     uint64_t nBlockTxs;
-    CGrapheneSet *pGrapheneSet;
+    std::shared_ptr<CGrapheneSet> pGrapheneSet;
     uint64_t version;
     bool computeOptimized;
+    double fpr;
 
 public:
     CGrapheneBlock(const CBlockRef pblock,
@@ -78,19 +96,41 @@ public:
         uint64_t nSenderMempoolPlusBlock,
         uint64_t _version,
         bool _computeOptimized);
-    CGrapheneBlock() : shorttxidk0(0), shorttxidk1(0), pGrapheneSet(nullptr), version(2), computeOptimized(false) {}
+    CGrapheneBlock()
+        : nSize(0), nWaitingFor(0), shorttxidk0(0), shorttxidk1(0), pGrapheneSet(nullptr), version(2),
+          computeOptimized(false)
+    {
+    }
     CGrapheneBlock(uint64_t _version)
-        : shorttxidk0(0), shorttxidk1(0), pGrapheneSet(nullptr), version(_version), computeOptimized(false)
+        : nSize(0), nWaitingFor(0), shorttxidk0(0), shorttxidk1(0), pGrapheneSet(nullptr), version(_version),
+          computeOptimized(false)
     {
     }
     CGrapheneBlock(uint64_t _version, bool _computeOptimized)
-        : shorttxidk0(0), shorttxidk1(0), pGrapheneSet(nullptr), version(_version), computeOptimized(_computeOptimized)
+        : nSize(0), nWaitingFor(0), shorttxidk0(0), shorttxidk1(0), pGrapheneSet(nullptr), version(_version),
+          computeOptimized(_computeOptimized)
     {
     }
     ~CGrapheneBlock();
     // Create seeds for SipHash using the sipHashNonce generated in the constructor
     // Note that this must be called any time members header or sipHashNonce are changed
     void FillShortTxIDSelector();
+
+    // Adds a new set of transactins after rerequesting or during failure recovery
+    void AddNewTransactions(std::vector<CTransaction> vMissingTx, CNode *pfrom);
+
+    // Order hashes in vTxHashes256
+    void OrderTxHashes(CNode *pfrom);
+
+    // Validates header and, if possible, determines if there are any missing or unnecessary transactions
+    // in the block
+    bool ValidateAndRecontructBlock(uint256 blockhash,
+        std::shared_ptr<CBlockThinRelay> pblock,
+        const std::map<uint64_t, CTransactionRef> &mapMissingTx,
+        std::string command,
+        CNode *pfrom,
+        CDataStream &vRecv);
+
     /**
      * Handle an incoming Graphene block
      * Once the block is validated apart from the Merkle root, forward the Xpedited block with a hop count of nHops.
@@ -101,6 +141,17 @@ public:
      * @return True if handling succeeded
      */
     static bool HandleMessage(CDataStream &vRecv, CNode *pfrom, std::string strCommand, unsigned nHops);
+
+    static inline uint64_t GetGrapheneSetVersion(uint64_t grapheneBlockVersion)
+    {
+        if (grapheneBlockVersion < 2)
+            return 0;
+        else
+        {
+            // Currently CGrapheneSet version trails CGrapheneBlock version by 1
+            return grapheneBlockVersion - 1;
+        }
+    }
 
     ADD_SERIALIZE_METHODS;
 
@@ -116,29 +167,48 @@ public:
         READWRITE(header);
         READWRITE(vAdditionalTxs);
         READWRITE(nBlockTxs);
-        // This logic assumes a smallest transaction size of 100 bytes.  This is optimistic for realistic transactions
-        // and the downside for pathological blocks is just that graphene won't work so we fall back to xthin
-        if (nBlockTxs > (excessiveBlockSize * maxMessageSizeMultiplier / 100))
-            throw std::runtime_error("nBlockTxs exceeds threshold for excessive block txs");
+        // This logic assumes a smallest transaction size of MIN_TX_SIZE bytes.  This is optimistic for realistic
+        // transactions and the downside for pathological blocks is just that graphene won't work so we fall back
+        // to xthin
+        if (nBlockTxs > (thinrelay.GetMaxAllowedBlockSize() / MIN_TX_SIZE))
+        {
+            throw std::runtime_error(strprintf(
+                "Based on number of transactions:(%d) the threshold for max allowed blocksize:(%d) will be exceeded",
+                nBlockTxs, thinrelay.GetMaxAllowedBlockSize()));
+        }
         if (!pGrapheneSet)
         {
             if (version > 3)
-                pGrapheneSet = new CGrapheneSet(3, computeOptimized);
-            else if (version == 3)
-                pGrapheneSet = new CGrapheneSet(2);
-            else if (version == 2)
-                pGrapheneSet = new CGrapheneSet(1);
+                pGrapheneSet = std::make_shared<CGrapheneSet>(
+                    CGrapheneSet(CGrapheneBlock::GetGrapheneSetVersion(version), computeOptimized));
             else
-                pGrapheneSet = new CGrapheneSet(0);
+                pGrapheneSet =
+                    std::make_shared<CGrapheneSet>(CGrapheneSet(CGrapheneBlock::GetGrapheneSetVersion(version)));
         }
         READWRITE(*pGrapheneSet);
+        if (version >= 6)
+            READWRITE(fpr);
     }
     uint64_t GetAdditionalTxSerializationSize()
     {
         return ::GetSerializeSize(vAdditionalTxs, SER_NETWORK, PROTOCOL_VERSION);
     }
+
+    uint64_t GetSize() const
+    {
+        if (nSize == 0)
+            nSize = ::GetSerializeSize(*this, SER_NETWORK, PROTOCOL_VERSION);
+        return nSize;
+    }
+
     CInv GetInv() { return CInv(MSG_BLOCK, header.GetHash()); }
-    bool process(CNode *pfrom, int nSizeGrapheneBlock, std::string strCommand);
+    bool process(CNode *pfrom, std::string strCommand, std::shared_ptr<CBlockThinRelay> pblock);
+    void FillTxMapFromPools(std::map<uint64_t, CTransactionRef> &mapTxFromPools);
+    void SituateCoinbase(std::vector<uint64_t> blockCheapHashes, CTransactionRef coinbase, uint64_t grapheneVersion);
+    void SituateCoinbase(CTransactionRef coinbase);
+    std::set<uint64_t> UpdateResolvedTxsAndIdentifyMissing(const std::map<uint64_t, CTransactionRef> &mapPartialTxHash,
+        const std::vector<uint64_t> &blockCheapHashes,
+        uint64_t grapheneVersion);
     bool CheckBlockHeader(const CBlockHeader &block, CValidationState &state);
 };
 
@@ -219,15 +289,18 @@ struct GrapheneQuickStats
     double fLast24hOutboundCompression;
     uint64_t nLast24hRerequestTx;
     double fLast24hRerequestTxPercent;
+    GrapheneQuickStats()
+        : nTotalInbound(0), nTotalOutbound(0), nTotalBandwidthSavings(0), nTotalDecodeFailures(0), nLast24hInbound(0),
+          fLast24hInboundCompression(0.0), nLast24hOutbound(0), fLast24hOutboundCompression(0.0),
+          nLast24hRerequestTx(0), fLast24hRerequestTxPercent(0.0)
+    {
+    }
 };
 
 // This class stores statistics for graphene block derived protocols.
 class CGrapheneBlockData
 {
 private:
-    /* The sum total of all bytes for graphene blocks currently in process of being reconstructed */
-    std::atomic<uint64_t> nGrapheneBlockBytes{0};
-
     CCriticalSection cs_graphenestats; // locks everything below this point
 
     CStatHistory<uint64_t> nOriginalSize;
@@ -332,27 +405,110 @@ public:
     std::string ValidationTimeToString();
     std::string ReRequestedTxToString();
 
-    void ClearGrapheneBlockData(CNode *pfrom);
-    void ClearGrapheneBlockData(CNode *pfrom, const uint256 &hash);
     void ClearGrapheneBlockStats();
-
-    uint64_t AddGrapheneBlockBytes(uint64_t, CNode *pfrom);
-    void DeleteGrapheneBlockBytes(uint64_t, CNode *pfrom);
-    void ResetGrapheneBlockBytes();
-    uint64_t GetGrapheneBlockBytes();
 
     void FillGrapheneQuickStats(GrapheneQuickStats &stats);
 };
 extern CGrapheneBlockData graphenedata; // Singleton class
 
+/**
+ * If CGrapheneSet fails to decode, then receiver communicates relevant contents of mempool by sending
+ * a Bloom filter which contains all transactions from its mempool that passed through the sender's
+ * Bloom filter.
+ **/
+class CRequestGrapheneReceiverRecover
+{
+public:
+    /** Bloom filter containing transaction hashes that passed through sender's Bloom filter. */
+    std::shared_ptr<CVariableFastFilter> pReceiverFilter;
+    uint64_t nSenderFilterPositives;
+    uint256 blockhash;
+
+public:
+    CRequestGrapheneReceiverRecover(std::vector<uint256> &relevantHashes,
+        CGrapheneBlock &grapheneBlock,
+        uint64_t _nSenderFilterPositives);
+    CRequestGrapheneReceiverRecover() {}
+    ~CRequestGrapheneReceiverRecover() { pReceiverFilter = nullptr; }
+    /**
+     * Issue outgoing request for graphene recovery
+     * @param[in] vRecv        The raw binary message
+     * @param[in] pFrom        The node the message was from
+     * @return True if handling succeeded
+     */
+    static bool HandleMessage(CDataStream &vRecv, CNode *pfrom);
+    ADD_SERIALIZE_METHODS;
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream &s, Operation ser_action)
+    {
+        if (!pReceiverFilter)
+            pReceiverFilter = std::make_shared<CVariableFastFilter>();
+        READWRITE(*pReceiverFilter);
+        READWRITE(nSenderFilterPositives);
+        READWRITE(blockhash);
+    }
+};
+
+/**
+ * Respond to receiver's request for Graphene failure recovery. Using the filter sent by the
+ * receiver, formulate 1) the array of transactions from the block that the receiver is definitely
+ * missing and 2) a new IBLT that accounts for false positives in both the sender and receiver
+ * filters.
+ **/
+class CGrapheneReceiverRecover
+{
+public:
+    /** Transactions that receiver is definitely missing */
+    // FIXME: Consider not making these shared_ptrs
+    std::vector<CTransaction> vMissingTxs;
+    /** Revised IBLT that accounts for false positives */
+    std::shared_ptr<CIblt> pRevisedIblt;
+    uint256 blockhash;
+
+public:
+    CGrapheneReceiverRecover(CVariableFastFilter &receiverFilter,
+        CGrapheneBlock &grapheneBlock,
+        uint64_t _nSenderFilterPositives,
+        CNode *pfrom);
+    CGrapheneReceiverRecover() {}
+    ~CGrapheneReceiverRecover() { pRevisedIblt = nullptr; }
+    /**
+     * Issue outgoing response for graphene recovery
+     * @param[in] vRecv        The raw binary message
+     * @param[in] pFrom        The node the message was from
+     * @return True if handling succeeded
+     */
+    static bool HandleMessage(CDataStream &vRecv, CNode *pfrom);
+    ADD_SERIALIZE_METHODS;
+
+    template <typename Stream, typename Operation>
+    inline void SerializationOp(Stream &s, Operation ser_action)
+    {
+        READWRITE(vMissingTxs);
+
+        if (!pRevisedIblt)
+            pRevisedIblt = std::make_shared<CIblt>(CIblt());
+        READWRITE(*pRevisedIblt);
+        READWRITE(blockhash);
+    }
+};
 
 bool IsGrapheneBlockEnabled();
-bool ClearLargestGrapheneBlockAndDisconnect(CNode *pfrom);
 void SendGrapheneBlock(CBlockRef pblock, CNode *pfrom, const CInv &inv, const CMemPoolInfo &mempoolinfo);
 bool IsGrapheneBlockValid(CNode *pfrom, const CBlockHeader &header);
 bool HandleGrapheneBlockRequest(CDataStream &vRecv, CNode *pfrom, const CChainParams &chainparams);
+bool HandleGrapheneBlockRecoveryResponse(CDataStream &vRecv, CNode *pfrom, const CChainParams &chainparams);
+bool HandleGrapheneBlockRecoveryRequest(CDataStream &vRecv, CNode *pfrom, const CChainParams &chainparams);
 CMemPoolInfo GetGrapheneMempoolInfo();
-void RequestFailoverBlock(CNode *pfrom, const uint256 &blockhash);
+void RequestFailureRecovery(CNode *pfrom,
+    std::shared_ptr<CGrapheneBlock> pblock,
+    std::vector<uint256> vSenderFilterPositiveHahses);
+void RequestFailoverBlock(CNode *pfrom, std::shared_ptr<CBlockThinRelay> pblock);
+// Load subset of transactions from block according to cheap hashes
+std::vector<CTransaction> TransactionsFromBlockByCheapHash(std::set<uint64_t> &vCheapHashes,
+    uint256 blockhash,
+    CNode *pfrom);
 // Generate cheap hash from seeds using SipHash
 uint64_t GetShortID(uint64_t shorttxidk0, uint64_t shorttxidk1, const uint256 &txhash, uint64_t grapheneVersion);
 // This method decides on the value of computeOptimized depending on what modes are supported

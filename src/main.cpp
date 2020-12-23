@@ -1,6 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -10,6 +10,7 @@
 #include "arith_uint256.h"
 #include "blockrelay/blockrelay_common.h"
 #include "blockrelay/graphene.h"
+#include "blockrelay/mempool_sync.h"
 #include "blockrelay/thinblock.h"
 #include "blockstorage/blockstorage.h"
 #include "blockstorage/sequential_files.h"
@@ -23,7 +24,8 @@
 #include "consensus/validation.h"
 #include "dosman.h"
 #include "expedited.h"
-#include "hash.h"
+#include "hashwrapper.h"
+#include "index/txindex.h"
 #include "init.h"
 #include "merkleblock.h"
 #include "net.h"
@@ -42,6 +44,7 @@
 #include "tinyformat.h"
 #include "txadmission.h"
 #include "txdb.h"
+#include "txlookup.h"
 #include "txmempool.h"
 #include "txorphanpool.h"
 #include "ui_interface.h"
@@ -73,10 +76,9 @@
  * Global state
  */
 
-// BU moved CWaitableCriticalSection csBestBlock;
-// BU moved CConditionVariable cvBlockChange;
-bool fImporting = false;
-bool fReindex = false;
+std::atomic<bool> fImporting{false};
+std::atomic<bool> fReindex{false};
+bool fBlocksOnly = false;
 bool fTxIndex = false;
 bool fHavePruned = false;
 bool fPruneMode = false;
@@ -99,7 +101,6 @@ extern CCriticalSection cs_mapInboundConnectionTracker;
 
 extern CCriticalSection cs_LastBlockFile;
 
-extern CBlockIndex *pindexBestInvalid;
 extern std::map<uint256, NodeId> mapBlockSource;
 extern std::set<int> setDirtyFileInfo;
 extern uint64_t nBlockSequenceId;
@@ -144,8 +145,15 @@ void InitializeNode(const CNode *pnode)
 
 void FinalizeNode(NodeId nodeid)
 {
-    // Decrement thin type peer counters
-    thinrelay.RemovePeers(connmgr->FindNodeFromId(nodeid).get());
+    // Clean up the sync maps
+    ClearDisconnectedFromMempoolSyncMaps(nodeid);
+
+    // Clear thintype block data if we have any.
+    thinrelay.ClearAllBlocksToReconstruct(nodeid);
+    thinrelay.ClearAllBlocksInFlight(nodeid);
+
+    // Clear Graphene blocks held by sender for this receiver
+    thinrelay.ClearSentGrapheneBlocks(nodeid);
 
     // Update block sync counters
     {
@@ -174,7 +182,7 @@ bool GetNodeStateStats(NodeId nodeid, CNodeStateStats &stats)
     CNodeStateAccessor state(nodestate, nodeid);
     DbgAssert(state != nullptr, return false);
 
-    stats.nMisbehavior = node->nMisbehavior;
+    stats.nMisbehavior = node->nMisbehavior.load();
     stats.nSyncHeight = state->pindexBestKnownBlock ? state->pindexBestKnownBlock->nHeight : -1;
     stats.nCommonHeight = state->pindexLastCommonBlock ? state->pindexLastCommonBlock->nHeight : -1;
 
@@ -273,6 +281,7 @@ bool AreFreeTxnsDisallowed()
 
 bool GetTransaction(const uint256 &hash,
     CTransactionRef &txOut,
+    int64_t &txTime,
     const Consensus::Params &consensusParams,
     uint256 &hashBlock,
     bool fAllowSlow,
@@ -280,44 +289,36 @@ bool GetTransaction(const uint256 &hash,
 {
     const CBlockIndex *pindexSlow = blockIndex;
 
-    LOCK(cs_main);
+    CTransactionRef ptx;
+    {
+        READLOCK(mempool.cs_txmempool);
+        CTxMemPool::txiter entryPtr = mempool.mapTx.find(hash);
+        if (entryPtr != mempool.mapTx.end())
+        {
+            txTime = entryPtr->GetTime();
+            ptx = entryPtr->GetSharedTx();
+        }
+    }
+    if (ptx)
+    {
+        txOut = ptx;
+        return true;
+    }
+
+    if (g_txindex)
+    {
+        int32_t time = -1;
+        if (g_txindex->FindTx(hash, hashBlock, txOut, time))
+        {
+            if (txTime != -1)
+                txTime = time;
+            return true;
+        }
+    }
 
     if (blockIndex == nullptr)
     {
-        CTransactionRef ptx = mempool.get(hash);
-        if (ptx)
-        {
-            txOut = ptx;
-            return true;
-        }
-
-        if (fTxIndex)
-        {
-            CDiskTxPos postx;
-            if (pblocktree->ReadTxIndex(hash, postx))
-            {
-                CAutoFile file(OpenBlockFile(postx, true), SER_DISK, CLIENT_VERSION);
-                if (file.IsNull())
-                    return error("%s: OpenBlockFile failed", __func__);
-                CBlockHeader header;
-                try
-                {
-                    file >> header;
-                    fseek(file.Get(), postx.nTxOffset, SEEK_CUR);
-                    file >> txOut;
-                }
-                catch (const std::exception &e)
-                {
-                    return error("%s: Deserialize or I/O error - %s", __func__, e.what());
-                }
-                hashBlock = header.GetHash();
-                if (txOut->GetHash() != hash)
-                    return error("%s: txid mismatch", __func__);
-                return true;
-            }
-        }
-
-        // use coin database to locate block that contains transaction, and scan it
+        // attempt to use coin database to locate block that contains transaction, and scan it
         if (fAllowSlow)
         {
             CoinAccessor coin(*pcoinsTip, hash);
@@ -331,15 +332,15 @@ bool GetTransaction(const uint256 &hash,
         CBlock block;
         if (ReadBlockFromDisk(block, pindexSlow, consensusParams))
         {
-            for (const auto &tx : block.vtx)
+            bool ctor_enabled = pindexSlow->nHeight >= consensusParams.nov2018Height;
+            int64_t pos = FindTxPosition(block, hash, ctor_enabled);
+            if (pos == TX_NOT_FOUND)
             {
-                if (tx->GetHash() == hash)
-                {
-                    txOut = tx;
-                    hashBlock = pindexSlow->GetBlockHash();
-                    return true;
-                }
+                return false;
             }
+            txOut = block.vtx.at(pos);
+            txTime = block.nTime;
+            return true;
         }
     }
 
@@ -399,11 +400,11 @@ bool AbortNode(CValidationState &state, const std::string &strMessage, const std
 // too slowly or too quickly).
 //
 void PartitionCheck(bool (*initialDownloadCheck)(),
-    CCriticalSection &cs,
+    CCriticalSection &cs_partitionCheck,
     const CBlockIndex *const &bestHeader,
     int64_t nPowTargetSpacing)
 {
-    if (bestHeader == NULL || initialDownloadCheck())
+    if (bestHeader == nullptr || initialDownloadCheck())
         return;
 
     static int64_t lastAlertTime = 0;
@@ -420,14 +421,14 @@ void PartitionCheck(bool (*initialDownloadCheck)(),
     std::string strWarning;
     int64_t startTime = GetAdjustedTime() - SPAN_SECONDS;
 
-    LOCK(cs);
+    LOCK(cs_partitionCheck);
     const CBlockIndex *i = bestHeader;
     int nBlocks = 0;
     while (i->GetBlockTime() >= startTime)
     {
         ++nBlocks;
         i = i->pprev;
-        if (i == NULL)
+        if (i == nullptr)
             return; // Ran out of chain, we must not be fully sync'ed
     }
 
@@ -473,7 +474,9 @@ bool CheckAgainstCheckpoint(unsigned int height, const uint256 &hash, const CCha
     if (lkup != ckpt.mapCheckpoints.end()) // this block height is checkpointed
     {
         if (hash != lkup->second) // This block does not match the checkpoint
+        {
             return false;
+        }
     }
     return true;
 }
@@ -482,8 +485,8 @@ bool CheckDiskSpace(uint64_t nAdditionalBytes)
 {
     uint64_t nFreeBytesAvailable = fs::space(GetDataDir()).available;
 
-    // Check for nMinDiskSpace bytes (currently 50MB)
-    if (nFreeBytesAvailable < nMinDiskSpace + nAdditionalBytes)
+    // Check for nMinDiskSpace bytes (currently 100MB)
+    if (Params().NetworkIDString() != "regtest" && nFreeBytesAvailable < nMinDiskSpace + nAdditionalBytes)
         return AbortNode("Disk space is low!", _("Error: Disk space is low!"));
 
     return true;
@@ -502,6 +505,7 @@ bool LoadExternalBlockFile(const CChainParams &chainparams, FILE *fileIn, CDiskB
         CBufferedFile blkdat(fileIn, 2 * (reindexTypicalBlockSize.Value() + MESSAGE_START_SIZE + sizeof(unsigned int)),
             reindexTypicalBlockSize.Value() + MESSAGE_START_SIZE + sizeof(unsigned int), SER_DISK, CLIENT_VERSION);
         uint64_t nRewind = blkdat.GetPos();
+
         while (!blkdat.eof())
         {
             if (shutdown_threads.load() == true)
@@ -572,10 +576,16 @@ bool LoadExternalBlockFile(const CChainParams &chainparams, FILE *fileIn, CDiskB
 
                 // process in case the block isn't known yet
                 auto *pindex = LookupBlockIndex(hash);
-                if (pindex == nullptr || (pindex->nStatus & BLOCK_HAVE_DATA) == 0)
+                bool fHaveData = false;
+                if (pindex)
+                {
+                    READLOCK(cs_mapBlockIndex);
+                    fHaveData = (pindex->nStatus & BLOCK_HAVE_DATA);
+                }
+                if (pindex == nullptr || !fHaveData)
                 {
                     CValidationState state;
-                    if (ProcessNewBlock(state, chainparams, NULL, &block, true, dbp, false))
+                    if (ProcessNewBlock(state, chainparams, nullptr, &block, true, dbp, false))
                         nLoaded++;
                     if (state.IsError())
                         break;
@@ -603,7 +613,7 @@ bool LoadExternalBlockFile(const CChainParams &chainparams, FILE *fileIn, CDiskB
                             LOGA("%s: Processing out of order child %s of %s\n", __func__, block.GetHash().ToString(),
                                 head.ToString());
                             CValidationState dummy;
-                            if (ProcessNewBlock(dummy, chainparams, NULL, &block, true, &it->second, false))
+                            if (ProcessNewBlock(dummy, chainparams, nullptr, &block, true, &it->second, false))
                             {
                                 nLoaded++;
                                 queue.push_back(block.GetHash());
@@ -715,7 +725,7 @@ void MainCleanup()
 
     {
         // orphan transactions
-        WRITELOCK(orphanpool.cs);
+        WRITELOCK(orphanpool.cs_orphanpool);
         orphanpool.mapOrphanTransactions.clear();
         orphanpool.mapOrphanTransactionsByPrev.clear();
     }

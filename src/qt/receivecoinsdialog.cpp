@@ -73,6 +73,10 @@ ReceiveCoinsDialog::ReceiveCoinsDialog(const PlatformStyle *_platformStyle, cons
 
     // initialize freeze
     nFreezeLockTime = CScriptNum(0);
+
+    // Temporarily disable the freeze coin check box in the wallet.
+    // TODO: determine whether to competely remove the freeze feature.
+    ui->freezeCheck->setEnabled(false);
 }
 
 void ReceiveCoinsDialog::setModel(WalletModel *_model)
@@ -114,7 +118,7 @@ void ReceiveCoinsDialog::clear()
     ui->freezeCheck->setChecked(false);
     ui->freezeCheck->setText("Coin &Freeze");
     nFreezeLockTime = CScriptNum(0);
-    freezeDialog = NULL;
+    freezeDialog = nullptr;
     updateDisplayUnit();
 }
 

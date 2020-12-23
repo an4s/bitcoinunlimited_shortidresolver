@@ -1,13 +1,16 @@
 // Copyright (c) 2012-2016 The Bitcoin Core developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
 #include "net.h"
 #include "addrman.h"
 #include "chainparams.h"
-#include "hash.h"
+#include "hashwrapper.h"
 #include "serialize.h"
 #include "streams.h"
 #include "test/test_bitcoin.h"
+
 #include <boost/test/unit_test.hpp>
 #include <string>
 
@@ -211,6 +214,27 @@ BOOST_AUTO_TEST_CASE(cnode_simple_test)
         BOOST_CHECK_EQUAL(pnode1->nRefCount, 0);
     }
     BOOST_CHECK_EQUAL(pnode1->nRefCount, 0);
+}
+
+BOOST_AUTO_TEST_CASE(test_userAgent)
+{
+    const std::vector<std::string> uacomments{"A very nice comment"};
+    int temp = 0;
+    int *ptemp = &temp;
+    std::string arch = (sizeof(ptemp) == 4) ? "32bit" : "64bit";
+    mapArgs["-uacomment"] = uacomments[0];
+    std::string client_name(CLIENT_NAME);
+
+    std::string versionMessage = "/" + client_name + ":" + std::to_string(CLIENT_VERSION_MAJOR) + "." +
+                                 std::to_string(CLIENT_VERSION_MINOR) + "." + std::to_string(CLIENT_VERSION_REVISION);
+
+    if (std::to_string(CLIENT_VERSION_BUILD) != "0")
+    {
+        versionMessage = versionMessage + "." + std::to_string(CLIENT_VERSION_BUILD);
+    }
+    versionMessage = versionMessage + "(" + uacomments[0] + "; " + arch + ")/";
+
+    BOOST_CHECK_EQUAL(FormatSubVersion(CLIENT_NAME, CLIENT_VERSION, uacomments), versionMessage);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

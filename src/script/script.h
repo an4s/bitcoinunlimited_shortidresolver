@@ -1,7 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
-// Copyright (c) 2018 The Bitcoin SV developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -26,8 +25,10 @@ static const unsigned int MAX_SCRIPT_ELEMENT_SIZE = 520;
 
 // Maximum number of non-push operations per script
 static const int MAX_OPS_PER_SCRIPT = 201;
-static const int SV_MAX_OPS_PER_SCRIPT = 500;
 
+// 2020-05-15 sigchecks consensus rule
+// Maximum number of signature check operations per transaction
+static const int MAX_SIGOPS_PER_TRANSACTION = 3000;
 
 // Maximum number of public keys per multisig
 static const int MAX_PUBKEYS_PER_MULTISIG = 20;
@@ -189,21 +190,22 @@ enum opcodetype
     OP_CHECKDATASIG = 0xba,
     OP_CHECKDATASIGVERIFY = 0xbb,
 
+    // additional byte string operations
+    OP_REVERSEBYTES = 0xbc,
+
     // The first op_code value after all defined opcodes
     FIRST_UNDEFINED_OP_VALUE,
-
-    // template matching params
-    OP_BIGINTEGER = 0xf0,
-    OP_DATA = 0xf1,
-    OP_SMALLINTEGER = 0xfa,
-    OP_PUBKEYS = 0xfb,
-    OP_PUBKEYHASH = 0xfd,
-    OP_PUBKEY = 0xfe,
 
     OP_INVALIDOPCODE = 0xff,
 };
 
 const char *GetOpName(opcodetype opcode);
+
+/**
+ * Check whether the given stack element data would be minimally pushed using
+ * the given opcode.
+ */
+bool CheckMinimalPush(const std::vector<uint8_t> &data, opcodetype opcode);
 
 class scriptnum_error : public std::runtime_error
 {
@@ -371,6 +373,14 @@ private:
     int64_t m_value;
 };
 
+/** wrapper class that serializes in an older way that is incompatible with current rules, but is used by the genesis
+block */
+class LegacyCScriptNum : public CScriptNum
+{
+public:
+    explicit LegacyCScriptNum(const int64_t &n) : CScriptNum(n) {}
+};
+
 /**
  * We use a prevector for the script to reduce the considerable memory overhead
  *  of vectors in cases where they normally contain a small number of small elements.
@@ -402,7 +412,6 @@ protected:
 
 public:
     CScript() {}
-    CScript(const CScript &b) : CScriptBase(b.begin(), b.end()) {}
     CScript(const_iterator pbegin, const_iterator pend) : CScriptBase(pbegin, pend) {}
     CScript(std::vector<unsigned char>::const_iterator pbegin, std::vector<unsigned char>::const_iterator pend)
         : CScriptBase(pbegin, pend)
@@ -411,6 +420,7 @@ public:
     CScript(const unsigned char *pbegin, const unsigned char *pend) : CScriptBase(pbegin, pend) {}
     CScript &operator+=(const CScript &b)
     {
+        reserve(size() + b.size());
         insert(end(), b.begin(), b.end());
         return *this;
     }
@@ -441,7 +451,7 @@ public:
         return *this;
     }
 
-    CScript &operator<<(const std::vector<unsigned char> &b)
+    void serializeVector(const std::vector<unsigned char> &b)
     {
         if (b.size() < OP_PUSHDATA1)
         {
@@ -467,6 +477,34 @@ public:
             insert(end(), data, data + sizeof(data));
         }
         insert(end(), b.begin(), b.end());
+    }
+
+    CScript &operator<<(const LegacyCScriptNum &a)
+    {
+        auto b = a.getvch();
+        serializeVector(b);
+        return *this;
+    }
+
+    CScript &operator<<(const std::vector<unsigned char> &b)
+    {
+        if (b.size() == 0)
+        {
+            insert(end(), OP_0);
+            return *this;
+        }
+        if ((b.size() == 1) && (b[0] >= 1 && b[0] <= 16))
+        {
+            insert(end(), OP_1 - 1 + b[0]);
+            return *this;
+        }
+        else if ((b.size() == 1) && (b[0] == 0x81))
+        {
+            insert(end(), OP_1NEGATE);
+            return *this;
+        }
+
+        serializeVector(b);
         return *this;
     }
 
@@ -482,7 +520,7 @@ public:
     bool GetOp(iterator &pc, opcodetype &opcodeRet)
     {
         const_iterator pc2 = pc;
-        bool fRet = GetOp2(pc2, opcodeRet, NULL);
+        bool fRet = GetOp2(pc2, opcodeRet, nullptr);
         pc = begin() + (pc2 - begin());
         return fRet;
     }
@@ -492,7 +530,7 @@ public:
         return GetOp2(pc, opcodeRet, &vchRet);
     }
 
-    bool GetOp(const_iterator &pc, opcodetype &opcodeRet) const { return GetOp2(pc, opcodeRet, NULL); }
+    bool GetOp(const_iterator &pc, opcodetype &opcodeRet) const { return GetOp2(pc, opcodeRet, nullptr); }
     bool GetOp2(const_iterator &pc, opcodetype &opcodeRet, std::vector<unsigned char> *pvchRet) const
     {
         opcodeRet = OP_INVALIDOPCODE;

@@ -1,4 +1,4 @@
-// Copyright (c) 2016 Bitcoin Unlimited Developers
+// Copyright (c) 2016-2019 The Bitcoin Unlimited Developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -12,6 +12,7 @@
 #include "blockrelay/blockrelay_common.h"
 #include "blockrelay/compactblock.h"
 #include "blockrelay/graphene.h"
+#include "blockrelay/mempool_sync.h"
 #include "blockrelay/thinblock.h"
 #include "chain.h"
 #include "chainparams.h"
@@ -32,6 +33,8 @@
 #include "rpc/server.h"
 #include "script/standard.h"
 #include "stat.h"
+#include "sync.h"
+#include "threadgroup.h"
 #include "timedata.h"
 #include "tinyformat.h"
 #include "tweak.h"
@@ -41,13 +44,14 @@
 #include "ui_interface.h"
 #include "util.h"
 #include "utilstrencodings.h"
+#include "utiltime.h"
 #include "validationinterface.h"
 #include "version.h"
 #include "versionbits.h"
 
 #include <atomic>
 #include <boost/lexical_cast.hpp>
-#include <boost/thread/tss.hpp> // for boost::thread_specific_ptr
+#include <chrono>
 #include <inttypes.h>
 #include <iomanip>
 #include <list>
@@ -57,10 +61,12 @@
 using namespace std;
 
 #ifdef DEBUG_LOCKORDER
-boost::mutex dd_mutex;
-std::map<std::pair<void *, void *>, LockStack> lockorders;
-boost::thread_specific_ptr<LockStack> lockstack;
+std::atomic<bool> lockdataDestructed{false};
+LockData lockdata;
 #endif
+
+//! Maximum fee as a percentage of the value input into the transaction
+extern int MAX_FEE_PERCENT_OF_VALUE;
 
 // this flag is set to true when a wallet rescan has been invoked.
 std::atomic<bool> fRescan{false};
@@ -77,19 +83,18 @@ CCriticalSection cs_rpcWarmup;
 CSharedCriticalSection cs_mapBlockIndex;
 BlockMap mapBlockIndex GUARDED_BY(cs_mapBlockIndex);
 
-CCriticalSection cs_main;
-CChain chainActive GUARDED_BY(cs_main); // however, chainActive.Tip() is lock free
-// BU variables moved to globals.cpp
-// - moved CCriticalSection cs_main;
-// - moved BlockMap mapBlockIndex;
-// - movedCChain chainActive;
 std::atomic<CBlockIndex *> pindexBestHeader{nullptr};
+std::atomic<CBlockIndex *> pindexBestInvalid{nullptr};
+
+// The max allowed size of the in memory UTXO cache.
+std::atomic<int64_t> nCoinCacheMaxSize{0};
+
+CCriticalSection cs_main;
+CChain chainActive; // chainActive.Tip() is lock free, other APIs take an internal lock
+
 CFeeRate minRelayTxFee GUARDED_BY(cs_main) = CFeeRate(DEFAULT_MIN_RELAY_TX_FEE);
-// The allowed size of the in memory UTXO cache
-int64_t nCoinCacheMaxSize GUARDED_BY(cs_main) = 0;
 /** A cache to store headers that have arrived but can not yet be connected **/
 std::map<uint256, std::pair<CBlockHeader, int64_t> > mapUnConnectedHeaders GUARDED_BY(cs_main);
-CBlockIndex *pindexBestInvalid GUARDED_BY(cs_main) = nullptr;
 /**
  * Every received block is assigned a unique and increasing identifier, so we
  * know which one to give priority in case of a fork.
@@ -106,6 +111,8 @@ std::map<uint256, NodeId> mapBlockSource GUARDED_BY(cs_main);
 std::set<int> setDirtyFileInfo GUARDED_BY(cs_main);
 /** Dirty block index entries. */
 std::set<CBlockIndex *> setDirtyBlockIndex GUARDED_BY(cs_main);
+/** Holds temporary mining candidates */
+map<int64_t, CMiningCandidate> miningCandidatesMap GUARDED_BY(cs_main);
 
 /** Flags for coinbase transactions we create */
 CCriticalSection cs_coinbaseFlags;
@@ -153,7 +160,6 @@ proxyType proxyInfo[NET_MAX];
 proxyType nameProxy;
 CCriticalSection cs_proxyInfos;
 
-CCriticalSection cs_vNodes;
 CCriticalSection cs_mapLocalHost;
 map<CNetAddr, LocalServiceInfo> mapLocalHost;
 
@@ -177,7 +183,7 @@ uint64_t excessiveBlockSize = DEFAULT_EXCESSIVE_BLOCK_SIZE;
 unsigned int excessiveAcceptDepth = DEFAULT_EXCESSIVE_ACCEPT_DEPTH;
 unsigned int maxMessageSizeMultiplier = DEFAULT_MAX_MESSAGE_SIZE_MULTIPLIER;
 int nMaxOutConnections = DEFAULT_MAX_OUTBOUND_CONNECTIONS;
-
+bool fCanonicalTxsOrder = true;
 uint32_t blockVersion = 0; // Overrides the mined block version if non-zero
 
 std::vector<std::string> BUComments = std::vector<std::string>();
@@ -192,11 +198,11 @@ const char *sampleNames[] = {"sec10", "min5", "hourly", "daily", "monthly"};
 int operateSampleCount[] = {30, 12, 24, 30};
 int interruptIntervals[] = {30, 30 * 12, 30 * 12 * 24, 30 * 12 * 24 * 30};
 
-CTxMemPool mempool(::minRelayTxFee);
-CTxOrphanPool orphanpool;
-
 std::chrono::milliseconds statMinInterval(10000);
 boost::asio::io_service stat_io_service;
+
+CTxMemPool mempool(::minRelayTxFee);
+CTxOrphanPool orphanpool;
 
 std::list<CStatBase *> mallocedStats;
 CStatMap statistics;
@@ -206,13 +212,25 @@ map<CInv, CTransactionRef> mapRelay;
 deque<pair<int64_t, CInv> > vRelayExpiration;
 CCriticalSection cs_mapRelay;
 
-vector<CNode *> vNodes;
-list<CNode *> vNodesDisconnected;
-CSemaphore *semOutbound = NULL;
-CSemaphore *semOutboundAddNode = NULL; // BU: separate semaphore for -addnodes
+CCriticalSection cs_vNodes;
+vector<CNode *> vNodes GUARDED_BY(cs_vNodes);
+
+CCriticalSection cs_vNodesDisconnected;
+list<CNode *> vNodesDisconnected GUARDED_BY(cs_vNodesDisconnected);
+
+CSemaphore *semOutbound = nullptr;
+CSemaphore *semOutboundAddNode = nullptr; // BU: separate semaphore for -addnodes
 CNodeSignals g_signals;
 CAddrMan addrman;
 CDoSManager dosMan;
+
+// A message queue used for priority messages such as graheneblocks or other thintype block messages
+std::atomic<bool> fPriorityRecvMsg{false};
+std::atomic<bool> fPrioritySendMsg{false};
+CCriticalSection cs_priorityRecvQ;
+CCriticalSection cs_prioritySendQ;
+deque<pair<CNodeRef, CNetMessage> > vPriorityRecvQ GUARDED_BY(cs_priorityRecvQ);
+deque<CNodeRef> vPrioritySendQ GUARDED_BY(cs_prioritySendQ);
 
 // Transaction mempool admission globals
 
@@ -238,7 +256,7 @@ std::queue<CTxInputData> txWaitNextBlockQ GUARDED_BY(csTxInQ);
 // Transactions that have been validated and are waiting to be committed into the mempool
 CWaitableCriticalSection csCommitQ;
 CConditionVariable cvCommitQ GUARDED_BY(csCommitQ);
-std::map<uint256, CTxCommitData> *txCommitQ = nullptr;
+std::map<uint256, CTxCommitData> *txCommitQ GUARDED_BY(csCommitQ) = nullptr;
 
 // Control the execution of the parallel tx validation and serial mempool commit phases
 CThreadCorral txProcessingCorral;
@@ -258,22 +276,29 @@ CTweak<uint64_t> pruneIntervalTweak("prune.pruneInterval",
 
 CTweak<uint32_t> netMagic("net.magic", "network prefix override. If 0 use the default", 0);
 
+CTweak<uint32_t> randomlyDontInv("net.randomlyDontInv", "Skip sending an INV for some percent of transactions", 0);
+
 CTweakRef<uint64_t> ebTweak("net.excessiveBlock",
     "Excessive block size in bytes",
     &excessiveBlockSize,
     &ExcessiveBlockValidator);
-CTweak<uint64_t> blockSigopsPerMb("net.excessiveSigopsPerMb",
-    "Excessive effort per block, denoted in cost (# inputs * txsize) per MB",
-    BLOCKSTREAM_CORE_MAX_BLOCK_SIGOPS);
 CTweak<bool> ignoreNetTimeouts("net.ignoreTimeouts", "ignore inactivity timeouts, used during debugging", false);
+CTweakRef<bool> displayArchInSubver("net.displayArchInSubver",
+    "Show box architecture, 32/64bit, in node user agent string (subver)",
+    &fDisplayArchInSubver);
 
-CTweak<uint64_t> blockMiningSigopsPerMb("mining.excessiveSigopsPerMb",
-    "Excessive effort per block, denoted in cost (# inputs * txsize) per MB",
-    BLOCKSTREAM_CORE_MAX_BLOCK_SIGOPS);
+CTweak<bool> doubleSpendProofs("net.doubleSpendProofs",
+    "Process and forward double spend proofs (default: true)",
+    true);
+
+CTweak<bool> miningCPFP("mining.childPaysForParent",
+    "If enabled then we will mine ancestor packages and allow child pays for parent.",
+    true);
 CTweak<uint64_t> coinbaseReserve("mining.coinbaseReserve",
     "How much space to reserve for the coinbase transaction, in bytes",
     DEFAULT_COINBASE_RESERVE_SIZE);
 CTweakRef<std::string> miningCommentTweak("mining.comment", "Include text in a block's coinbase.", &minerComment);
+
 CTweakRef<uint64_t> miningBlockSize("mining.blockSize",
     "Maximum block size in bytes.  The maximum block size returned from 'getblocktemplate' will be this value minus "
     "mining.coinbaseReserve.",
@@ -284,27 +309,27 @@ CTweakRef<unsigned int> maxDataCarrierTweak("mining.dataCarrierSize",
     &nMaxDatacarrierBytes,
     &MaxDataCarrierValidator);
 
-CTweakRef<uint64_t> miningForkTime("consensus.forkMay2019Time",
-    "Time in seconds since the epoch to initiate the Bitcoin Cash hard fork scheduled on 15th May 2019.  A setting of "
+CTweakRef<uint64_t> miningForkTime("consensus.forkNov2020Time",
+    "Time in seconds since the epoch to initiate the Bitcoin Cash protocol upgraded scheduled on 15th May 2020.  A "
+    "setting of "
     "1 "
     "will turn on the fork at the appropriate time.",
     &nMiningForkTime,
-    &ForkTimeValidator); // Thu May 15 12:00:00 UTC 2019
-
-CTweakRef<uint64_t> miningSvForkTime("consensus.svForkNov2018Time",
-    "Time in seconds since the epoch to initiate the Bitcoin SV defined hard fork scheduled on 15th Nov 2018.  A "
-    "setting of 1 will turn on the fork at the appropriate time.",
-    &nMiningSvForkTime,
-    &ForkTimeValidatorSV); // Thu Nov 15 15:40:00 UTC 2018
+    &ForkTimeValidator); // Sunday Nov 15 12:00:00 UTC 2020
 
 CTweak<uint64_t> maxScriptOps("consensus.maxScriptOps",
     "Maximum number of script operations allowed.  Stack pushes are excepted.",
     MAX_OPS_PER_SCRIPT);
 
+CTweak<uint64_t> maxSigChecks("consensus.maxBlockSigChecks",
+    "Consensus parameter specifying the maximum sigchecks in a block.  Use for testing only!",
+    MAY2020_MAX_BLOCK_SIGCHECK_COUNT);
 
 CTweak<bool> unsafeGetBlockTemplate("mining.unsafeGetBlockTemplate",
     "Allow getblocktemplate to succeed even if the chain tip is old or this node is not connected to other nodes",
     false);
+
+CTweak<bool> xvalTweak("mining.xval", "Turn on/off Xpress Validation (default: false)", false);
 
 CTweak<unsigned int> maxTxSize("net.excessiveTx", "Largest transaction size in bytes", DEFAULT_LARGEST_TRANSACTION);
 CTweakRef<unsigned int> eadTweak("net.excessiveAcceptDepth",
@@ -333,13 +358,21 @@ CTweakRef<std::string> subverOverrideTweak("net.subversionOverride",
     &subverOverride,
     &SubverValidator);
 
-CTweak<bool> enableCanonicalTxOrder("consensus.enableCanonicalTxOrder",
+CTweakRef<bool> enableCanonicalTxOrder("consensus.enableCanonicalTxOrder",
     "True if canonical transaction ordering is enabled.  Reflects the actual state so may be switched on or off by"
     " fork time flags and blockchain reorganizations.",
-    false);
+    &fCanonicalTxsOrder);
 
 CTweak<unsigned int> numMsgHandlerThreads("net.msgHandlerThreads", "Max message handler threads", 0);
 CTweak<unsigned int> numTxAdmissionThreads("net.txAdmissionThreads", "Max transaction mempool admission threads", 0);
+CTweak<unsigned int> unconfPushAction("net.unconfChainResendAction",
+    "Action to take when this node thinks that a peer will now accept a previously unacceptable unconfirmed "
+    "transaction (default: 2) "
+    "0: do not resend, 1: send an INV, 2: send the TX",
+    2);
+CTweak<bool> restrictInputs("net.restrictInputs",
+    "Do we want to restrict max inputs to 1 for unconfirmed transaction chains that are longer than 25 (default: true)",
+    true);
 
 CTweak<CAmount> maxTxFee("wallet.maxTxFee",
     "Maximum total fees to use in a single wallet transaction or raw transaction; setting this too low may abort large "
@@ -357,6 +390,33 @@ CTweak<unsigned int> maxBlocksInTransitPerPeer("net.maxBlocksInTransitPerPeer",
 CTweak<unsigned int> blockDownloadWindow("net.blockDownloadWindow",
     "How far ahead of our current height do we fetch? 0 means use algorithm.",
     0);
+
+/** If transactions overpay by less than this amount in Satoshis, the extra will be put in the fee rather than a
+    change address.  Zero means calculate this dynamically as a fraction of the current transaction fee
+    (recommended). */
+CTweak<unsigned int> txWalletDust("wallet.txFeeOverpay",
+    "If transactions overpay by less than this amount in Satoshis, the extra will be put in the fee rather than a "
+    "change address.  Zero means calculate this dynamically as a fraction of the current transaction fee "
+    "(recommended).",
+    0);
+
+/** When sending, how long should this wallet search for a more efficient or no-change payment solution in
+    milliseconds.  A no-change solution reduces transaction fees, but is extremely unlikely unless your wallet
+    is very large and well distributed because transaction fees add a small quantity of dust to the normal round
+    numbers that humans use.
+*/
+CTweak<unsigned int> maxCoinSelSearchTime("wallet.coinSelSearchTime",
+    "When sending, how long should this wallet search for a no-change payment solution in milliseconds.  A no-change "
+    "solution reduces transaction fees.",
+    25);
+
+/** How many UTXOs should be maintained in this wallet (on average).  If the number of UTXOs exceeds this value,
+    transactions will be found that tend to have more inputs.  This will consolidate UTXOs.
+ */
+CTweak<unsigned int> preferredNumUTXO("wallet.preferredNumUTXO",
+    "How many UTXOs should be maintained in this wallet (on average).  If the number of UTXOs exceeds this value, "
+    "transactions will be found that tend to have more inputs.  This will consolidate UTXOs.",
+    5000);
 
 /** This setting specifies the minimum supported Graphene version (inclusive).
  *  The actual version used will be negotiated between sender and receiver.
@@ -384,6 +444,42 @@ CTweak<uint64_t> grapheneMaxVersionSupported("net.grapheneMaxVersionSupported",
 CTweak<uint64_t> grapheneFastFilterCompatibility("net.grapheneFastFilterCompatibility",
     "Support fast Bloom filter: 0 - either, 1 - fast only, 2 - regular only (default: either)",
     GRAPHENE_FAST_FILTER_SUPPORT);
+
+/** This setting overrides the number of cells (excluding overhead) in the initial IBLT
+ * sent using Graphene. The intent is to enable the first stage of the Graphene protocol
+ * to fail in order to test the second stage.
+ */
+CTweak<uint64_t> grapheneIbltSizeOverride("net.grapheneIbltSizeOverride",
+    "Override size of Iblt to the indicated value (greater than 0): 0 for optimal (default: 0)",
+    0);
+
+/** This setting overrides the false positive rate in the initial Bloom filter sent using
+ * Graphene. The intent is to enable the first stage of the Graphene protocol to fail in
+ * order to test the second stage.
+ */
+CTweak<double> grapheneBloomFprOverride("net.grapheneBloomFprOverride",
+    "Override size of Bloom filter to the indicated value (greater than 0.0): 0.0 for optimal (default: 0.0)",
+    0.0);
+
+CTweak<bool> syncMempoolWithPeers("net.syncMempoolWithPeers", "Synchronize mempool with peers", false);
+
+/** This setting specifies the minimum supported mempool sync version (inclusive).
+ *  The actual version used will be negotiated between sender and receiver.
+ */
+std::string memSyncMinVerStr = "Minimum mempool sync version supported (default: " +
+                               std::to_string(DEFAULT_MEMPOOL_SYNC_MIN_VERSION_SUPPORTED) + ")";
+CTweak<uint64_t> mempoolSyncMinVersionSupported("net.mempoolSyncMinVersionSupported",
+    memSyncMinVerStr,
+    DEFAULT_MEMPOOL_SYNC_MIN_VERSION_SUPPORTED);
+
+/** This setting specifies the maximum supported mempool sync version (inclusive).
+ *  The actual version used will be negotiated between sender and receiver.
+ */
+std::string memSyncMaxVerStr = "Maximum mempool sync version supported (default: " +
+                               std::to_string(DEFAULT_MEMPOOL_SYNC_MAX_VERSION_SUPPORTED) + ")";
+CTweak<uint64_t> mempoolSyncMaxVersionSupported("net.mempoolSyncMaxVersionSupported",
+    memSyncMaxVerStr,
+    DEFAULT_MEMPOOL_SYNC_MAX_VERSION_SUPPORTED);
 
 /** This is the initial size of CFileBuffer's RAM buffer during reindex.  A
 larger size will result in a tiny bit better performance if blocks are that
@@ -422,8 +518,21 @@ CTweak<double> dMinLimiterTxFee("minlimitertxfee",
                                     DEFAULT_MINLIMITERTXFEE),
     DEFAULT_MINLIMITERTXFEE);
 
+/** Disable reconsidermostworkchain during initial bootstrap when chain is not synced.
+  * This is for testing purpose only and hence it is disabled by default.
+  * This tweak will be useful during multiple clients interop network upgrade tests.
+  * During this tests  official testnet is forked via invalidate block, that means that
+  * if for what ever reason you need to restart your client during the test, you need to
+  * rollbackchain and then reconsiderblock the first block of the forked testnet. This is because
+  * if more than 1 block at time have to be invalidated so that the utxo may get undone correctly.
+  */
+CTweak<bool> avoidReconsiderMostWorkChain("test.avoidReconsiderMostWorkChain",
+    "Disable reconsidermostworkchain during initial bootstrap when chain is not synced",
+    false);
+
 CRequestManager requester; // after the maps nodes and tweaks
 CState nodestate;
+thread_group threadGroup;
 
 CStatHistory<unsigned int> txAdded; //"memPool/txAdded");
 CStatHistory<uint64_t, MinValMax<uint64_t> > poolSize; // "memPool/size",STAT_OP_AVE);
@@ -438,12 +547,18 @@ CThinBlockData thindata;
 CGrapheneBlockData graphenedata;
 CCompactBlockData compactdata;
 ThinTypeRelay thinrelay;
+CCriticalSection cs_mempoolsync;
+std::map<NodeId, CMempoolSyncState> mempoolSyncRequested GUARDED_BY(cs_mempoolsync);
+std::map<NodeId, CMempoolSyncState> mempoolSyncResponded GUARDED_BY(cs_mempoolsync);
+uint64_t lastMempoolSync = GetStopwatchMicros();
+uint64_t lastMempoolSyncClear = GetStopwatchMicros();
 
-uint256 bitcoinCashForkBlockHash = uint256S("000000000000000000651ef99cb9fcbe0dadde1d424bd9f15ff20136191a5eec");
-
-map<int64_t, CMiningCandidate> miningCandidatesMap GUARDED_BY(cs_main);
-
+// Are we shutting down. Replaces boost interrupts.
 std::atomic<bool> shutdown_threads{false};
+
+// Size of last block that was successfully connected at the tip.
+std::atomic<uint64_t> nBlockSizeAtChainTip{0};
+
 
 #ifdef ENABLE_MUTRACE
 class CPrintSomePointers

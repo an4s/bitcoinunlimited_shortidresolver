@@ -1,30 +1,35 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #ifndef BITCOIN_NET_H
 #define BITCOIN_NET_H
 
+#include "banentry.h"
 #include "blockrelay/compactblock.h"
 #include "bloom.h"
 #include "chainparams.h"
 #include "compat.h"
 #include "fastfilter.h"
 #include "fs.h"
-#include "hash.h"
+#include "hashwrapper.h"
 #include "iblt.h"
 #include "limitedmap.h"
 #include "netbase.h"
+#include "policy/mempool.h"
 #include "primitives/block.h"
 #include "protocol.h"
 #include "random.h"
+#include "stat.h"
 #include "streams.h"
 #include "sync.h"
 #include "threadgroup.h"
 #include "uint256.h"
+#include "unlimited.h"
 #include "util.h" // FIXME: reduce scope
+#include "xversionmessage.h"
 
 #include <atomic>
 #include <deque>
@@ -36,24 +41,28 @@
 
 #include <boost/signals2/signal.hpp>
 
-#include "banentry.h"
-#include "stat.h"
-#include "unlimited.h"
-#include "xversionmessage.h"
 
 extern CTweak<uint32_t> netMagic;
+extern CChain chainActive;
 static CMessageHeader::MessageStartChars netOverride;
 class CAddrMan;
 class CSubNet;
 class CNode;
 class CNodeRef;
+class CNetMessage;
 
 namespace boost
 {
 class thread_group;
 } // namespace boost
 
+extern CCriticalSection cs_priorityRecvQ;
+extern CCriticalSection cs_prioritySendQ;
 extern CTweak<unsigned int> numMsgHandlerThreads;
+extern std::deque<std::pair<CNodeRef, CNetMessage> > vPriorityRecvQ;
+extern std::deque<CNodeRef> vPrioritySendQ;
+extern std::atomic<bool> fPriorityRecvMsg;
+extern std::atomic<bool> fPrioritySendMsg;
 
 /** Time between pings automatically sent out for latency probing and keepalive (in seconds). */
 static const int PING_INTERVAL = 2 * 60;
@@ -92,6 +101,12 @@ static const unsigned int MAX_DISCONNECTS = 200;
 static const uint64_t DEFAULT_MAX_UPLOAD_TARGET = 0;
 /** Default for blocks only*/
 static const bool DEFAULT_BLOCKSONLY = false;
+/** Default for XVersion */
+static const bool DEFAULT_USE_XVERSION = true;
+
+/** Internal constant that indicates we have no common graphene versions. */
+const uint64_t GRAPHENE_NO_VERSION_SUPPORTED = 0xfffffff;
+
 
 // BITCOINUNLIMITED START
 static const bool DEFAULT_FORCEBITNODES = false;
@@ -113,19 +128,20 @@ void AddOneShot(const std::string &strDest);
 CNodeRef FindNodeRef(const std::string &addrName);
 // Find a node by id.  Returns a null ref if no node found
 CNodeRef FindNodeRef(const NodeId id);
+// Find a node by ip.  Returns a null ref if no node found
+CNodeRef FindNodeRef(const CNetAddr &ip);
 int DisconnectSubNetNodes(const CSubNet &subNet);
 bool OpenNetworkConnection(const CAddress &addrConnect,
     bool fCountFailure,
-    CSemaphoreGrant *grantOutbound = NULL,
-    const char *strDest = NULL,
+    CSemaphoreGrant *grantOutbound = nullptr,
+    const char *strDest = nullptr,
     bool fOneShot = false,
     bool fFeeler = false);
 void MapPort(bool fUseUPnP);
 unsigned short GetListenPort();
 bool BindListenPort(const CService &bindAddr, std::string &strError, bool fWhitelisted = false);
-void StartNode(thread_group &threadGroup);
+void StartNode();
 bool StopNode();
-int SocketSendData(CNode *pnode);
 
 struct CombinerAll
 {
@@ -179,10 +195,10 @@ bool AddLocal(const CNetAddr &addr, int nScore = LOCAL_NONE);
 bool RemoveLocal(const CService &addr);
 bool SeenLocal(const CService &addr);
 bool IsLocal(const CService &addr);
-bool GetLocal(CService &addr, const CNetAddr *paddrPeer = NULL);
+bool GetLocal(CService &addr, const CNetAddr *paddrPeer = nullptr);
 bool IsReachable(enum Network net);
 bool IsReachable(const CNetAddr &addr);
-CAddress GetLocalAddress(const CNetAddr *paddrPeer = NULL);
+CAddress GetLocalAddress(const CNetAddr *paddrPeer = nullptr);
 
 
 extern bool fDiscover;
@@ -195,17 +211,18 @@ extern CAddrMan addrman;
 extern int nMaxConnections;
 /** The minimum number of xthin nodes to connect to */
 extern int nMinXthinNodes;
+
 extern std::vector<CNode *> vNodes;
 extern CCriticalSection cs_vNodes;
+extern std::list<CNode *> vNodesDisconnected;
+extern CCriticalSection cs_vNodesDisconnected;
+
 extern std::map<CInv, CTransactionRef> mapRelay;
 extern std::deque<std::pair<int64_t, CInv> > vRelayExpiration;
 extern CCriticalSection cs_mapRelay;
 
 extern std::vector<std::string> vAddedNodes;
 extern CCriticalSection cs_vAddedNodes;
-
-/** Subversion as sent to the P2P network in `version` messages */
-extern std::string strSubVersion;
 
 struct LocalServiceInfo
 {
@@ -225,7 +242,8 @@ public:
     bool fRelayTxes;
     int64_t nLastSend;
     int64_t nLastRecv;
-    int64_t nTimeConnected;
+    int64_t nTimeConnected; /** Calendar time this node was connected */
+    uint64_t nStopwatchConnected; /** Stopwatch time this node was connected (in uSec) */
     int64_t nTimeOffset;
     std::string addrName;
     int nVersion;
@@ -240,7 +258,7 @@ public:
     double dPingMin;
     //! What this peer sees as my address
     std::string addrLocal;
-    //! Whether this peer supports CompactBlocks (for statistics only, BU doesn't support CB protocol)
+    //! Whether this peer supports CompactBlocks
     bool fSupportsCompactBlocks;
 };
 
@@ -257,7 +275,8 @@ public:
     CDataStream vRecv; // received message data
     unsigned int nDataPos;
 
-    int64_t nTime; // time (in microseconds) of message receipt.
+    int64_t nTime; // calendar time (in microseconds) of message receipt.
+    int64_t nStopwatch; // stopwatch time in microseconds of message receipt.  Used to calculate round trip latency.
 
     // default constructor builds an empty message object to accept assignment of real messages
     CNetMessage() : hdrbuf(0, 0), hdr({0, 0, 0, 0}), vRecv(0, 0)
@@ -266,6 +285,7 @@ public:
         nHdrPos = 0;
         nDataPos = 0;
         nTime = 0;
+        nStopwatch = 0;
     }
 
     CNetMessage(const CMessageHeader::MessageStartChars &pchMessageStartIn, int nTypeIn, int nVersionIn)
@@ -276,6 +296,7 @@ public:
         nHdrPos = 0;
         nDataPos = 0;
         nTime = 0;
+        nStopwatch = 0;
     }
 
     // Returns true if this message has been completely received.  This is determined by checking the message size
@@ -312,45 +333,6 @@ public:
 };
 #endif
 
-
-// clang-format off
-
-
-/*! Corresponding ConnectionStateOutgoing, this is used to track incoming versioning information from a peer. */
-enum class ConnectionStateIncoming : uint8_t {
-    //! initial state after TCP connection is up - waiting for version message
-    CONNECTED_WAIT_VERSION                       = 0x01,
-    //! Sent verack message - ready for xversion (or any other message, aborting the xversion-handling process)
-    SENT_VERACK_READY_FOR_POTENTIAL_XVERSION     = 0x02,
-    //! Sent xverack and am thus ready for general data transfer
-    READY                                        = 0x04,
-    //! placeholder value to allow any when checking for a particular state
-    ANY                                          = 0xff
-};
-ConnectionStateIncoming operator|(const ConnectionStateIncoming& a, const ConnectionStateIncoming& b);
-/** This is enum is used to track the state of the versioning information
-    that has been sent to the remote node. */
-enum class ConnectionStateOutgoing : uint8_t {
-    //! initial state after TCP connection is up
-    CONNECTED     = 0x01,
-    //! the VERSION message has been sent
-    SENT_VERSION  = 0x02,
-    //! Connection is ready for general data transfer into peer's direction (and the xversion as well as BU version has been sent)
-    READY         = 0x04,
-    //! placeholder value to allow any when checking for a particular state
-    ANY           = 0xff
-};
-ConnectionStateOutgoing operator|(const ConnectionStateOutgoing& a, const ConnectionStateOutgoing& b);
-// clang-format on
-
-//! ConnectionStateIncoming enum to string
-std::string toString(const ConnectionStateIncoming &state) PURE_FUNCTION;
-std::ostream &operator<<(std::ostream &os, const ConnectionStateIncoming &state);
-
-//! ConnectionStateOutgoing enum to string
-std::string toString(const ConnectionStateOutgoing &state) PURE_FUNCTION;
-std::ostream &operator<<(std::ostream &os, const ConnectionStateOutgoing &state);
-
 /** Information about a peer */
 class CNode
 {
@@ -359,94 +341,129 @@ class CNode
 #endif
 
 public:
+    /** This node's max acceptable number ancestor transactions.  Used to decide whether this node will accept a
+     * particular transaction. */
+    size_t nLimitAncestorCount = BCH_DEFAULT_ANCESTOR_LIMIT;
+    /** This node's max acceptable sum of all ancestor transaction sizes.  Used to decide whether this node will accept
+     * a particular transaction. */
+    size_t nLimitAncestorSize = BCH_DEFAULT_ANCESTOR_SIZE_LIMIT * 1000;
+    /** This node's max acceptable number of descendants.  Used to decide whether this node will accept a particular
+     * transaction. */
+    size_t nLimitDescendantCount = BCH_DEFAULT_DESCENDANT_LIMIT;
+    /** This node's max acceptable sum of all descendant transaction sizes.  Used to decide whether this node will
+     * accept a particular transaction. */
+    size_t nLimitDescendantSize = BCH_DEFAULT_DESCENDANT_SIZE_LIMIT * 1000;
+    /** Does this node support mempool synchronization? */
+    bool canSyncMempoolWithPeers = false;
+    /** Minimum supported mempool synchronization version */
+    uint64_t nMempoolSyncMinVersionSupported = 0;
+    /** Maximum supported mempool synchronization version */
+    uint64_t nMempoolSyncMaxVersionSupported = 0;
+    /** Tx concatenation supported (set by xversion) */
+    uint64_t txConcat = 0;
+    /** set to true if this node support xVersion */
+    std::atomic<bool> xVersionEnabled{false};
+    /** set to true if the next expected message is xVersion */
+    std::atomic<bool> xVersionExpected{false};
+    /** set to true if this node is ok with no message checksum */
+    bool skipChecksum = false;
+    /** Graphene min supported version */
+    uint64_t minGrapheneVersion = 0;
+    /** Graphene max supported version */
+    uint64_t maxGrapheneVersion = 0;
+    /** Negotiated graphene version.  Based on the other node and me, what's the best version to use? */
+    uint64_t negotiatedGrapheneVersion = GRAPHENE_NO_VERSION_SUPPORTED;
+
+
     // This is shared-locked whenever messages are processed.
     // Take it exclusive-locked to finish all ongoing processing
     CSharedCriticalSection csMsgSerializer;
+
     // socket
-    uint64_t nServices;
     SOCKET hSocket;
-    CDataStream ssSend;
-    std::atomic<uint64_t> nSendSize; // total size in bytes of all vSendMsg entries
-    size_t nSendOffset; // offset inside the first vSendMsg already sent
-    uint64_t nSendBytes;
-    std::deque<CSerializeData> vSendMsg;
+
     CCriticalSection cs_vSend;
+    CDataStream ssSend GUARDED_BY(cs_vSend);
+    size_t nSendOffset GUARDED_BY(cs_vSend); // offset inside the first vSendMsg already sent
+    uint64_t nSendBytes GUARDED_BY(cs_vSend);
+    std::deque<CSerializeData> vSendMsg GUARDED_BY(cs_vSend);
+    std::deque<CSerializeData> vLowPrioritySendMsg GUARDED_BY(cs_vSend);
+    std::atomic<uint64_t> nSendSize; // total size in bytes of all vSendMsg entries
 
     CCriticalSection csRecvGetData;
-    std::deque<CInv> vRecvGetData;
-    std::deque<CNetMessage> vRecvMsg;
-    CStatHistory<uint64_t> currentRecvMsgSize;
+    std::deque<CInv> vRecvGetData GUARDED_BY(csRecvGetData);
+
     CCriticalSection cs_vRecvMsg;
-    uint64_t nRecvBytes;
+    uint64_t nRecvBytes GUARDED_BY(cs_vRecvMsg);
+    std::deque<CNetMessage> vRecvMsg GUARDED_BY(cs_vRecvMsg);
+    std::deque<CNetMessage> vRecvMsg_handshake GUARDED_BY(cs_vRecvMsg);
+    // the next message we receive from the socket
+    CNetMessage msg GUARDED_BY(cs_vRecvMsg);
+    CStatHistory<uint64_t> currentRecvMsgSize;
+
+    uint64_t nServices;
     int nRecvVersion;
 
-    // BU connection de-prioritization
-    //! Total bytes sent and received
-    uint64_t nActivityBytes;
+    /** Connection de-prioritization - Total useful bytes sent and received */
+    std::atomic<uint64_t> nActivityBytes{0};
+    /** The last time bytes were sent to the remote peer */
+    std::atomic<int64_t> nLastSend{0};
+    /** The last time bytes were received from the remote peer */
+    std::atomic<int64_t> nLastRecv{0};
+    /** Calendar time this node was connected */
+    std::atomic<int64_t> nTimeConnected;
+    /** Stopwatch time this node was connected */
+    std::atomic<uint64_t> nStopwatchConnected;
 
-    int64_t nLastSend;
-    int64_t nLastRecv;
-    int64_t nTimeConnected;
     int64_t nTimeOffset;
-    //! The address of the remote peer
+
+    /** The address of the remote peer */
     CAddress addr;
 
-    //! set to true if this node is ok with no message checksum
-    bool skipChecksum;
-
-    //! The address the remote peer advertised in its version message
+    /** The address the remote peer advertised in its version message */
     CAddress addrFrom_advertised;
 
     std::string addrName;
     const char *currentCommand; // if in the middle of the send, this is the command type
-    //! The the remote peer sees us as this address (may be different than our IP due to NAT)
+    /** The the remote peer sees us as this address (may be different than our IP due to NAT) */
     CService addrLocal;
     int nVersion;
 
-    //! The state of informing the remote peer of our version information
-    ConnectionStateOutgoing state_outgoing;
-
-    //! The state of being informed by the remote peer of his version information
-    ConnectionStateIncoming state_incoming;
-
-    //! used to make processing serial when version handshake is taking place
+    /** used to make processing serial when version handshake is taking place */
     CCriticalSection csSerialPhase;
 
-    //! the intial xversion message sent in the handshake
+    /** the intial xversion message sent in the handshake */
     CCriticalSection cs_xversion;
-    CXVersionMessage xVersion;
+    CXVersionMessage xVersion GUARDED_BY(cs_xversion);
 
-    //! strSubVer is whatever byte array we read from the wire. However, this field is intended
-    //! to be printed out, displayed to humans in various forms and so on. So we sanitize it and
-    //! store the sanitized version in cleanSubVer. The original should be used when dealing with
-    //! the network or wire types and the cleaned string used when displayed or logged.
+    /** strSubVer is whatever byte array we read from the wire. However, this field is intended
+        to be printed out, displayed to humans in various forms and so on. So we sanitize it and
+        store the sanitized version in cleanSubVer. The original should be used when dealing with
+        the network or wire types and the cleaned string used when displayed or logged.
+    */
     std::string strSubVer, cleanSubVer;
 
-    //! This peer can bypass DoS banning.
+    /** This peer can bypass DoS banning. */
     bool fWhitelisted;
-    //! If true this node is being used as a short lived feeler.
+    /** If true this node is being used as a short lived feeler. */
     bool fFeeler;
     bool fOneShot;
     bool fClient;
 
-    //! after BIP159
+    /** after BIP159 */
     bool m_limited_node;
 
-    //! If true a remote node initiated the connection.  If false, we initiated.
-    //! The protocol is slightly asymmetric:
-    //! initial version exchange
-    //! stop ADDR flooding in preparation for a network-wide eclipse attack
-    //! stop connection slot attack via eviction of stale (connected but no data) inbound connections
-    //! stop fingerprinting by seeding fake addresses and checking for them later by ignoring outbound getaddr
+    /** If true a remote node initiated the connection.  If false, we initiated.
+        The protocol is slightly asymmetric:
+        initial version exchange
+        stop ADDR flooding in preparation for a network-wide eclipse attack
+        stop connection slot attack via eviction of stale (connected but no data) inbound connections
+        stop fingerprinting by seeding fake addresses and checking for them later by ignoring outbound getaddr
+    */
     bool fInbound;
     bool fAutoOutbound; // any outbound node not connected with -addnode, connect-thinblock or -connect
     bool fNetworkNode; // any outbound node
     int64_t tVersionSent;
-
-    bool successfullyConnected() const
-    {
-        return (state_outgoing == ConnectionStateOutgoing::READY && state_incoming == ConnectionStateIncoming::READY);
-    }
 
     std::atomic<bool> fDisconnect;
     std::atomic<bool> fDisconnectRequest;
@@ -457,56 +474,52 @@ public:
     bool fRelayTxes;
     bool fSentAddr;
     CSemaphoreGrant grantOutbound;
+
     CCriticalSection cs_filter;
-    CBloomFilter *pfilter;
-    // BU - Xtreme Thinblocks: a bloom filter which is separate from the one used by SPV wallets
-    CBloomFilter *pThinBlockFilter;
+    /** A bloom filter which is used by SPV wallets */
+    CBloomFilter *pfilter GUARDED_BY(cs_filter);
+    /** Xtreme Thinblocks bloom filter which is send with a get_xthin request */
+    CBloomFilter *pThinBlockFilter GUARDED_BY(cs_filter);
+
     std::atomic<int> nRefCount;
     NodeId id;
 
-    //! Accumulated misbehaviour score for this peer.
-    std::atomic<int> nMisbehavior;
+    //! Accumulated misbehavior score for this peer.
+    std::atomic<double> nMisbehavior{0};
+    std::atomic<int64_t> nLastMisbehaviorTime{0};
+
     //! Whether this peer should be disconnected and banned (unless whitelisted).
-    bool fShouldBan;
+    std::atomic<bool> fShouldBan{false};
+    std::atomic<int> nBanType{-1};
 
-    // BUIP010 Xtreme Thinblocks: begin section
-    std::atomic<uint32_t> nXthinBloomfilterSize; // Max xthin bloom filter size (in bytes) that our peer will accept.
+    // General thintype critical section to ensure that no
+    // two thintype blocks from the "same" peer can be processed at
+    // the same time.
+    CCriticalSection cs_thintype;
 
-    CCriticalSection cs_xthinblock;
-    // BUIP010 Xtreme Thinblocks: end section
+    // Xtreme Thinblocks
+    /** Max xthin bloom filter size (in bytes) that our peer will accept */
+    std::atomic<uint32_t> nXthinBloomfilterSize;
 
-    // BUIPXXX Graphene blocks: begin section
-    CCriticalSection cs_graphene;
-    CBlock grapheneBlock;
-    std::vector<uint256> grapheneBlockHashes;
-    std::map<uint64_t, uint32_t> grapheneMapHashOrderIndex;
-    std::map<uint64_t, CTransactionRef> mapGrapheneMissingTx;
-    uint64_t nLocalGrapheneBlockBytes; // the bytes used in creating this graphene block, updated dynamically
-    int nSizeGrapheneBlock; // Original on-wire size of the block. Just used for reporting
-    int grapheneBlockWaitingForTxns; // if -1 then not currently waiting
-    CCriticalSection cs_grapheneadditionaltxs; // lock grapheneAdditionalTxs
-    std::vector<CTransactionRef> grapheneAdditionalTxs; // entire transactions included in graphene block
-    uint64_t gr_shorttxidk0;
-    uint64_t gr_shorttxidk1;
-    // BUIPXXX Graphene blocks: end section
+    // Graphene blocks
+    /** Stores the grapheneblock salt to be used for this peer */
+    std::atomic<uint64_t> gr_shorttxidk0;
+    std::atomic<uint64_t> gr_shorttxidk1;
 
-    // Compact Blocks : begin
-    CCriticalSection cs_compactblock;
-
-    // Store the compactblock salt to be used for this peer
-    uint64_t shorttxidk0;
-    uint64_t shorttxidk1;
-
-    // Whether this peer supports CompactBlocks
+    // Compact Blocks
+    /** Stores the compactblock salt to be used for this peer */
+    std::atomic<uint64_t> shorttxidk0;
+    std::atomic<uint64_t> shorttxidk1;
+    /** Does this peer support CompactBlocks */
     std::atomic<bool> fSupportsCompactBlocks;
 
-    // Compact Blocks : end
-
     CCriticalSection cs_nAvgBlkResponseTime;
-    double nAvgBlkResponseTime;
+    double nAvgBlkResponseTime GUARDED_BY(cs_nAvgBlkResponseTime);
     std::atomic<int64_t> nMaxBlocksInTransit;
 
     unsigned short addrFromPort;
+
+    std::atomic<bool> fSuccessfullyConnected;
 
 protected:
     // Basic fuzz-testing
@@ -528,8 +541,8 @@ public:
 
     // inventory based relay
     CRollingFastFilter<4 * 1024 * 1024> filterInventoryKnown;
-    std::vector<CInv> vInventoryToSend;
     CCriticalSection cs_inventory;
+    std::vector<CInv> vInventoryToSend GUARDED_BY(cs_inventory);
     int64_t nNextInvSend;
     // Used for headers announcements - unfiltered blocks to relay
     // Also protected by cs_inventory
@@ -595,25 +608,48 @@ public:
         return nRefCount;
     }
 
+    /** Returns true if a transaction with the passed properties will likely get accepted into this node's mempool */
+    bool IsTxAcceptable(const CTxProperties &props)
+    {
+        // Checking the descendants makes no sense -- the target node can't have descendants in its mempool if it
+        // doesn't have this transaction!
+        if ((xVersionEnabled && props.countWithAncestors > nLimitAncestorCount) ||
+            (!xVersionEnabled && props.countWithAncestors > BCH_DEFAULT_DESCENDANT_LIMIT))
+            return false;
+        if (props.sizeWithAncestors > nLimitAncestorSize)
+            return false;
+        return true;
+    }
+
+    /** Updates node configuration variables based on XVERSION data in the xVersion member variable */
+    void ReadConfigFromXVersion_OLD();
+    void ReadConfigFromXVersion();
+
     // requires LOCK(cs_vRecvMsg)
-    unsigned int GetTotalRecvSize()
+    unsigned int GetTotalRecvSize() EXCLUSIVE_LOCKS_REQUIRED(cs_vRecvMsg)
     {
         AssertLockHeld(cs_vRecvMsg);
         unsigned int total = 0;
-        for (const CNetMessage &msg : vRecvMsg)
-            total += msg.vRecv.size() + 24;
+        for (const CNetMessage &message : vRecvMsg)
+            total += message.vRecv.size() + 24;
         return total;
     }
 
+    unsigned int GetSendMsgSize()
+    {
+        LOCK(cs_vSend);
+        return vSendMsg.size();
+    }
+
     // requires LOCK(cs_vRecvMsg)
-    bool ReceiveMsgBytes(const char *pch, unsigned int nBytes);
+    bool ReceiveMsgBytes(const char *pch, unsigned int nBytes) EXCLUSIVE_LOCKS_REQUIRED(cs_vRecvMsg);
 
     void SetRecvVersion(int nVersionIn)
     {
         LOCK(cs_vRecvMsg);
         nRecvVersion = nVersionIn;
-        for (CNetMessage &msg : vRecvMsg)
-            msg.SetVersion(nVersionIn);
+        for (CNetMessage &message : vRecvMsg)
+            message.SetVersion(nVersionIn);
     }
 
     const CMessageHeader::MessageStartChars &GetMagic(const CChainParams &params) const
@@ -675,7 +711,7 @@ public:
         {
             if (vAddrToSend.size() >= MAX_ADDR_TO_SEND)
             {
-                vAddrToSend[insecure_rand.rand32() % vAddrToSend.size()] = _addr;
+                vAddrToSend[insecure_rand.randrange(vAddrToSend.size())] = _addr;
             }
             else
             {
@@ -691,14 +727,32 @@ public:
         filterInventoryKnown.insert(inv.hash);
     }
 
-    void PushInventory(const CInv &inv)
+    /**
+     * Add a reference of a new INV message to the inventory
+     *
+     * @param[in] inv reference to new INV object
+     * @param[in] force whether or not force the push in case the INV was already added
+     */
+    void PushInventory(const CInv &inv, bool force = false)
     {
         LOCK(cs_inventory);
-        if (inv.type == MSG_TX && filterInventoryKnown.contains(inv.hash))
+        if (!force && inv.type == MSG_TX && filterInventoryKnown.contains(inv.hash))
             return;
         vInventoryToSend.push_back(inv);
     }
 
+    /** Get size of INVs to be sent in a thread safe way*/
+    unsigned int GetInventoryToSendSize()
+    {
+        LOCK(cs_inventory);
+        return vInventoryToSend.size();
+    }
+
+    /**
+     * Add a reference of a new hash block to the list of blocks need to be announced
+     *
+     * @param[in] hash reference to the hash of the new block to announce
+     */
     void PushBlockHash(const uint256 &hash)
     {
         LOCK(cs_inventory);
@@ -923,7 +977,7 @@ public:
     //! returns the name of this node for logging.  Respects the user's choice to not log the node's IP
     std::string GetLogName()
     {
-        std::string idstr = boost::lexical_cast<std::string>(id);
+        std::string idstr = std::to_string(id);
         if (fLogIPs)
             return addrName + " (" + idstr + ")";
         return idstr;
@@ -1024,7 +1078,7 @@ private:
 typedef std::vector<CNodeRef> VNodeRefs;
 
 class CTransaction;
-void RelayTransaction(const CTransactionRef &ptx, const bool fRespend = false);
+void RelayTransaction(const CTransactionRef ptx, const CTxProperties *txproperties = nullptr);
 
 /** Access to the (IP) address database (peers.dat) */
 class CAddrDB

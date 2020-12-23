@@ -48,7 +48,7 @@ static const unsigned int DEFAULT_KEYPOOL_SIZE = 100;
 //! -paytxfee default
 static const CAmount DEFAULT_TRANSACTION_FEE = 0;
 //! -fallbackfee default
-static const CAmount DEFAULT_FALLBACK_FEE = 20000;
+static const CAmount DEFAULT_FALLBACK_FEE = 1000;
 //! -mintxfee default
 static const CAmount DEFAULT_TRANSACTION_MINFEE = 1000;
 //! minimum change amount
@@ -168,9 +168,11 @@ private:
     static const uint256 ABANDON_HASH;
 
 public:
+    /** Hash of the block containing this transaction */
     uint256 hashBlock;
 
-    /* An nIndex == -1 means that hashBlock (in nonzero) refers to the earliest
+    /** Position of the transaction in the block.
+     * An nIndex == -1 means that hashBlock (in nonzero) refers to the earliest
      * block in the chain we know this or any in-wallet dependency conflicts
      * with. Older clients interpret nIndex == -1 as unconfirmed for backward
      * compatibility.
@@ -263,7 +265,7 @@ public:
     mutable CAmount nAvailableWatchCreditCached;
     mutable CAmount nChangeCached;
 
-    CWalletTx() { Init(NULL); }
+    CWalletTx() { Init(nullptr); }
     CWalletTx(const CWallet *pwalletIn) { Init(pwalletIn); }
     CWalletTx(const CWallet *pwalletIn, const CMerkleTx &txIn) : CMerkleTx(txIn) { Init(pwalletIn); }
     CWalletTx(const CWallet *pwalletIn, const CTransaction &txIn) : CMerkleTx(txIn) { Init(pwalletIn); }
@@ -304,7 +306,7 @@ public:
     inline void SerializationOp(Stream &s, Operation ser_action)
     {
         if (ser_action.ForRead())
-            Init(NULL);
+            Init(nullptr);
         char fSpent = false;
 
         if (!ser_action.ForRead())
@@ -401,8 +403,12 @@ public:
 class COutput
 {
 public:
-    const CWalletTx *tx;
-    int i;
+    const CWalletTx *tx; //*< transaction
+    int i; //*< index of this output in transaction's vout
+
+    /** output of GetDepthInMainChain().  That is, how many blocks from the tip did this output get created in.  0 means
+     * not in blockchain (unconfirmed)
+     */
     int nDepth;
     bool fSpendable;
 
@@ -415,7 +421,55 @@ public:
     }
 
     std::string ToString() const;
+
+    inline int cmp(const COutput &rhs) const
+    {
+        if (tx->GetHash() == rhs.tx->GetHash())
+        {
+            if (i < rhs.i)
+                return -1;
+            if (i > rhs.i)
+                return 1;
+            return 0;
+        }
+        if (tx->GetHash() < rhs.tx->GetHash())
+            return -1;
+        return 1;
+    }
 };
+
+inline bool operator==(const COutput &lhs, const COutput &rhs) { return lhs.cmp(rhs) == 0; }
+inline bool operator!=(const COutput &lhs, const COutput &rhs) { return lhs.cmp(rhs) != 0; }
+inline bool operator<(const COutput &lhs, const COutput &rhs) { return lhs.cmp(rhs) < 0; }
+inline bool operator>(const COutput &lhs, const COutput &rhs) { return lhs.cmp(rhs) > 0; }
+inline bool operator<=(const COutput &lhs, const COutput &rhs) { return lhs.cmp(rhs) <= 0; }
+inline bool operator>=(const COutput &lhs, const COutput &rhs) { return lhs.cmp(rhs) >= 0; }
+typedef std::multimap<CAmount, COutput> SpendableTxos;
+
+struct TxoIterLess // : binary_function <T,T,bool>
+{
+    typedef SpendableTxos::iterator T;
+    bool operator()(const T &x, const T &y) const
+    {
+        if (x->first == y->first)
+        {
+            return x->second < y->second;
+        }
+        return x->first < y->first;
+    }
+};
+
+typedef std::set<SpendableTxos::iterator, TxoIterLess> TxoItVec;
+typedef std::pair<CAmount, TxoItVec> TxoGroup; // A set of coins and how much they sum to.
+
+// Select a group of UTXOs that sum up to above targetvalue.  The best choice is to be within dust of targetValue
+// because
+// that will mean that I do not create any change.
+extern TxoGroup CoinSelection(/* const */ SpendableTxos &available,
+    const CAmount targetValue,
+    const CAmount &dust,
+    CFeeRate fee,
+    unsigned int changeLen);
 
 
 /** Private key that includes an expiration date in case it never gets used. */
@@ -540,9 +594,11 @@ private:
      * if they are not ours
      */
     bool SelectCoins(const CAmount &nTargetValue,
+        CFeeRate fee,
+        unsigned int changeLen,
         std::set<std::pair<const CWalletTx *, unsigned int> > &setCoinsRet,
         CAmount &nValueRet,
-        const CCoinControl *coinControl = NULL) const;
+        const CCoinControl *coinControl = nullptr);
 
     CWalletDB *pwalletdbEncryption;
 
@@ -585,6 +641,9 @@ public:
      */
     mutable CCriticalSection cs_wallet;
 
+    SpendableTxos available;
+    bool fOnlyConfirmed; // Only allow spending of confirmed coins
+
     bool fFileBacked;
     std::string strWalletFile;
 
@@ -607,7 +666,7 @@ public:
     ~CWallet()
     {
         delete pwalletdbEncryption;
-        pwalletdbEncryption = NULL;
+        pwalletdbEncryption = nullptr;
     }
 
     void SetNull()
@@ -616,7 +675,7 @@ public:
         nWalletMaxVersion = FEATURE_BASE;
         fFileBacked = false;
         nMasterKeyMaxID = 0;
-        pwalletdbEncryption = NULL;
+        pwalletdbEncryption = nullptr;
         nOrderPosNext = 0;
         nNextResend = 0;
         nLastResend = 0;
@@ -644,6 +703,9 @@ public:
 
     const CWalletTx *GetWalletTx(const uint256 &hash) const;
 
+    bool IsTxSpendable(const CWalletTx *) const;
+    void FillAvailableCoins(const CCoinControl *coinControl); // populate available COutputs.
+
     //! check whether we are allowed to upgrade (or already support) to the named feature
     bool CanSupportFeature(enum WalletFeature wf)
     {
@@ -656,7 +718,7 @@ public:
      */
     void AvailableCoins(std::vector<COutput> &vCoins,
         bool fOnlyConfirmed = true,
-        const CCoinControl *coinControl = NULL,
+        const CCoinControl *coinControl = nullptr,
         bool fIncludeZeroValue = false) const;
 
     /**
@@ -739,8 +801,23 @@ public:
     void MarkDirty();
     bool AddToWallet(const CWalletTx &wtxIn, bool fFromLoadWallet, CWalletDB *pwalletdb);
     void SyncTransaction(const CTransactionRef &ptx, const CBlock *pblock, int txIndex = -1);
+
+    /**
+     * Add a transaction to the wallet, or update it.
+     * pblock is optional, but should be provided if the transaction is known to be in a block.
+     * If fUpdate is true, existing transactions will be updated.
+     * @return true if the wallet was updated
+     */
     bool AddToWalletIfInvolvingMe(const CTransactionRef &ptx, const CBlock *pblock, bool fUpdate, int txIndex = -1);
+
+    /**
+     * Scan the block chain (starting in pindexStart) for transactions
+     * from or to us. If fUpdate is true, found transactions that already
+     * exist in the wallet will be updated.
+     * @return the number of wallet updates
+     */
     int ScanForWalletTransactions(CBlockIndex *pindexStart, bool fUpdate = false);
+
     void ReacceptWalletTransactions();
     void ResendWalletTransactions(int64_t nBestBlockTime);
     std::vector<uint256> ResendWalletTransactionsBefore(int64_t nTime);
@@ -771,7 +848,7 @@ public:
         CAmount &nFeeRet,
         int &nChangePosRet,
         std::string &strFailReason,
-        const CCoinControl *coinControl = NULL,
+        const CCoinControl *coinControl = nullptr,
         bool sign = true);
     bool CommitTransaction(CWalletTx &wtxNew, CReserveKey &reservekey);
 
@@ -858,7 +935,7 @@ public:
 
     //! signify that a particular wallet feature is now used. this may change nWalletVersion and nWalletMaxVersion if
     //! those are lower
-    bool SetMinVersion(enum WalletFeature, CWalletDB *pwalletdbIn = NULL, bool fExplicit = false);
+    bool SetMinVersion(enum WalletFeature, CWalletDB *pwalletdbIn = nullptr, bool fExplicit = false);
 
     //! change which version we're allowed to upgrade to (note that this does not immediately imply upgrading to that
     //! format)

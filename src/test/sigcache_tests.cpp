@@ -1,5 +1,6 @@
 // Copyright (c) 2012-2015 The Bitcoin Core developers
-// Copyright (c) 2019- The Bitcoin developers
+// Copyright (c) 2019-2019 The Bitcoin developers
+// Copyright (c) 2019-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 // (based on key_tests.cpp)
@@ -35,13 +36,13 @@ static const uint32_t TEST_INVARIANT_FLAGS =
     SCRIPT_VERIFY_CHECKSEQUENCEVERIFY | SCRIPT_VERIFY_MINIMALIF |
     SCRIPT_VERIFY_NULLFAIL | SCRIPT_VERIFY_COMPRESSED_PUBKEYTYPE |
     SCRIPT_ENABLE_SIGHASH_FORKID | SCRIPT_ENABLE_REPLAY_PROTECTION |
-    SCRIPT_ENABLE_CHECKDATASIG | SCRIPT_ALLOW_SEGWIT_RECOVERY;
+    SCRIPT_ENABLE_CHECKDATASIG | SCRIPT_DISALLOW_SEGWIT_RECOVERY;
 /* We will be testing that these flags DO affect the cache entry. The expected
  * behaviour is that flags which are not explicitly listed as invariant in
  * script/sigcache.cpp will affect the cache entry. Here we will thus enforce
  * that certain flags are omitted from that sigcache.cpp list.
  */
-static const uint32_t TEST_VARIANT_FLAGS = SCRIPT_ENABLE_SCHNORR;
+static const uint32_t TEST_VARIANT_FLAGS = 0;
 
 /**
  * Sigcache is only accessible via CachingTransactionSignatureChecker
@@ -83,7 +84,7 @@ BOOST_AUTO_TEST_CASE(sig_pubkey_hash_variations) {
         SER_NETWORK, PROTOCOL_VERSION);
     CTransaction dummyTx(deserialize, stream);
     PrecomputedTransactionData txdata(dummyTx);
-    CachingTransactionSignatureChecker checker(&dummyTx, 0, 0 * SATOSHI, true,
+    CachingTransactionSignatureChecker checker(&dummyTx, 0, 0, true,
                                                txdata);
 
     TestCachingTransactionSignatureChecker testChecker(checker);
@@ -154,7 +155,7 @@ BOOST_AUTO_TEST_CASE(flag_invariants) {
         SER_NETWORK, PROTOCOL_VERSION);
     CTransaction dummyTx(deserialize, stream);
     PrecomputedTransactionData txdata(dummyTx);
-    CachingTransactionSignatureChecker checker(&dummyTx, 0, 0 * SATOSHI, true,
+    CachingTransactionSignatureChecker checker(&dummyTx, 0, 0, true,
                                                txdata);
 
     TestCachingTransactionSignatureChecker testChecker(checker);
@@ -175,7 +176,7 @@ BOOST_AUTO_TEST_CASE(flag_invariants) {
         BOOST_CHECK(key1.SignECDSA(hashMsg, sig));
 
         // choose random background flagset to test
-        uint32_t base_flags = insecure_rand();
+        uint32_t base_flags = InsecureRand32();
 
         // shouldn't be in cache at start
         BOOST_CHECK(!testChecker.IsCached(sig, pubkey1, hashMsg, base_flags));

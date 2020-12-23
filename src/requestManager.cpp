@@ -1,4 +1,4 @@
-// Copyright (c) 2016-2018 The Bitcoin Unlimited developers
+// Copyright (c) 2016-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -6,6 +6,7 @@
 #include "blockrelay/blockrelay_common.h"
 #include "blockrelay/compactblock.h"
 #include "blockrelay/graphene.h"
+#include "blockrelay/mempool_sync.h"
 #include "blockrelay/thinblock.h"
 #include "chain.h"
 #include "chainparams.h"
@@ -27,9 +28,11 @@
 #include "unlimited.h"
 #include "util.h"
 #include "utilstrencodings.h"
+#include "utiltime.h"
 #include "validation/validation.h"
 #include "validationinterface.h"
 #include "version.h"
+#include "xversionkeys.h"
 #include <boost/accumulators/accumulators.hpp>
 #include <boost/accumulators/statistics/mean.hpp>
 #include <boost/accumulators/statistics/stats.hpp>
@@ -61,7 +64,7 @@ unsigned int blkReqRetryInterval = MIN_BLK_REQUEST_RETRY_INTERVAL;
 extern bool CanDirectFetch(const Consensus::Params &consensusParams);
 
 /** Find the last common ancestor two blocks have.
- *  Both pa and pb must be non-NULL. */
+ *  Both pa and pb must be non-nullptr. */
 static CBlockIndex *LastCommonAncestor(CBlockIndex *pa, CBlockIndex *pb)
 {
     if (pa->nHeight > pb->nHeight)
@@ -82,6 +85,12 @@ static CBlockIndex *LastCommonAncestor(CBlockIndex *pa, CBlockIndex *pb)
     // Eventually all chain branches meet at the genesis block.
     assert(pa == pb);
     return pa;
+}
+
+static bool IsBlockType(const CInv &obj)
+{
+    return ((obj.type == MSG_BLOCK) || (obj.type == MSG_CMPCT_BLOCK) || (obj.type == MSG_XTHINBLOCK) ||
+            (obj.type == MSG_GRAPHENEBLOCK));
 }
 
 // Constructor for CRequestManagerNodeState struct
@@ -105,6 +114,28 @@ CRequestManager::CRequestManager()
     sendBlkIter = mapBlkInfo.end();
 }
 
+void CRequestManager::Cleanup()
+{
+    LOCK(cs_objDownloader);
+    sendIter = mapTxnInfo.end();
+    sendBlkIter = mapBlkInfo.end();
+    MapBlocksInFlightClear();
+    OdMap::iterator i = mapTxnInfo.begin();
+    while (i != mapTxnInfo.end())
+    {
+        auto prev = i;
+        ++i;
+        cleanup(prev); // cleanup erases which is why I need to advance the iterator first
+    }
+
+    i = mapBlkInfo.begin();
+    while (i != mapBlkInfo.end())
+    {
+        auto prev = i;
+        ++i;
+        cleanup(prev); // cleanup erases which is why I need to advance the iterator first
+    }
+}
 
 void CRequestManager::cleanup(OdMap::iterator &itemIt)
 {
@@ -116,20 +147,6 @@ void CRequestManager::cleanup(OdMap::iterator &itemIt)
     pendingTxns -= 1;
 
     // remove all the source nodes
-    for (CUnknownObj::ObjectSourceList::iterator i = item.availableFrom.begin(); i != item.availableFrom.end(); ++i)
-    {
-        CNode *node = i->node;
-        if (node != nullptr)
-        {
-            // LOG(REQ, "ReqMgr: %s cleanup - removed ref to %d count %d.\n", item.obj.ToString(), node->GetId(),
-            //    node->GetRefCount());
-            //
-            // A cs_vNodes lock is not required here when releasing refs for two reasons: one, this only decrements
-            // an atomic counter, and two, the counter will always be > 0 at this point, so we don't have to worry
-            // that a pnode could be disconnected and no longer exist before the decrement takes place.
-            node->Release();
-        }
-    }
     item.availableFrom.clear();
 
     if (item.obj.type == MSG_TX)
@@ -175,10 +192,14 @@ void CRequestManager::AskFor(const CInv &obj, CNode *from, unsigned int priority
         // else the txn already existed so nothing to do
 
         data.priority = max(priority, data.priority);
-        // Got the data, now add the node as a source
-        data.AddSource(from);
+
+        // Got the data, now add the node as a source if we're not already processing
+        // this txn. If we add more sources here while processing a txn then we could
+        // end up with dangling noderefs when the peer tries to disconnect.
+        if (!data.fProcessing)
+            data.AddSource(from);
     }
-    else if ((obj.type == MSG_BLOCK) || (obj.type == MSG_CMPCT_BLOCK) || (obj.type == MSG_XTHINBLOCK))
+    else if (IsBlockType(obj))
     {
         uint256 temp = obj.hash;
         OdMap::value_type v(temp, CUnknownObj());
@@ -276,7 +297,7 @@ bool CRequestManager::AlreadyAskedForBlock(const uint256 &hash)
 
 void CRequestManager::UpdateTxnResponseTime(const CInv &obj, CNode *pfrom)
 {
-    int64_t now = GetTimeMicros();
+    int64_t now = GetStopwatchMicros();
     LOCK(cs_objDownloader);
     if (pfrom && obj.type == MSG_TX)
     {
@@ -289,30 +310,53 @@ void CRequestManager::UpdateTxnResponseTime(const CInv &obj, CNode *pfrom)
     }
 }
 
-// Indicate that we are processing this object.
-void CRequestManager::Processing(const CInv &obj, CNode *pfrom)
+void CRequestManager::ProcessingTxn(const uint256 &hash, CNode *pfrom)
 {
     LOCK(cs_objDownloader);
-    if (obj.type == MSG_TX)
-    {
-        OdMap::iterator item = mapTxnInfo.find(obj.hash);
-        if (item == mapTxnInfo.end())
-            return;
+    OdMap::iterator item = mapTxnInfo.find(hash);
+    if (item == mapTxnInfo.end())
+        return;
 
-        item->second.fProcessing = true;
-        LOG(REQ, "ReqMgr: Processing %s (received from %s).\n", item->second.obj.ToString(),
-            pfrom ? pfrom->GetLogName() : "unknown");
-    }
-    else if (obj.type == MSG_BLOCK || obj.type == MSG_CMPCT_BLOCK || obj.type == MSG_XTHINBLOCK)
-    {
-        OdMap::iterator item = mapBlkInfo.find(obj.hash);
-        if (item == mapBlkInfo.end())
-            return;
+    item->second.fProcessing = true;
+    LOG(REQ, "ReqMgr: Processing %s (received from %s).\n", item->second.obj.ToString(),
+        pfrom ? pfrom->GetLogName() : "unknown");
 
-        item->second.fProcessing = true;
-        LOG(BLK, "ReqMgr: Processing %s (received from %s).\n", item->second.obj.ToString(),
-            pfrom ? pfrom->GetLogName() : "unknown");
-    }
+    // As a last step we must clear all sources to release the noderef's. If we don't do this
+    // then if the transaction ends up being a double spend, an orphan that is never reclaimed, or
+    // perhaps some other validation failure, it would result in having dangling noderef's which then
+    // prevent a node from fully disconnecting and thus preventing the CNode from calling it's destructor.
+    //
+    // However in the case of blocks we don't do this because if a block fails to validate we
+    // reset the fProcessing flag to false so that we can get another block and check its validity.
+    // This is so that we can prevent a DOS attack where a corrupted block is fed to us in order
+    // to prevent us from downloading the good block.
+    item->second.availableFrom.clear();
+}
+
+void CRequestManager::ProcessingBlock(const uint256 &hash, CNode *pfrom)
+{
+    LOCK(cs_objDownloader);
+    OdMap::iterator item = mapBlkInfo.find(hash);
+    if (item == mapBlkInfo.end())
+        return;
+
+    item->second.fProcessing = true;
+    LOG(BLK, "ReqMgr: Processing %s (received from %s).\n", item->second.obj.ToString(),
+        pfrom ? pfrom->GetLogName() : "unknown");
+}
+// This block has failed to be accepted so in case this is some sort of attack block
+// we need to set the fProcessing flag back to false.
+//
+// We don't have to remove the source because it would have already been removed if/when we
+// requested the block and if this was an unsolicited block or attack block then the source
+// would never have been added to the request manager.
+void CRequestManager::BlockRejected(const CInv &obj, CNode *pfrom)
+{
+    LOCK(cs_objDownloader);
+    OdMap::iterator item = mapBlkInfo.find(obj.hash);
+    if (item == mapBlkInfo.end())
+        return;
+    item->second.fProcessing = false;
 }
 
 // Indicate that we got this object.
@@ -328,7 +372,7 @@ void CRequestManager::Received(const CInv &obj, CNode *pfrom)
         LOG(REQ, "ReqMgr: TX received for %s.\n", item->second.obj.ToString().c_str());
         cleanup(item);
     }
-    else if (obj.type == MSG_BLOCK || obj.type == MSG_CMPCT_BLOCK || obj.type == MSG_XTHINBLOCK)
+    else if (IsBlockType(obj))
     {
         OdMap::iterator item = mapBlkInfo.find(obj.hash);
         if (item == mapBlkInfo.end())
@@ -381,7 +425,7 @@ void CRequestManager::Rejected(const CInv &obj, CNode *from, unsigned char reaso
 
         rejectedTxns += 1;
     }
-    else if ((obj.type == MSG_BLOCK) || (obj.type == MSG_CMPCT_BLOCK) || (obj.type == MSG_XTHINBLOCK))
+    else if (IsBlockType(obj))
     {
         item = mapBlkInfo.find(obj.hash);
         if (item == mapBlkInfo.end())
@@ -427,10 +471,9 @@ void CRequestManager::Rejected(const CInv &obj, CNode *from, unsigned char reaso
     }
 }
 
-CNodeRequestData::CNodeRequestData(CNode *n)
+CNodeRequestData::CNodeRequestData(CNodeRef n)
 {
-    assert(n);
-    node = n;
+    noderef = n;
     requestCount = 0;
     desirability = 0;
 
@@ -439,13 +482,13 @@ CNodeRequestData::CNodeRequestData(CNode *n)
     // Calculate how much we like this node:
 
     // Prefer thin block nodes over low latency ones when the chain is syncd
-    if (node->ThinBlockCapable() && IsChainNearlySyncd())
+    if (noderef.get()->ThinBlockCapable() && IsChainNearlySyncd())
     {
         desirability += MaxLatency;
     }
 
     // The bigger the latency (in microseconds), the less we want to request from this node
-    int latency = node->txReqLatency.GetTotal().get_int();
+    int latency = noderef.get()->txReqLatency.GetTotalTyped();
     // data has never been requested from this node.  Should we encourage investigation into whether this node is fast,
     // or stick with nodes that we do have data on?
     if (latency == 0)
@@ -465,13 +508,8 @@ bool CUnknownObj::AddSource(CNode *from)
     {
         LOG(REQ, "AddSource %s is available at %s.\n", obj.ToString(), from->GetLogName());
 
-        // We do not have to take a vNodes lock here as would usually be the case because the counter is
-        // atomic, and also at this point there will be at least one ref already and we therefore don't
-        // have to worry about the node getting disconnected and no longer existing.
-        DbgAssert(from->GetRefCount() > 0, );
-        from->AddRef();
-
-        CNodeRequestData req(from);
+        CNodeRef noderef(from);
+        CNodeRequestData req(noderef);
         for (ObjectSourceList::iterator i = availableFrom.begin(); i != availableFrom.end(); ++i)
         {
             if (i->desirability < req.desirability)
@@ -495,6 +533,19 @@ void CRequestManager::RequestCorruptedBlock(const uint256 &blockHash)
     AskForDuringIBD(vGetBlocks, nullptr);
 }
 
+static bool IsGrapheneVersionSupported(CNode *pfrom)
+{
+    try
+    {
+        NegotiateGrapheneVersion(pfrom);
+        return true;
+    }
+    catch (const std::runtime_error &error)
+    {
+        return false;
+    }
+}
+
 bool CRequestManager::RequestBlock(CNode *pfrom, CInv obj)
 {
     CInv inv2(obj);
@@ -505,9 +556,8 @@ bool CRequestManager::RequestBlock(CNode *pfrom, CInv obj)
     {
         // Ask for Graphene blocks
         // Must download a graphene block from a graphene enabled peer.
-        if (IsGrapheneBlockEnabled() && pfrom->GrapheneCapable())
+        if (IsGrapheneBlockEnabled() && pfrom->GrapheneCapable() && IsGrapheneVersionSupported(pfrom))
         {
-            // We can only request one thin type block per peer at a time.
             if (thinrelay.AddBlockInFlight(pfrom, inv2.hash, NetMsgType::GRAPHENEBLOCK))
             {
                 MarkBlockAsInFlight(pfrom->GetId(), obj.hash);
@@ -532,7 +582,6 @@ bool CRequestManager::RequestBlock(CNode *pfrom, CInv obj)
         // Must download an xthinblock from a xthin peer.
         if (IsThinBlocksEnabled() && pfrom->ThinBlockCapable())
         {
-            // We can only request one thin type block per peer at a time.
             if (thinrelay.AddBlockInFlight(pfrom, inv2.hash, NetMsgType::XTHINBLOCK))
             {
                 MarkBlockAsInFlight(pfrom->GetId(), obj.hash);
@@ -541,7 +590,7 @@ bool CRequestManager::RequestBlock(CNode *pfrom, CInv obj)
                 inv2.type = MSG_XTHINBLOCK;
                 std::vector<uint256> vOrphanHashes;
                 {
-                    READLOCK(orphanpool.cs);
+                    READLOCK(orphanpool.cs_orphanpool);
                     for (auto &mi : orphanpool.mapOrphanTransactions)
                         vOrphanHashes.emplace_back(mi.first);
                 }
@@ -559,7 +608,6 @@ bool CRequestManager::RequestBlock(CNode *pfrom, CInv obj)
         // Must download an xthinblock from a xthin peer.
         if (IsCompactBlocksEnabled() && pfrom->CompactBlockCapable())
         {
-            // We can only request one thin type block per peer at a time.
             if (thinrelay.AddBlockInFlight(pfrom, inv2.hash, NetMsgType::CMPCTBLOCK))
             {
                 MarkBlockAsInFlight(pfrom->GetId(), obj.hash);
@@ -603,6 +651,11 @@ void CRequestManager::ResetLastBlockRequestTime(const uint256 &hash)
     }
 }
 
+struct CompareIteratorByNodeRef
+{
+    bool operator()(const CNodeRef &a, const CNodeRef &b) const { return a.get() < b.get(); }
+};
+
 void CRequestManager::SendRequests()
 {
     int64_t now = 0;
@@ -616,35 +669,43 @@ void CRequestManager::SendRequests()
     // those blocks and txns can take much longer to download.
     unsigned int _blkReqRetryInterval = MIN_BLK_REQUEST_RETRY_INTERVAL;
     unsigned int _txReqRetryInterval = MIN_TX_REQUEST_RETRY_INTERVAL;
-    if ((!IsChainNearlySyncd() && Params().NetworkIDString() != "regtest") || IsTrafficShapingEnabled())
+    if (IsTrafficShapingEnabled())
     {
         _blkReqRetryInterval *= 6;
-        // we want to optimise block DL during IBD (and give lots of time for shaped nodes) so push the TX retry up to 2
-        // minutes (default val of MIN_TX is 5 sec)
         _txReqRetryInterval *= (12 * 2);
+    }
+    else if ((!IsChainNearlySyncd() && Params().NetworkIDString() != "regtest"))
+    {
+        _blkReqRetryInterval *= 2;
+        _txReqRetryInterval *= 8;
     }
 
     // When we are still doing an initial sync we want to batch request the blocks instead of just
     // asking for one at time. We can do this because there will be no XTHIN requests possible during
     // this time.
     bool fBatchBlockRequests = IsInitialBlockDownload();
-    std::map<CNode *, std::vector<CInv> > mapBatchBlockRequests;
+    std::map<CNodeRef, std::vector<CInv>, CompareIteratorByNodeRef> mapBatchBlockRequests;
 
     // Batch any transaction requests when possible. The process of batching and requesting batched transactions
     // is simlilar to batched block requests, however, we don't make the distinction of whether we're in the process
     // of syncing the chain, as we do with block requests.
-    std::map<CNode *, std::vector<CInv> > mapBatchTxnRequests;
+    std::map<CNodeRef, std::vector<CInv>, CompareIteratorByNodeRef> mapBatchTxnRequests;
 
     // Get Blocks
     while (sendBlkIter != mapBlkInfo.end())
     {
-        now = GetTimeMicros();
+        now = GetStopwatchMicros();
         OdMap::iterator itemIter = sendBlkIter;
         if (itemIter == mapBlkInfo.end())
             break;
 
         ++sendBlkIter; // move it forward up here in case we need to erase the item we are working with.
         CUnknownObj &item = itemIter->second;
+
+        // If we've already received the item and it's in processing then skip it here so we don't
+        // end up re-requesting it again.
+        if (item.fProcessing)
+            continue;
 
         // if never requested then lastRequestTime==0 so this will always be true
         if (now - item.lastRequestTime > _blkReqRetryInterval)
@@ -653,28 +714,21 @@ void CRequestManager::SendRequests()
             {
                 CNodeRequestData next;
                 // Go thru the availableFrom list, looking for the first node that isn't disconnected
-                while (!item.availableFrom.empty() && (next.node == nullptr))
+                while (!item.availableFrom.empty() && (next.noderef.get() == nullptr))
                 {
                     next = item.availableFrom.front(); // Grab the next location where we can find this object.
                     item.availableFrom.pop_front();
-                    if (next.node != nullptr)
+                    if (next.noderef.get() != nullptr)
                     {
                         // Do not request from this node if it was disconnected
-                        if (next.node->fDisconnect)
+                        if (next.noderef.get()->fDisconnect)
                         {
-                            LOG(REQ, "ReqMgr: %s removed block ref to %s count %d (on disconnect).\n",
-                                item.obj.ToString(), next.node->GetLogName(), next.node->GetRefCount());
-                            // A cs_vNodes lock is not required here when releasing refs for two reasons: one, this
-                            // only decrements an atomic counter, and two, the counter will always be > 0 at this
-                            // point, so we don't have to worry that a pnode could be disconnected and no longer exist
-                            // before the decrement takes place.
-                            next.node->Release();
-                            next.node = nullptr; // force the loop to get another node
+                            next.noderef.~CNodeRef(); // force the loop to get another node
                         }
                     }
                 }
 
-                if (next.node != nullptr)
+                if (next.noderef.get() != nullptr)
                 {
                     // If item.lastRequestTime is true then we've requested at least once and we'll try a re-request
                     if (item.lastRequestTime)
@@ -690,22 +744,12 @@ void CRequestManager::SendRequests()
 
                     if (fBatchBlockRequests)
                     {
-                        // Add a node ref if we haven't already added a map entry for this node.
-                        if (mapBatchBlockRequests.find(next.node) == mapBatchBlockRequests.end())
-                        {
-                            // We do not have to take a vNodes lock here as would usually be the case because the
-                            // counter is atomic, and also at this point there will be at least one ref already and
-                            // we therefore don't have to worry about the node getting disconnected and no longer
-                            // existing.
-                            DbgAssert(next.node->GetRefCount() > 0, );
-                            next.node->AddRef();
-                        }
-                        mapBatchBlockRequests[next.node].emplace_back(obj);
+                        mapBatchBlockRequests[next.noderef].emplace_back(obj);
                     }
                     else
                     {
                         LEAVE_CRITICAL_SECTION(cs_objDownloader); // item and itemIter are now invalid
-                        fReqBlkResult = RequestBlock(next.node, obj);
+                        fReqBlkResult = RequestBlock(next.noderef.get(), obj);
                         ENTER_CRITICAL_SECTION(cs_objDownloader);
 
                         if (!fReqBlkResult)
@@ -727,12 +771,7 @@ void CRequestManager::SendRequests()
                     // we don't lose the block source.
                     if (fReqBlkResult)
                     {
-                        // A cs_vNodes lock is not required here when releasing refs for two reasons: one, this only
-                        // decrements an atomic counter, and two, the counter will always be > 0 at this point, so we
-                        // don't have to worry that a pnode could be disconnected and no longer exist before the
-                        // decrement takes place.
-                        next.node->Release();
-                        next.node = nullptr;
+                        next.noderef.~CNodeRef();
                     }
                     else
                     {
@@ -745,8 +784,10 @@ void CRequestManager::SendRequests()
                 }
                 else
                 {
-                    // node should never be null... but if it is then there's nothing to do.
-                    LOG(REQ, "Block %s has no sources\n", item.obj.ToString());
+                    // We requested from all available sources so remove the source. This should not
+                    // happen and would indicate some other problem.
+                    LOG(REQ, "Block %s has no sources. Removing\n", item.obj.ToString());
+                    cleanup(itemIter);
                 }
             }
             else
@@ -767,22 +808,15 @@ void CRequestManager::SendRequests()
             {
                 for (auto &inv : iter.second)
                 {
-                    MarkBlockAsInFlight(iter.first->GetId(), inv.hash);
+                    MarkBlockAsInFlight(iter.first.get()->GetId(), inv.hash);
                 }
-                iter.first->PushMessage(NetMsgType::GETDATA, iter.second);
+                iter.first.get()->PushMessage(NetMsgType::GETDATA, iter.second);
                 LOG(REQ, "Sent batched request with %d blocks to node %s\n", iter.second.size(),
-                    iter.first->GetLogName());
+                    iter.first.get()->GetLogName());
             }
         }
         ENTER_CRITICAL_SECTION(cs_objDownloader);
 
-        for (auto iter : mapBatchBlockRequests)
-        {
-            // A cs_vNodes lock is not required here when releasing refs for two reasons: one, this only decrements
-            // an atomic counter, and two, the counter will always be > 0 at this point, so we don't have to worry
-            // that a pnode could be disconnected and no longer exist before the decrement takes place.
-            iter.first->Release();
-        }
         mapBatchBlockRequests.clear();
     }
 
@@ -791,7 +825,7 @@ void CRequestManager::SendRequests()
         sendIter = mapTxnInfo.begin();
     while ((sendIter != mapTxnInfo.end()) && requestPacer.try_leak(1))
     {
-        now = GetTimeMicros();
+        now = GetStopwatchMicros();
         OdMap::iterator itemIter = sendIter;
         if (itemIter == mapTxnInfo.end())
             break;
@@ -814,44 +848,38 @@ void CRequestManager::SendRequests()
                 if (item.lastRequestTime)
                 {
                     LOG(REQ, "Request timeout for %s.  Retrying\n", item.obj.ToString().c_str());
-                    // Not reducing inFlight; it's still outstanding and will be cleaned up when item is removed from
-                    // map
-                    // note we can never be sure its really dropped verses just delayed for a long time so this is not
-                    // authoritative.
+                    // Not reducing inFlight; it's still outstanding and will be cleaned up when
+                    // item is removed from map.
+                    // Note we can never be sure its really dropped verses just delayed for a long
+                    // time so this is not authoritative.
                     droppedTxns += 1;
                 }
 
                 if (item.availableFrom.empty())
                 {
-                    // TODO: tell someone about this issue, look in a random node, or something.
-                    LOG(REQ, "No sources for %s.  Dropping\n", item.obj.ToString().c_str());
-                    cleanup(itemIter); // right now we give up requesting it if we have no other sources...
+                    // There can be no block sources because a node dropped out.  In this case, nothing can be done so
+                    // remove the item.
+                    LOG(REQ, "Tx has no sources for %s.  Removing\n", item.obj.ToString().c_str());
+                    cleanup(itemIter);
                 }
                 else // Ok, we have at least one source so request this item.
                 {
                     CNodeRequestData next;
                     // Go thru the availableFrom list, looking for the first node that isn't disconnected
-                    while (!item.availableFrom.empty() && (next.node == nullptr))
+                    while (!item.availableFrom.empty() && (next.noderef.get() == nullptr))
                     {
                         next = item.availableFrom.front(); // Grab the next location where we can find this object.
                         item.availableFrom.pop_front();
-                        if (next.node != nullptr)
+                        if (next.noderef.get() != nullptr)
                         {
-                            if (next.node->fDisconnect) // Node was disconnected so we can't request from it
+                            if (next.noderef.get()->fDisconnect) // Node was disconnected so we can't request from it
                             {
-                                LOG(REQ, "ReqMgr: %s removed tx ref to %d count %d (on disconnect).\n",
-                                    item.obj.ToString(), next.node->GetId(), next.node->GetRefCount());
-                                // A cs_vNodes lock is not required here when releasing refs for two reasons: one, this
-                                // only decrements an atomic counter, and two, the counter will always be > 0 at this
-                                // point, so we don't have to worry that a pnode could be disconnected and no longer
-                                // exist before the decrement takes place.
-                                next.node->Release();
-                                next.node = nullptr; // force the loop to get another node
+                                next.noderef.~CNodeRef(); // force the loop to get another node
                             }
                         }
                     }
 
-                    if (next.node != nullptr)
+                    if (next.noderef.get() != nullptr)
                     {
                         // This commented code skips requesting TX if the node is not synced. The request
                         // manager should not make this decision but rather the caller should not give us the TX.
@@ -860,42 +888,37 @@ void CRequestManager::SendRequests()
                             item.outstandingReqs++;
                             item.lastRequestTime = now;
 
-                            // Add a node ref if we haven't already added a map entry for this node.
-                            if (mapBatchTxnRequests.find(next.node) == mapBatchTxnRequests.end())
-                            {
-                                // We do not have to take a vNodes lock here as would usually be the case because the
-                                // counter is atomic, and also at this point there will be at least one ref already and
-                                // we therefore don't have to worry about the node getting disconnected and no longer
-                                // existing.
-                                DbgAssert(next.node->GetRefCount() > 0, );
-                                next.node->AddRef();
-                            }
-                            mapBatchTxnRequests[next.node].emplace_back(item.obj);
+                            mapBatchTxnRequests[next.noderef].emplace_back(item.obj);
 
                             // If we have 1000 requests for this peer then send them right away.
-                            if (mapBatchTxnRequests[next.node].size() >= 1000)
+                            if (mapBatchTxnRequests[next.noderef].size() >= 1000)
                             {
                                 LEAVE_CRITICAL_SECTION(cs_objDownloader);
                                 {
-                                    next.node->PushMessage(NetMsgType::GETDATA, mapBatchTxnRequests[next.node]);
+                                    next.noderef.get()->PushMessage(
+                                        NetMsgType::GETDATA, mapBatchTxnRequests[next.noderef]);
                                     LOG(REQ, "Sent batched request with %d transations to node %s\n",
-                                        mapBatchTxnRequests[next.node].size(), next.node->GetLogName());
+                                        mapBatchTxnRequests[next.noderef].size(), next.noderef.get()->GetLogName());
                                 }
                                 ENTER_CRITICAL_SECTION(cs_objDownloader);
 
-                                mapBatchTxnRequests.erase(next.node);
-                                {
-                                    // A cs_vNodes lock is not required here when releasing refs for two reasons: one,
-                                    // this only decrements an atomic counter, and two, the counter will always be > 0
-                                    // at this point, so we don't have to worry that a pnode could be disconnected and
-                                    // no longer exist before the decrement takes place.
-                                    next.node->Release();
-                                }
+                                mapBatchTxnRequests.erase(next.noderef);
                             }
+
+                            // Now that we've completed setting up our request for this transaction
+                            // we're done with this node, for this item, and can delete it.
+                            next.noderef.~CNodeRef();
                         }
 
                         inFlight++;
                         inFlightTxns << inFlight;
+                    }
+                    else
+                    {
+                        // We requested from all available sources so remove the source. This should not
+                        // happen and would indicate some other problem.
+                        LOG(REQ, "Tx has no sources for %s.  Removing\n", item.obj.ToString().c_str());
+                        cleanup(itemIter);
                     }
                 }
             }
@@ -908,49 +931,44 @@ void CRequestManager::SendRequests()
         {
             for (auto iter : mapBatchTxnRequests)
             {
-                iter.first->PushMessage(NetMsgType::GETDATA, iter.second);
+                iter.first.get()->PushMessage(NetMsgType::GETDATA, iter.second);
                 LOG(REQ, "Sent batched request with %d transations to node %s\n", iter.second.size(),
-                    iter.first->GetLogName());
+                    iter.first.get()->GetLogName());
             }
         }
         ENTER_CRITICAL_SECTION(cs_objDownloader);
 
-        for (auto iter : mapBatchTxnRequests)
-        {
-            // A cs_vNodes lock is not required here when releasing refs for two reasons: one, this only decrements
-            // an atomic counter, and two, the counter will always be > 0 at this point, so we don't have to worry
-            // that a pnode could be disconnected and no longer exist before the decrement takes place.
-            iter.first->Release();
-        }
         mapBatchTxnRequests.clear();
     }
 }
 
 bool CRequestManager::CheckForRequestDOS(CNode *pfrom, const CChainParams &chainparams)
 {
-    LOCK(cs_objDownloader);
-
     // Check for Misbehaving and DOS
-    // If they make more than MAX_THINTYPE_OBJECT_REQUESTS requests in 10 minutes then disconnect them
-    if (chainparams.NetworkIDString() != "regtest")
+    // If they make more than MAX_THINTYPE_OBJECT_REQUESTS requests in 10 minutes then assign misbehavior points.
+    //
+    // Other networks have variable mining rates, so only apply these rules to mainnet only.
+    if (chainparams.NetworkIDString() == "main")
     {
+        LOCK(cs_objDownloader);
+
         std::map<NodeId, CRequestManagerNodeState>::iterator it = mapRequestManagerNodeState.find(pfrom->GetId());
         DbgAssert(it != mapRequestManagerNodeState.end(), return false);
         CRequestManagerNodeState *state = &it->second;
 
+        // First decay the previous value
         uint64_t nNow = GetTime();
-        state->nNumRequests = std::pow(1.0 - 1.0 / 600.0, (double)(nNow - state->nLastRequest)) + 1;
-        state->nLastRequest = nNow;
-        LOG(THIN | GRAPHENE | CMPCT, "Number of thin object requests is %f\n", state->nNumRequests);
+        state->nNumRequests = std::pow(1.0 - 1.0 / 600.0, (double)(nNow - state->nLastRequest));
 
-        // Other networks have variable mining rates, so only apply these rules to mainnet.
-        if (chainparams.NetworkIDString() == "main")
+        // Now add one request and update the time
+        state->nNumRequests++;
+        state->nLastRequest = nNow;
+
+        if (state->nNumRequests >= MAX_THINTYPE_OBJECT_REQUESTS)
         {
-            if (state->nNumRequests >= MAX_THINTYPE_OBJECT_REQUESTS)
-            {
-                dosMan.Misbehaving(pfrom, 50);
-                return error("%s is misbehaving. Making too many thin type requests.", pfrom->GetLogName());
-            }
+            pfrom->fDisconnect = true;
+            return error("Disconnecting  %s. Making too many (%f) thin object requests.", pfrom->GetLogName(),
+                state->nNumRequests);
         }
     }
     return true;
@@ -1029,10 +1047,35 @@ void CRequestManager::RequestNextBlocksToDownload(CNode *pto)
         }
         if (!vGetBlocks.empty())
         {
+            std::vector<CInv> vToFetchNew;
+            {
+                LOCK(cs_objDownloader);
+                for (CInv &inv : vGetBlocks)
+                {
+                    // If this block is already in flight then don't ask for it again during the IBD process.
+                    //
+                    // If it's an additional source for a new peer then it would have been added already in
+                    // FindNextBlocksToDownload().
+                    std::map<uint256, std::map<NodeId, std::list<QueuedBlock>::iterator> >::iterator itInFlight =
+                        mapBlocksInFlight.find(inv.hash);
+                    if (itInFlight != mapBlocksInFlight.end())
+                    {
+                        continue;
+                    }
+
+                    vToFetchNew.push_back(inv);
+                }
+            }
+            vGetBlocks.swap(vToFetchNew);
+
             if (!IsInitialBlockDownload())
+            {
                 AskFor(vGetBlocks, pto);
+            }
             else
+            {
                 AskForDuringIBD(vGetBlocks, pto);
+            }
         }
     }
 }
@@ -1048,19 +1091,18 @@ void CRequestManager::FindNextBlocksToDownload(CNode *node, unsigned int count, 
     vBlocks.reserve(vBlocks.size() + count);
 
     // Make sure pindexBestKnownBlock is up to date, we'll need it.
-    LOCK(cs_main);
     ProcessBlockAvailability(nodeid);
 
     CNodeStateAccessor state(nodestate, nodeid);
     DbgAssert(state != nullptr, return );
 
+    LOCK(cs_main);
     if (state->pindexBestKnownBlock == nullptr ||
         state->pindexBestKnownBlock->nChainWork < chainActive.Tip()->nChainWork)
     {
         // This peer has nothing interesting.
         return;
     }
-
 
     if (state->pindexLastCommonBlock == nullptr)
     {
@@ -1107,8 +1149,17 @@ void CRequestManager::FindNextBlocksToDownload(CNode *node, unsigned int count, 
             uint256 blockHash = pindex->GetBlockHash();
             if (AlreadyAskedForBlock(blockHash))
             {
-                AskFor(CInv(MSG_BLOCK, blockHash), node); // Add another source
-                continue;
+                // Only add a new source if there is a block in flight from a different peer. This prevents
+                // us from re-adding a source for the same peer and possibly downloading two duplicate blocks.
+                // This edge condition can typically happen when we were only connected to only one peer and we
+                // exceed the download timeout causing us to re-request the same block from the same peer.
+                std::map<uint256, std::map<NodeId, std::list<QueuedBlock>::iterator> >::iterator itInFlight =
+                    mapBlocksInFlight.find(blockHash);
+                if (itInFlight != mapBlocksInFlight.end() && !itInFlight->second.count(nodeid))
+                {
+                    AskFor(CInv(MSG_BLOCK, blockHash), node); // Add another source
+                    continue;
+                }
             }
 
             if (!pindex->IsValid(BLOCK_VALID_TREE))
@@ -1140,6 +1191,35 @@ void CRequestManager::FindNextBlocksToDownload(CNode *node, unsigned int count, 
     }
 }
 
+void CRequestManager::RequestMempoolSync(CNode *pto)
+{
+    LOCK(cs_mempoolsync);
+    NodeId nodeId = pto->GetId();
+
+    if ((mempoolSyncRequested.count(nodeId) == 0 ||
+            ((GetStopwatchMicros() - mempoolSyncRequested[nodeId].lastUpdated) > MEMPOOLSYNC_FREQ_US)) &&
+        pto->canSyncMempoolWithPeers)
+    {
+        // Similar to Graphene, receiver must send CMempoolInfo
+        CMempoolSyncInfo receiverMemPoolInfo = GetMempoolSyncInfo();
+        mempoolSyncRequested[nodeId] = CMempoolSyncState(
+            GetStopwatchMicros(), receiverMemPoolInfo.shorttxidk0, receiverMemPoolInfo.shorttxidk1, false);
+        if (NegotiateMempoolSyncVersion(pto) > 0)
+            pto->PushMessage(NetMsgType::GET_MEMPOOLSYNC, receiverMemPoolInfo);
+        else
+        {
+            CInv inv;
+            CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+            ss << inv;
+            ss << receiverMemPoolInfo;
+            pto->PushMessage(NetMsgType::GET_MEMPOOLSYNC, ss);
+        }
+        LOG(MPOOLSYNC, "Requesting mempool synchronization from peer %s\n", pto->GetLogName());
+
+        lastMempoolSync = GetStopwatchMicros();
+    }
+}
+
 // indicate whether we requested this block.
 void CRequestManager::MarkBlockAsInFlight(NodeId nodeid, const uint256 &hash)
 {
@@ -1158,7 +1238,7 @@ void CRequestManager::MarkBlockAsInFlight(NodeId nodeid, const uint256 &hash)
         CRequestManagerNodeState *state = &it->second;
 
         // Add queued block to nodestate and add iterator for queued block to mapBlocksInFlight
-        int64_t nNow = GetTimeMicros();
+        int64_t nNow = GetStopwatchMicros();
         QueuedBlock newentry = {hash, nNow};
         std::list<QueuedBlock>::iterator it2 = state->vBlocksInFlight.insert(state->vBlocksInFlight.end(), newentry);
         mapBlocksInFlight[hash][nodeid] = it2;
@@ -1168,7 +1248,7 @@ void CRequestManager::MarkBlockAsInFlight(NodeId nodeid, const uint256 &hash)
         if (state->nBlocksInFlight == 1)
         {
             // We're starting a block download (batch) from this peer.
-            state->nDownloadingSince = GetTimeMicros();
+            state->nDownloadingSince = GetStopwatchMicros();
         }
     }
 }
@@ -1198,7 +1278,7 @@ bool CRequestManager::MarkBlockAsReceived(const uint256 &hash, CNode *pnode)
         CRequestManagerNodeState *state = &it->second;
 
         int64_t getdataTime = itInFlight->second->nTime;
-        int64_t now = GetTimeMicros();
+        int64_t now = GetStopwatchMicros();
         double nResponseTime = (double)(now - getdataTime) / 1000000.0;
 
         // calculate avg block response time over a range of blocks to be used for IBD tuning.
@@ -1248,7 +1328,10 @@ bool CRequestManager::MarkBlockAsReceived(const uint256 &hash, CNode *pnode)
                 // disconnecting.
                 //
                 // We disconnect a peer only if their average response time is more than 4 times the overall average.
-                if (nOutbound >= nMaxOutConnections - 1 && IsInitialBlockDownload() && nIterations > nOverallRange &&
+                static int nStartDisconnections GUARDED_BY(cs_overallaverage) = BEGIN_PRUNING_PEERS;
+                if (!pnode->fDisconnectRequest &&
+                    (nOutbound >= nMaxOutConnections - 1 || nOutbound >= nStartDisconnections) &&
+                    IsInitialBlockDownload() && nIterations > nOverallRange &&
                     pnode->nAvgBlkResponseTime > nOverallAverageResponseTime * 4)
                 {
                     LOG(IBD, "disconnecting %s because too slow , overall avg %d peer avg %d\n", pnode->GetLogName(),
@@ -1256,6 +1339,14 @@ bool CRequestManager::MarkBlockAsReceived(const uint256 &hash, CNode *pnode)
                     pnode->InitiateGracefulDisconnect();
                     // We must not return here but continue in order
                     // to update the vBlocksInFlight stats.
+
+                    // Increment so we start disconnecting at a higher number of peers each time. This
+                    // helps to improve the very beginning of IBD such that we don't have to wait for all outbound
+                    // connections to be established before we start pruning the slow peers and yet we don't end
+                    // up suddenly overpruning.
+                    nStartDisconnections = nOutbound;
+                    if (nStartDisconnections < nMaxOutConnections)
+                        nStartDisconnections++;
                 }
             }
 
@@ -1307,17 +1398,17 @@ bool CRequestManager::MarkBlockAsReceived(const uint256 &hash, CNode *pnode)
         if (IsChainNearlySyncd())
         {
             // Update Thinblock stats
-            if (thinrelay.IsBlockInFlight(pnode, NetMsgType::XTHINBLOCK))
+            if (thinrelay.IsBlockInFlight(pnode, NetMsgType::XTHINBLOCK, hash))
             {
                 thindata.UpdateResponseTime(nResponseTime);
             }
             // Update Graphene stats
-            if (thinrelay.IsBlockInFlight(pnode, NetMsgType::GRAPHENEBLOCK))
+            if (thinrelay.IsBlockInFlight(pnode, NetMsgType::GRAPHENEBLOCK, hash))
             {
                 graphenedata.UpdateResponseTime(nResponseTime);
             }
             // Update CompactBlock stats
-            if (thinrelay.IsBlockInFlight(pnode, NetMsgType::CMPCTBLOCK))
+            if (thinrelay.IsBlockInFlight(pnode, NetMsgType::CMPCTBLOCK, hash))
             {
                 compactdata.UpdateResponseTime(nResponseTime);
             }
@@ -1326,7 +1417,7 @@ bool CRequestManager::MarkBlockAsReceived(const uint256 &hash, CNode *pnode)
         if (state->vBlocksInFlight.begin() == itInFlight->second)
         {
             // First block on the queue was received, update the start download time for the next one
-            state->nDownloadingSince = std::max(state->nDownloadingSince, GetTimeMicros());
+            state->nDownloadingSince = std::max(state->nDownloadingSince, (int64_t)GetStopwatchMicros());
         }
         // In order to prevent a dangling iterator we must erase from vBlocksInFlight after mapBlockInFlight
         // however that will invalidate the iterator held by mapBlocksInFlight. Use a temporary to work around this.

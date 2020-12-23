@@ -29,6 +29,7 @@ import urllib.parse as urlparse
 import errno
 import logging
 import traceback
+from . import test_node
 
 from . import coverage
 from .authproxy import AuthServiceProxy, JSONRPCException
@@ -45,17 +46,18 @@ uBTC = 100
 # The maximum number of nodes a single test can spawn
 MAX_NODES = 8
 # Don't assign rpc or p2p ports lower than this
-PORT_MIN = 11000
+PORT_MIN = 5000
 # The number of ports to "reserve" for p2p and rpc, each
-PORT_RANGE = 5000
+PORT_RANGE = 30000
 
 debug_port_assignments = False
 
 class TimeoutException(Exception):
     pass
 
-def SetupPythonLogConfig():
+def SetupPythonLogConfig(levelStr=None):
     logOn = os.getenv("PYTHON_DEBUG")
+    if logOn==None: logOn=levelStr
     level = logging.ERROR
     if logOn=="ERROR":
         level = logging.ERROR
@@ -72,6 +74,7 @@ SetupPythonLogConfig()
 class UtilOptions:
     # this module-wide var is set from test_framework.py
     no_ipv6_rpc_listen = False
+    electrumexec = None
 
 BITCOIND_PROC_WAIT_TIMEOUT = 60
 
@@ -139,6 +142,21 @@ def waitFor(timeout, fn, onError="timeout in waitFor", sleepAmt=1.0):
         time.sleep(sleepAmt)
         timeout -= sleepAmt
 
+async def waitForAsync(timeout, fn, onError="timeout in waitFor", sleepAmt=1.0):
+    """  Repeatedly calls fn while it returns None, raising an assert after timeout.  If fn returns non None, return that result
+    """
+    timeout = float(timeout)
+    while 1:
+        result = await fn()
+        if not (result is None or result is False):
+            return result
+        if timeout <= 0:
+            if callable(onError):
+                onError = onError()
+            raise TimeoutException(onError)
+        time.sleep(sleepAmt)
+        timeout -= sleepAmt
+
 def expectException(fn, ExcType, comparison=None):
     try:
         fn()
@@ -196,6 +214,8 @@ def get_rpc_proxy(url, node_number, timeout=None, miningCapable=True):
 
     proxy = AuthServiceProxy(url, **proxy_kwargs)
     proxy.url = url  # store URL on proxy for info
+    proxy.nodeNumber = node_number
+    proxy.p2pPort = p2p_port(node_number)
 
     coverage_logfile = coverage.get_filename(
         COVERAGE_DIR, node_number) if COVERAGE_DIR else None
@@ -247,30 +267,84 @@ def hex_str_to_bytes(hex_str):
 def str_to_b64str(string):
     return b64encode(string.encode('utf-8')).decode('ascii')
 
-def sync_blocks(rpc_connections, wait=1,verbose=1):
+
+connectionTracking = False
+
+def setup_connection_tracking(rpc_connections):
+    global connectionTracking
+    for c in rpc_connections:
+        c.set("net.subversionOverride=%d" % c.auth_service_proxy_instance.nodeNumber)
+    connectionTracking = True
+
+# credit: https://www.python-course.eu/graphs_python.php
+def is_connected(gdict, vertices_encountered = None, start_vertex=None):
+        """ determines if the graph is connected """
+        if vertices_encountered is None:
+            vertices_encountered = set()
+        vertices = list(gdict.keys()) # "list" necessary in Python 3
+        if not start_vertex:
+            # chosse a vertex from graph as a starting point
+            start_vertex = vertices[0]
+        vertices_encountered.add(start_vertex)
+        if len(vertices_encountered) != len(vertices):
+            for vertex in gdict[start_vertex]:
+                if vertex not in vertices_encountered:
+                    if is_connected(gdict, vertices_encountered, vertex):
+                        return True
+        else:
+            return True
+        return False
+
+def sync_blocks(rpc_connections, *, wait=1, verbose=1, timeout=60):
     """
     Wait until everybody has the same block count
     """
-    while True:
+    iter=-1
+    stop_time = time.time() + timeout
+    while time.time() <= stop_time:
         counts = [ x.getblockcount() for x in rpc_connections ]
-        if verbose:
-            logging.info("sync blocks: " + str(counts))
         if counts == [ counts[0] ]*len(counts):
-            break
+            return
+        if verbose and iter>2:
+            logging.info("sync blocks (" + str(iter) +"): " + str(counts))
         time.sleep(wait)
+        iter+=1
+        if connectionTracking and iter&7==0:  # do some other checks to ensure that block sync is possible
+            cxnCount = 0
+            cnxns = [(x.url, x.get("net.subversionOverride")["net.subversionOverride"], x.getpeerinfo()) for x in rpc_connections]
+            graph = { }
+            cnxnCount = 0
+            interestingNodes=[]
+            for (url, node_idx, peers) in cnxns:  # We only care to check the nodes in our rpc_connections
+                interestingNodes.append(node_idx)
 
-def sync_blocks_to(height, rpc_connections, wait=1,verbose=1):
+            for (url, nodeIdx, peers) in cnxns:
+                connectedTo = []
+                for p in peers:
+                    peerIdx = p["subver"]
+                    if peerIdx in interestingNodes:
+                        connectedTo.append(peerIdx)
+                graph[nodeIdx] = connectedTo
+            if not is_connected(graph):
+                raise Exception('sync_blocks: bitcoind nodes cannot sync because they are not all connected.  Node connection graph: %s' % str(graph))
+    raise Exception('sync_blocks: blocks did not sync through various nodes before the timeout of %d seconds kicked in' % timeout)
+
+def sync_blocks_to(height, rpc_connections, *, wait=1, verbose=1, timeout=60):
     """
     Wait until all passed nodes have the passed "height" block count
     """
     heights = [ height ]*len(rpc_connections)
-    while True:
+    iter = 0
+    stop_time = time.time() + timeout
+    while time.time() <= stop_time:
         counts = [ x.getblockcount() for x in rpc_connections ]
-        if verbose:
-            logging.info("sync blocks to %d: %s" % (height, str(counts)))
         if counts == heights:
-            break
+            return
+        if verbose and iter>2:
+            logging.info("sync blocks (" + str(iter) + ") to %d: %s" % (height, str(counts)))
+        iter+=1
         time.sleep(wait)
+    raise Exception('sync_blocks_to: blocks did not sync through various nodes before the timeout of %d seconds kicked in' % timeout)
 
 def hub_is_running(node_num):
     """
@@ -324,7 +398,7 @@ def initialize_datadir(dirname, n, bitcoinConfDict=None, wallet=None, bins=None)
     rpc_u, rpc_p = rpc_auth_pair(n)
     defaults = {"server":1, "discover":0, "regtest":1,"rpcuser":"rt","rpcpassword":"rt",
                 "port":p2p_port(n),"rpcport":str(rpc_port(n)),"listenonion":0,"maxlimitertxfee":0,"usecashaddr":1,
-                "rpcuser":rpc_u, "rpcpassword":rpc_p, "bindallorfail" : 1}
+                "rpcuser":rpc_u, "rpcpassword":rpc_p, "bindallorfail" : 1, "minlimitertxfee":0, "limitfreerelay":15}
 
     # switch off default IPv6 listening port (for travis)
     if UtilOptions.no_ipv6_rpc_listen:
@@ -332,6 +406,15 @@ def initialize_datadir(dirname, n, bitcoinConfDict=None, wallet=None, bins=None)
             "rpcbind": "127.0.0.1",
             "rpcallowip" : "127.0.0.1"
             })
+
+    if UtilOptions.electrumexec is not None:
+        if not os.path.isfile(UtilOptions.electrumexec):
+            raise Exception("Electrum server path {} does not exist"
+                .format(UtilOptions.electrumexec))
+
+        defaults.update({
+            "electrum.exec": UtilOptions.electrumexec
+        })
 
     if bitcoinConfDict: defaults.update(bitcoinConfDict)
 
@@ -380,6 +463,7 @@ def wait_for_bitcoind_start(process, url, i):
     Wait for bitcoind to start. This means that RPC is accessible and fully initialized.
     Raise an exception if bitcoind exits during initialization.
     '''
+    rpc = None
     while True:
         if process.poll() is not None:
             raise Exception('bitcoind exited with status %i during initialization' % process.returncode)
@@ -394,6 +478,7 @@ def wait_for_bitcoind_start(process, url, i):
             if e.error['code'] != -28: # RPC in warmup?
                 raise # unkown JSON RPC exception
         time.sleep(0.25)
+    return rpc
 
 def initialize_chain(test_dir,bitcoinConfDict=None,wallets=None, bins=None):
     """
@@ -437,6 +522,7 @@ def initialize_chain(test_dir,bitcoinConfDict=None,wallets=None, bins=None):
                     do_and_ignore_failure(lambda x: bitcoind_processes[i].kill())
                     traceback.print_exc(file=sys.stdout)
                     remap_ports(i)
+                    fixup_ports_in_configfile(i)
             else:
                 raise Exception("Couldn't start bitcoind even with retries on different ports (initialize_chain).")
 
@@ -553,7 +639,7 @@ def start_node(i, dirname, extra_args=None, rpchost=None, timewait=None, binary=
     if COVERAGE_DIR:
         coverage.write_all_rpc_commands(COVERAGE_DIR, proxy)
 
-    return proxy
+    return test_node.TestNode(proxy, datadir)
 
 def start_nodes(num_nodes, dirname, extra_args=None, rpchost=None, binary=None,timewait=None):
     """
@@ -561,14 +647,55 @@ def start_nodes(num_nodes, dirname, extra_args=None, rpchost=None, binary=None,t
     """
     if extra_args is None: extra_args = [ None for _ in range(num_nodes) ]
     if binary is None: binary = [ None for _ in range(num_nodes) ]
-    rpcs = []
-    try:
-        for i in range(num_nodes):
-            rpcs.append(start_node(i, dirname, extra_args[i], rpchost, binary=binary[i],timewait=timewait))
-    except: # If one node failed to start, stop the others
+
+    def start(i):
+        if binary[i] is None:
+            bin = os.getenv("BITCOIND", "bitcoind")
+        else:
+            bin = binary[i]
+        datadir = os.path.join(dirname, "node"+str(i))
+        # RPC tests still depend on free transactions
+        args = [ bin, "-datadir="+datadir, "-rest", "-mocktime="+str(get_mocktime()) ] # // BU removed, "-keypool=1","-blockprioritysize=50000" ]
+        if extra_args[i] is not None: args.extend(extra_args[i])
+
+        process = subprocess.Popen(args)
+        logging.info("Started '%s' %d as pid %d at %s dir %s  " % (" ".join(args), i, process.pid, "127.0.0.1:"+str(p2p_port(i)), datadir))
+        return(process,datadir)
+
+    rpcs = [None]*num_nodes
+    datadir = [None]*num_nodes
+    retry = 0
+    while retry < 4:
+        retry+=1
+        workingOn = 0
+        try:
+            for i in range(num_nodes):
+                if not i in bitcoind_processes:
+                    tmp = start(i)
+                    bitcoind_processes[i] = tmp[0]
+                    datadir[i] = tmp[1]
+
+            for i in range(num_nodes):
+                workingOn = i
+                url = rpc_url(i, rpchost)
+                rpcs[i] = wait_for_bitcoind_start(bitcoind_processes[i], url, i)
+                # log all the info you need for debugging access
+                logging.info("bitcoind %d startup complete" % i)
+            break
+        except Exception as exc:
+                # this may not be an error because every once in a while bitcoind uses a port that's already in use.
+                logging.error("Error bringing up bitcoind #%d, this might be retried. Problem is: %s", workingOn, str(exc))
+                do_and_ignore_failure(lambda x: bitcoind_processes[workingOn].kill())
+                # commented out because looks like an error: traceback.print_exc(file=sys.stdout)
+                remap_ports(workingOn)
+                fixup_ports_in_configfile(workingOn)
+                del bitcoind_processes[workingOn]
+
+    if retry == 4:
         stop_nodes(rpcs)
-        raise
-    return rpcs
+        raise Exception("all nodes did not start")
+
+    return [test_node.TestNode(r,d) for (r,d) in zip(rpcs,datadir)]
 
 def node_regtest_dir(dirname, n_node):
     return os.path.join(dirname, "node"+str(n_node), "regtest")
@@ -603,6 +730,10 @@ def wait_bitcoinds():
         bitcoind.wait(timeout=BITCOIND_PROC_WAIT_TIMEOUT)
     bitcoind_processes.clear()
 
+def is_bitcoind_running(i):
+    assert i in bitcoind_processes
+    return bitcoind_processes[i].poll() is None
+
 def connect_nodes(from_connection, node_num_or_str):
     """Connect the passed node to another node specified either by node index or by ip address:port string
     """
@@ -634,7 +765,10 @@ def disconnect_all(node):
     """Disconnect all peers from the passed node"""
     peers = node.getpeerinfo()
     for p in peers:
-        node.disconnectnode(p["addr"])
+        try:
+            node.disconnectnode(p["addr"])
+        except JSONRPCException as e:  # exception thrown if node is already disconnected so ignore since the intention is to disconnect
+            pass
     while len(node.getpeerinfo())!=0:
         time.sleep(0.1)
 
@@ -861,8 +995,12 @@ def assert_not_equal(thing1, thing2):
     if thing1 == thing2:
         raise AssertionError("%s != %s"%(str(thing1),str(thing2)))
 
-def assert_equal(thing1, thing2):
+def assert_equal(thing1, thing2, doit=None):
     if thing1 != thing2:
+        if doit != None:
+            doit()
+        logging.error("assert_equal failed: %s != %s"%(str(thing1),str(thing2)))
+        logging.error(traceback.format_exc())
         raise AssertionError("%s != %s"%(str(thing1),str(thing2)))
 
 def assert_greater_than(thing1, thing2):
@@ -872,6 +1010,16 @@ def assert_greater_than(thing1, thing2):
 def assert_raises(exc, fun, *args, **kwds):
     try:
         fun(*args, **kwds)
+    except exc:
+        pass
+    except Exception as e:
+        raise AssertionError("Unexpected exception raised: "+type(e).__name__)
+    else:
+        raise AssertionError("No exception raised")
+
+async def assert_raises_async(exc, fun, *args, **kwds):
+    try:
+        await fun(*args, **kwds)
     except exc:
         pass
     except Exception as e:
@@ -909,10 +1057,11 @@ def try_rpc(code, message, fun, *args, **kwds):
         # JSONRPCException was thrown as expected. Check the code and message values are correct.
         if (code is not None) and (code != e.error["code"]):
             raise AssertionError(
-                "Unexpected JSONRPC error code %i" % e.error["code"])
+                "Unexpected JSONRPC error code %i (%s)" % (e.error["code"], str(e)))
         if (message is not None) and (message not in e.error['message']):
             raise AssertionError(
-                "Expected substring not found:" + e.error['message'])
+                "Expected substring '{}' not found in '{}'".format(
+                    message, e.error['message']))
         return True
     except Exception as e:
         raise AssertionError(
@@ -1094,10 +1243,21 @@ def findBitcoind():
         objpath = os.path.dirname(env)
     return objpath
 
+def waitForBlockInChainTips(node, blockHash, timeout=30):
+    """Waits for a block to appear in the chaintip list.  Returns None if timeout or that block's chaintip data"""
+    start = time.time()
+    while time.time < start+timeout:
+        gct = node.getchaintips()
+        for t in gct:
+            if t["hash"] == blockHash:
+                return t
+        time.sleep(1)
+    raise AssertionError("block %s never appeared in chain tips" % str(blockHash))
+
 def standardFlags():
     flags = [] # ["--nocleanup", "--noshutdown"]
     if os.path.isdir("/ramdisk/test"):
-        flags.append("--tmppfx=/ramdisk/test")
+        flags.append("--tmpdir=/ramdisk/test/t")
     binpath = findBitcoind()
     flags.append("--srcdir=%s" % binpath)
     return flags

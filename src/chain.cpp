@@ -1,6 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2014 The Bitcoin Core developers
-// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -14,6 +14,7 @@ using namespace std;
  */
 void CChain::SetTip(CBlockIndex *pindex)
 {
+    WRITELOCK(cs_chainLock);
     if (pindex == nullptr)
     {
         vChain.clear();
@@ -35,6 +36,7 @@ CBlockLocator CChain::GetLocator(const CBlockIndex *pindex) const
     std::vector<uint256> vHave;
     vHave.reserve(32);
 
+    READLOCK(cs_chainLock);
     if (!pindex)
         pindex = Tip();
     while (pindex)
@@ -45,10 +47,10 @@ CBlockLocator CChain::GetLocator(const CBlockIndex *pindex) const
             break;
         // Exponentially larger steps back, plus the genesis block.
         int nHeight = std::max(pindex->nHeight - nStep, 0);
-        if (Contains(pindex))
+        if (_Contains(pindex))
         {
             // Use O(1) CChain index if possible.
-            pindex = (*this)[nHeight];
+            pindex = _idx(nHeight);
         }
         else
         {
@@ -64,13 +66,14 @@ CBlockLocator CChain::GetLocator(const CBlockIndex *pindex) const
 
 const CBlockIndex *CChain::FindFork(const CBlockIndex *pindex) const
 {
-    if (pindex == NULL)
+    READLOCK(cs_chainLock);
+    if (pindex == nullptr)
     {
-        return NULL;
+        return nullptr;
     }
     if (pindex->nHeight > Height())
         pindex = pindex->GetAncestor(Height());
-    while (pindex && !Contains(pindex))
+    while (pindex && !_Contains(pindex))
         pindex = pindex->pprev;
     return pindex;
 }

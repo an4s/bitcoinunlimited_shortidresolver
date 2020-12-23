@@ -1,6 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -75,7 +75,7 @@ public:
     /* Below flags apply in the context of BIP 68*/
     /* If this flag set, CTxIn::nSequence is NOT interpreted as a
      * relative lock-time. */
-    static const uint32_t SEQUENCE_LOCKTIME_DISABLE_FLAG = (1 << 31);
+    static const uint32_t SEQUENCE_LOCKTIME_DISABLE_FLAG = (1U << 31);
 
     /* If CTxIn::nSequence encodes a relative lock-time and this flag
      * is set, the relative lock-time has units of 512 seconds,
@@ -290,6 +290,22 @@ struct CMutableTransaction
      * fly, as opposed to GetHash() in CTransaction, which uses a cached result.
      */
     uint256 GetHash() const;
+};
+
+/** Properties of a transaction that are discovered during tx evaluation */
+class CTxProperties
+{
+public:
+    uint64_t countWithAncestors = 0;
+    uint64_t sizeWithAncestors = 0;
+    uint64_t countWithDescendants = 0;
+    uint64_t sizeWithDescendants = 0;
+    CTxProperties() {}
+    CTxProperties(uint64_t ancestorCount, uint64_t ancestorSize, uint64_t descendantCount, uint64_t descendantSize)
+        : countWithAncestors(ancestorCount), sizeWithAncestors(ancestorSize), countWithDescendants(descendantCount),
+          sizeWithDescendants(descendantSize)
+    {
+    }
 };
 
 typedef std::shared_ptr<const CTransaction> CTransactionRef;

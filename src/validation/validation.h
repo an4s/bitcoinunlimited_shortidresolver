@@ -12,8 +12,11 @@
 #include "consensus/validation.h"
 #include "forks.h"
 #include "parallel.h"
+#include "txdebugger.h"
 #include "txmempool.h"
 #include "versionbits.h"
+
+extern std::atomic<uint64_t> nBlockSizeAtChainTip;
 
 enum DisconnectResult
 {
@@ -55,7 +58,7 @@ void CheckBlockIndex(const Consensus::Params &consensusParams);
 
 /**
  * Check whether all inputs of this transaction are valid (no double spends, scripts & sigs, amounts)
- * This does not modify the UTXO set. If pvChecks is not NULL, script checks are pushed onto it
+ * This does not modify the UTXO set. If pvChecks is not nullptr, script checks are pushed onto it
  * instead of being performed inline.
  */
 bool CheckInputs(const CTransactionRef &tx,
@@ -67,7 +70,8 @@ bool CheckInputs(const CTransactionRef &tx,
     bool cacheStore,
     ValidationResourceTracker *resourceTracker,
     std::vector<CScriptCheck> *pvChecks = nullptr,
-    unsigned char *sighashType = nullptr);
+    unsigned char *sighashType = nullptr,
+    CValidationDebugger *debugger = nullptr);
 
 /** Remove invalidity status from a block and its descendants. */
 bool ReconsiderBlock(CValidationState &state, CBlockIndex *pindex);
@@ -96,10 +100,7 @@ bool InvalidateBlock(CValidationState &state, const Consensus::Params &consensus
 void InvalidChainFound(CBlockIndex *pindexNew);
 
 /** Context-dependent validity block checks */
-bool ContextualCheckBlock(const CBlock &block,
-    CValidationState &state,
-    CBlockIndex *pindexPrev,
-    const bool fConservative = false);
+bool ContextualCheckBlock(const CBlock &block, CValidationState &state, CBlockIndex *pindexPrev);
 
 // BU: returns the blocksize if block is valid.  Otherwise 0
 bool CheckBlock(const CBlock &block, CValidationState &state, bool fCheckPOW = true, bool fCheckMerkleRoot = true);
@@ -109,6 +110,8 @@ bool ReceivedBlockTransactions(const CBlock &block,
     CValidationState &state,
     CBlockIndex *pindexNew,
     const CDiskBlockPos &pos);
+
+uint32_t GetBlockScriptFlags(const CBlockIndex *pindex, const Consensus::Params &consensusparams);
 
 /** Undo the effects of this block (with given index) on the UTXO set represented by coins.
  *  In case pfClean is provided, operation will try to be tolerant about errors, and *pfClean
@@ -132,7 +135,8 @@ bool DisconnectTip(CValidationState &state, const Consensus::Params &consensusPa
 bool ActivateBestChain(CValidationState &state,
     const CChainParams &chainparams,
     const CBlock *pblock = nullptr,
-    bool fParallel = false);
+    bool fParallel = false,
+    CNode *pfrom = nullptr);
 
 /**
  * Process an incoming block. This only returns after the best known valid
@@ -159,5 +163,8 @@ bool ProcessNewBlock(CValidationState &state,
     bool fForceProcessing,
     CDiskBlockPos *dbp,
     bool fParallel);
+
+//! Check whether the block associated with this index entry is pruned or not.
+bool IsBlockPruned(const CBlockIndex *pblockindex);
 
 #endif

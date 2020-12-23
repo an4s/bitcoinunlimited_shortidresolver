@@ -1,6 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
 // Copyright (c) 2009-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2018 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -247,6 +247,8 @@ void LogInit()
 const char *const BITCOIN_CONF_FILENAME = "bitcoin.conf";
 const char *const BITCOIN_PID_FILENAME = "bitcoind.pid";
 const char *const FORKS_CSV_FILENAME = "forks.csv"; // bip135 added
+// Application startup time (used for uptime calculation)
+const int64_t nStartupTime = GetTime();
 
 std::map<std::string, std::string> mapArgs;
 std::map<std::string, std::vector<std::string> > mapMultiArgs;
@@ -265,16 +267,16 @@ CTranslationInterface translationInterface;
 // None of this is needed with OpenSSL 1.1.0
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
 /** Init OpenSSL library multithreading support */
-static CCriticalSection **ppmutexOpenSSL;
+static std::mutex **ppmutexOpenSSL;
 void locking_callback(int mode, int i, const char *file, int line) NO_THREAD_SAFETY_ANALYSIS
 {
     if (mode & CRYPTO_LOCK)
     {
-        ENTER_CRITICAL_SECTION(*ppmutexOpenSSL[i]);
+        (*ppmutexOpenSSL[i]).lock();
     }
     else
     {
-        LEAVE_CRITICAL_SECTION(*ppmutexOpenSSL[i]);
+        (*ppmutexOpenSSL[i]).unlock();
     }
 }
 #endif
@@ -287,9 +289,9 @@ public:
     {
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
         // Init OpenSSL library multithreading support
-        ppmutexOpenSSL = (CCriticalSection **)OPENSSL_malloc(CRYPTO_num_locks() * sizeof(CCriticalSection *));
+        ppmutexOpenSSL = (std::mutex **)OPENSSL_malloc(CRYPTO_num_locks() * sizeof(std::mutex *));
         for (int i = 0; i < CRYPTO_num_locks(); i++)
-            ppmutexOpenSSL[i] = new CCriticalSection();
+            ppmutexOpenSSL[i] = new std::mutex();
         CRYPTO_set_locking_callback(locking_callback);
 
         // OpenSSL can optionally load a config file which lists optional loadable modules and engines.
@@ -316,7 +318,7 @@ public:
         // Securely erase the memory used by the PRNG
         RAND_cleanup();
         // Shutdown OpenSSL library multithreading support
-        CRYPTO_set_locking_callback(NULL);
+        CRYPTO_set_locking_callback(nullptr);
         for (int i = 0; i < CRYPTO_num_locks(); i++)
             delete ppmutexOpenSSL[i];
         OPENSSL_free(ppmutexOpenSSL);
@@ -353,14 +355,14 @@ std::once_flag debugPrintInitFlag;
  * the OS/libc. When the shutdown sequence is fully audited and
  * tested, explicit destruction of these objects can be implemented.
  */
-static FILE *fileout = NULL;
-static boost::mutex *mutexDebugLog = NULL;
+static FILE *fileout = nullptr;
+static boost::mutex *mutexDebugLog = nullptr;
 static std::list<std::string> *vMsgsBeforeOpenLog;
 
 static int FileWriteStr(const std::string &str, FILE *fp) { return fwrite(str.data(), 1, str.size(), fp); }
 static void DebugPrintInit()
 {
-    assert(mutexDebugLog == NULL);
+    assert(mutexDebugLog == nullptr);
     mutexDebugLog = new boost::mutex();
     vMsgsBeforeOpenLog = new std::list<std::string>;
 }
@@ -370,13 +372,13 @@ void OpenDebugLog()
     std::call_once(debugPrintInitFlag, &DebugPrintInit);
     boost::mutex::scoped_lock scoped_lock(*mutexDebugLog);
 
-    assert(fileout == NULL);
+    assert(fileout == nullptr);
     assert(vMsgsBeforeOpenLog);
     fs::path pathDebug = GetDataDir() / "debug.log";
     fileout = fsbridge::fopen(pathDebug, "a");
     if (fileout)
     {
-        setbuf(fileout, NULL); // unbuffered
+        setbuf(fileout, nullptr); // unbuffered
         // dump buffered messages from before we opened the log
         while (!vMsgsBeforeOpenLog->empty())
         {
@@ -386,7 +388,7 @@ void OpenDebugLog()
     }
 
     delete vMsgsBeforeOpenLog;
-    vMsgsBeforeOpenLog = NULL;
+    vMsgsBeforeOpenLog = nullptr;
 }
 
 /** All logs are automatically CR terminated.  If you want to construct a single-line log out of multiple calls, don't.
@@ -458,13 +460,13 @@ int LogPrintStr(const std::string &str)
         ret = fwrite(strTimestamped.data(), 1, strTimestamped.size(), stdout);
         fflush(stdout);
     }
-    else if (fPrintToDebugLog)
+    if (fPrintToDebugLog)
     {
         std::call_once(debugPrintInitFlag, &DebugPrintInit);
         boost::mutex::scoped_lock scoped_lock(*mutexDebugLog);
 
         // buffer if we haven't opened the log yet
-        if (fileout == NULL)
+        if (fileout == nullptr)
         {
             assert(vMsgsBeforeOpenLog);
             ret = strTimestamped.length();
@@ -477,8 +479,8 @@ int LogPrintStr(const std::string &str)
             {
                 fReopenDebugLog = false;
                 fs::path pathDebug = GetDataDir() / "debug.log";
-                if (fsbridge::freopen(pathDebug, "a", fileout) != NULL)
-                    setbuf(fileout, NULL); // unbuffered
+                if (fsbridge::freopen(pathDebug, "a", fileout) != nullptr)
+                    setbuf(fileout, nullptr); // unbuffered
             }
 
             ret = FileWriteStr(strTimestamped, fileout);
@@ -508,7 +510,7 @@ std::string formatInfoUnit(double value)
 static const std::set<std::string> affirmativeStrings{"", "1", "t", "y", "true", "yes"};
 
 /** Interpret string as boolean, for argument parsing */
-static bool InterpretBool(const std::string &strValue) { return (affirmativeStrings.count(strValue) != 0); }
+bool InterpretBool(const std::string &strValue) { return (affirmativeStrings.count(strValue) != 0); }
 /** Turn -noX into -X=0 */
 static void InterpretNegativeSetting(std::string &strKey, std::string &strValue)
 {
@@ -568,6 +570,13 @@ int64_t GetArg(const std::string &strArg, int64_t nDefault)
     return nDefault;
 }
 
+double GetDoubleArg(const std::string &strArg, double dDefault)
+{
+    if (mapArgs.count(strArg))
+        return atof(mapArgs[strArg].c_str()); // returns 0.0 on conversion failure
+    return dDefault;
+}
+
 bool GetBoolArg(const std::string &strArg, bool fDefault)
 {
     if (mapArgs.count(strArg))
@@ -578,6 +587,7 @@ bool GetBoolArg(const std::string &strArg, bool fDefault)
 // You can set the args directly, using SetArg which always will update the value or you can use
 // SoftSetArg which will only set the value if it hasn't already been set and return success/fail.
 void SetArg(const std::string &strArg, const std::string &strValue) { mapArgs[strArg] = strValue; }
+void UnsetArg(const std::string &strArg) { mapArgs.erase(strArg); }
 void SetBoolArg(const std::string &strArg, bool fValue)
 {
     if (fValue)
@@ -604,7 +614,7 @@ static std::string FormatException(const std::exception *pex, const char *pszThr
 {
 #ifdef WIN32
     char pszModule[MAX_PATH] = "";
-    GetModuleFileNameA(NULL, pszModule, sizeof(pszModule));
+    GetModuleFileNameA(nullptr, pszModule, sizeof(pszModule));
 #else
     const char *pszModule = "bitcoin";
 #endif
@@ -634,7 +644,7 @@ fs::path GetDefaultDataDir()
 #else
     fs::path pathRet;
     char *pszHome = getenv("HOME");
-    if (pszHome == NULL || strlen(pszHome) == 0)
+    if (pszHome == nullptr || strlen(pszHome) == 0)
         pathRet = fs::path("/");
     else
         pathRet = fs::path(pszHome);
@@ -922,7 +932,7 @@ void ShrinkDebugFile()
             fclose(file);
         }
     }
-    else if (file != NULL)
+    else if (file != nullptr)
         fclose(file);
 }
 
@@ -931,7 +941,7 @@ fs::path GetSpecialFolderPath(int nFolder, bool fCreate)
 {
     char pszPath[MAX_PATH] = "";
 
-    if (SHGetSpecialFolderPathA(NULL, pszPath, nFolder, fCreate))
+    if (SHGetSpecialFolderPathA(nullptr, pszPath, nFolder, fCreate))
     {
         return fs::path(pszPath);
     }
@@ -1022,6 +1032,8 @@ std::string CopyrightHolders(const std::string &strPrefix)
     return strCopyrightHolders;
 }
 
+// Obtain the application startup time (used for uptime calculation)
+int64_t GetStartupTime() { return nStartupTime; }
 bool IsStringTrue(const std::string &str)
 {
     static const std::set<std::string> strOn = {"enable", "1", "true", "True", "on"};

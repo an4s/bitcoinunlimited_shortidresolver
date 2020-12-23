@@ -1,11 +1,12 @@
 // Copyright (c) 2017 Stephen McCarthy
-// Copyright (c) 2017-2018 The Bitcoin Unlimited developers
+// Copyright (c) 2017-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <set>
 
 #include "allowed_args.h"
+#include "bench/bench_constants.h"
 #include "blockstorage/blockstorage.h"
 #include "chainparams.h"
 #include "dosman.h"
@@ -22,6 +23,7 @@
 #include "tinyformat.h"
 #include "torcontrol.h"
 #include "tweak.h"
+#include "txadmission.h"
 #include "txdb.h"
 #include "util.h"
 #include "utilmoneystr.h"
@@ -547,19 +549,19 @@ static void addDebuggingOptions(AllowedArgs &allowedArgs, HelpMessageMode mode)
             strprintf("Stop running after importing blocks from disk (default: %u)", DEFAULT_STOPAFTERBLOCKIMPORT))
         .addDebugArg("limitancestorcount=<n>", requiredInt,
             strprintf("Do not accept transactions if number of in-mempool ancestors is <n> or more (default: %u)",
-                         DEFAULT_ANCESTOR_LIMIT))
+                         BU_DEFAULT_ANCESTOR_LIMIT))
         .addDebugArg(
             "limitancestorsize=<n>", requiredInt, strprintf("Do not accept transactions whose size with all in-mempool "
                                                             "ancestors exceeds <n> kilobytes (default: %u)",
-                                                      DEFAULT_ANCESTOR_SIZE_LIMIT))
+                                                      BU_DEFAULT_ANCESTOR_SIZE_LIMIT))
         .addDebugArg(
             "limitdescendantcount=<n>", requiredInt, strprintf("Do not accept transactions if any ancestor would have "
                                                                "<n> or more in-mempool descendants (default: %u)",
-                                                         DEFAULT_DESCENDANT_LIMIT))
+                                                         BU_DEFAULT_DESCENDANT_LIMIT))
         .addDebugArg("limitdescendantsize=<n>", requiredInt,
             strprintf("Do not accept transactions if any ancestor would have more than <n> kilobytes of in-mempool "
                       "descendants (default: %u).",
-                         DEFAULT_DESCENDANT_SIZE_LIMIT))
+                         BU_DEFAULT_DESCENDANT_SIZE_LIMIT))
         .addArg("debug=<category>", optionalStr,
             strprintf(_("Output debugging information (default: %u, supplying <category> is optional)"), 0) + ". " +
                 _("If <category> is not supplied or if <category> = 1, output all debugging information. ") +
@@ -592,6 +594,7 @@ static void addDebuggingOptions(AllowedArgs &allowedArgs, HelpMessageMode mode)
         .addDebugArg("printpriority", optionalBool,
             strprintf("Log transaction priority and fee per kB when mining blocks (default: %u)",
                          DEFAULT_PRINTPRIORITY))
+        .addDebugArg("printtologfile", optionalBool, "Write log to debug.log")
 #ifdef ENABLE_WALLET
         .addDebugArg("privdb", optionalBool,
             strprintf("Sets the DB_PRIVATE flag in the wallet db environment (default: %u)", DEFAULT_WALLET_PRIVDB),
@@ -661,6 +664,9 @@ static void addNodeRelayOptions(AllowedArgs &allowedArgs)
         .addArg("use-compactblocks", optionalBool,
             strprintf(_("Enable compact blocks to speed up the relay of blocks (default: %d)"),
                     DEFAULT_USE_COMPACT_BLOCKS))
+        .addArg("use-xversion", optionalBool,
+            strprintf(_("Enable extended versioning during node handshake (xversion) (default: %d)"),
+                    DEFAULT_USE_XVERSION))
         .addArg("preferential-timer=<millisec>", requiredInt,
             strprintf(_("Set graphene, thinblock and compactblock preferential timer duration (default: %u). Use 0 to "
                         "disable it."),
@@ -719,7 +725,13 @@ static void addElectrumOptions(AllowedArgs &allowedArgs)
         .addArg("electrum.dir", requiredStr, "Data directory for electrum database")
         .addArg("electrum.port", requiredStr, "Port electrum RPC listens on (default: mainnet 50001, testnet: 60001")
         .addArg("electrum.host", requiredStr, "Host electrum RPC listens on (default: 127.0.0.1)")
-        .addArg("electrum.addr.limit", requiredStr, "Max txs to look up per address (default: 500)")
+        .addArg("electrum.rawarg", optionalStr,
+            "Raw argument to pass directly to underlying electrum daemon "
+            "(example: -electrum.rawarg=\"--server-banner=\\\"Welcome to my server!\\\"\"). "
+            "This option can be specified multiple times.")
+        .addArg("electrum.shutdownonerror", optionalBool, "Shutdown if the electrum server exits unexpectedly")
+        .addArg("electrum.blocknotify", optionalBool, "Instantly notify electrum server of new blocks. "
+                                                      "Must only be used with ElectrsCash 2.0.0 or later")
         .addDebugArg("electrum.exec", requiredStr, "Path to electrum daemon executable")
         .addDebugArg("electrum.monitoring.port", requiredStr, "Port to bind monitoring service")
         .addDebugArg("electrum.monitoring.host", requiredStr, "Host to bind monitoring service")
@@ -814,6 +826,31 @@ BitcoinCli::BitcoinCli() : AllowedArgs(true)
         .addArg("stdin", optionalBool, _("Read extra arguments from standard input, one per line until EOF/Ctrl-D "
                                          "(recommended for sensitive information such as passphrases)"));
 }
+
+BitcoinBench::BitcoinBench() : AllowedArgs(true)
+{
+    addHelpOptions(*this);
+
+    addHeader("Bitcoin Bench options:")
+        .addArg("-list", ::AllowedArgs::optionalStr,
+            "List benchmarks without executing them. Can be combined with -scaling and -filter")
+        .addArg("-evals=<n>", ::AllowedArgs::requiredInt,
+            strprintf("Number of measurement evaluations to perform. (default: %u)", DEFAULT_BENCH_EVALUATIONS))
+        .addArg("-filter=<regex>", ::AllowedArgs::requiredInt,
+            strprintf("Regular expression filter to select benchmark by name (default: %s)", DEFAULT_BENCH_FILTER))
+        .addArg("-scaling=<n>", ::AllowedArgs::requiredInt,
+            strprintf("Scaling factor for benchmark's runtime (default: %u)", DEFAULT_BENCH_SCALING))
+        .addArg("-printer=(console|plot)", ::AllowedArgs::requiredStr,
+            strprintf("Choose printer format. console: print data to console. plot: Print results as HTML graph "
+                      "(default: %s)",
+                    DEFAULT_BENCH_PRINTER))
+        .addArg("-plot-plotlyurl=<uri>", ::AllowedArgs::requiredInt,
+            strprintf("URL to use for plotly.js (default: %s)", DEFAULT_PLOT_PLOTLYURL))
+        .addArg("-plot-width=<x>", ::AllowedArgs::requiredInt,
+            strprintf("Plot width in pixel (default: %u)", DEFAULT_PLOT_WIDTH))
+        .addArg("-plot-height=<x>", ::AllowedArgs::requiredInt,
+            strprintf("Plot height in pixel (default: %u)", DEFAULT_PLOT_HEIGHT));
+};
 
 Bitcoind::Bitcoind(CTweakMap *pTweaks) : AllowedArgs(false) { addAllNodeOptions(*this, HMM_BITCOIND, pTweaks); }
 BitcoinQt::BitcoinQt(CTweakMap *pTweaks) : AllowedArgs(false) { addAllNodeOptions(*this, HMM_BITCOIN_QT, pTweaks); }

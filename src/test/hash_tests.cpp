@@ -1,9 +1,9 @@
 // Copyright (c) 2013-2015 The Bitcoin Core developers
-// Copyright (c) 2015-2017 The Bitcoin Unlimited developers
+// Copyright (c) 2015-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include "hash.h"
+#include "hashwrapper.h"
 #include "random.h"
 #include "test/test_bitcoin.h"
 #include "utilstrencodings.h"
@@ -136,7 +136,7 @@ BOOST_AUTO_TEST_CASE(siphash)
     {
         uint64_t k1 = ctx.rand64();
         uint64_t k2 = ctx.rand64();
-        uint256 x = GetRandHash();
+        uint256 x = InsecureRand256();
         uint32_t n = ctx.rand32();
         uint8_t nb[4];
         WriteLE32(nb, n);

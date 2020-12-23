@@ -1,13 +1,20 @@
-// Copyright (c) 2018 The Bitcoin Unlimited developers
+// Copyright (c) 2018-2019 The Bitcoin Unlimited developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include "blockrelay/blockrelay_common.h"
+#include "blockrelay/graphene.h"
 #include "net.h"
 #include "random.h"
 #include "requestManager.h"
 #include "sync.h"
 #include "util.h"
+
+// When a node disconnects it may not be removed from the peer tracking sets immediately and so the size
+// of those sets could temporarily rise above the maxiumum number of connections.  This padding prevents
+// us from asserting in debug mode when a node or group of nodes drops off suddenly while another set
+// of nodes is connecting.
+static unsigned int NODE_PADDING = 5;
 
 bool IsThinBlockEnabled();
 bool IsGrapheneBlockEnabled();
@@ -16,34 +23,61 @@ bool IsCompactBlocksEnabled();
 // Update the counters for how many peers we have connected.
 void ThinTypeRelay::AddPeers(CNode *pfrom)
 {
+    LOCK(cs_addpeers);
+
+    // Don't allow the set sizes to grow unbounded.  They should never be greater
+    // than the number of peers connected.  If this should happen we'll just stop
+    // adding them and return, but if running a debug build we'll assert.
+    uint32_t nNodes = nMaxConnections + NODE_PADDING;
+    DbgAssert(setThinBlockPeers.size() <= nNodes, return );
+    DbgAssert(setGraphenePeers.size() <= nNodes, return );
+    if (setThinBlockPeers.size() > nNodes || setGraphenePeers.size() > nNodes)
+        return;
+
+    // Update the counters
     if (pfrom)
     {
         if (pfrom->nServices & NODE_XTHIN)
-            nThinBlockPeers++;
+            setThinBlockPeers.insert(pfrom->GetId());
         if (pfrom->nServices & NODE_GRAPHENE)
-            nGraphenePeers++;
+            setGraphenePeers.insert(pfrom->GetId());
     }
+    nThinBlockPeers = setThinBlockPeers.size();
+    nGraphenePeers = setGraphenePeers.size();
 }
 void ThinTypeRelay::AddCompactBlockPeer(CNode *pfrom)
 {
+    LOCK(cs_addpeers);
+
+    // Don't allow the set sizes to grow unbounded.  They should never be greater
+    // than the number of peers connected.  If this should happen we'll just stop
+    // adding them and return, but if running a debug build we'll assert.
+    uint32_t nNodes = nMaxConnections + NODE_PADDING;
+    DbgAssert(setCompactBlockPeers.size() <= nNodes, return );
+    if (setCompactBlockPeers.size() > nNodes)
+        return;
+
     if (pfrom && pfrom->fSupportsCompactBlocks)
-        nCompactBlockPeers++;
+    {
+        setCompactBlockPeers.insert(pfrom->GetId());
+    }
+    nCompactBlockPeers = setCompactBlockPeers.size();
 }
 void ThinTypeRelay::RemovePeers(CNode *pfrom)
 {
+    LOCK(cs_addpeers);
     if (pfrom)
     {
         if (pfrom->nServices & NODE_XTHIN)
-            nThinBlockPeers--;
+            setThinBlockPeers.erase(pfrom->GetId());
         if (pfrom->nServices & NODE_GRAPHENE)
-            nGraphenePeers--;
+            setGraphenePeers.erase(pfrom->GetId());
         if (pfrom->fSupportsCompactBlocks)
-            nCompactBlockPeers--;
-
-        DbgAssert(nThinBlockPeers >= 0, nThinBlockPeers = 0);
-        DbgAssert(nGraphenePeers >= 0, nGraphenePeers = 0);
-        DbgAssert(nCompactBlockPeers >= 0, nCompactBlockPeers = 0);
+            setCompactBlockPeers.erase(pfrom->GetId());
     }
+    nThinBlockPeers = setThinBlockPeers.size();
+    nGraphenePeers = setGraphenePeers.size();
+    nCompactBlockPeers = setCompactBlockPeers.size();
 }
 
 // Preferential Block Relay Timer:
@@ -109,6 +143,9 @@ bool ThinTypeRelay::HasBlockRelayTimerExpired(const uint256 &hash)
 
 bool ThinTypeRelay::IsBlockRelayTimerEnabled()
 {
+    if (GetArg("-preferential-timer", DEFAULT_PREFERENTIAL_TIMER) == 0)
+        return false;
+
     // Only engage the timer if one or more, but not all, thin type relays are active.
     // If all types are active, or all inactive, then we do not need the timer.
     // Generally speaking all types will be active and we can return early.
@@ -136,107 +173,167 @@ void ThinTypeRelay::ClearBlockRelayTimer(const uint256 &hash)
     }
 }
 
-bool ThinTypeRelay::IsBlockInFlight(CNode *pfrom, const std::string thinType)
+bool ThinTypeRelay::AreTooManyBlocksInFlight()
 {
+    // check if we've exceed the max thintype blocks in flight allowed.
     LOCK(cs_inflight);
-    // first check that we are in bounds.
-    if (mapThinTypeBlocksInFlight.size() >= MAX_THINTYPE_BLOCKS_IN_FLIGHT)
-        return true;
-
-    // check if this node already has this thinType of block in flight.
-    std::pair<std::multimap<const NodeId, CThinTypeBlockInFlight>::iterator,
-        std::multimap<const NodeId, CThinTypeBlockInFlight>::iterator>
-        range = mapThinTypeBlocksInFlight.equal_range(pfrom->GetId());
-    while (range.first != range.second)
+    size_t mapSize = 0;
+    for (auto &entry : mapThinTypeBlocksInFlight)
     {
-        if (range.first->second.thinType == thinType)
-            return true;
-
-        range.first++;
+        // add the size of the sets of each entry
+        // it is possible for a set to be empty
+        mapSize = mapSize + entry.second.size();
     }
-    return false;
+    return (mapSize >= MAX_THINTYPE_BLOCKS_IN_FLIGHT);
 }
 
-unsigned int ThinTypeRelay::TotalBlocksInFlight()
+bool ThinTypeRelay::IsBlockInFlight(CNode *pfrom, const std::string thinType, const uint256 &hash)
 {
+    // check if this node already has this thinType of block in flight.
     LOCK(cs_inflight);
-    return mapThinTypeBlocksInFlight.size();
+    auto key = mapThinTypeBlocksInFlight.find(pfrom->GetId());
+    if (key != mapThinTypeBlocksInFlight.end())
+    {
+        // time and recieved arent checked in the comparator, so they dont matter here
+        return key->second.count(CThinTypeBlockInFlight{hash, 0, false, thinType});
+    }
+    return false;
 }
 
 void ThinTypeRelay::BlockWasReceived(CNode *pfrom, const uint256 &hash)
 {
     LOCK(cs_inflight);
-    std::pair<std::multimap<const NodeId, CThinTypeBlockInFlight>::iterator,
-        std::multimap<const NodeId, CThinTypeBlockInFlight>::iterator>
-        range = mapThinTypeBlocksInFlight.equal_range(pfrom->GetId());
-    while (range.first != range.second)
+    auto key = mapThinTypeBlocksInFlight.find(pfrom->GetId());
+    if (key != mapThinTypeBlocksInFlight.end())
     {
-        if (range.first->second.hash == hash)
-            range.first->second.fReceived = true;
-
-        range.first++;
+        // elements in a set are immutable. they can be added/removed but not edited
+        // inserting/emplacing new elements in a set while iterating through a set is safe behavior
+        for (auto entry = key->second.begin(); entry != key->second.end();)
+        {
+            // our sets uniqueness is based on hash + thinType so just checking the hash
+            // does not guaranteed that all entries with that hash are marked as received
+            if (entry->hash == hash && entry->fReceived == false)
+            {
+                CThinTypeBlockInFlight updatedEntry = *entry;
+                updatedEntry.fReceived = true;
+                // we have to erase before emplacing to comply with comparator uniqueness
+                // erase never throws exceptions
+                entry = key->second.erase(entry);
+                key->second.emplace(updatedEntry);
+                // intended thin type block relay behavior should clear failed entries when making
+                // a failover request so there should only ever be 1 entry in the set with any
+                // given block hash across all thinType
+                // we do not break here to prevent a disconnect from a peer in the event
+                // that we did not properly clean up entries when a failover request was made.
+            }
+            else
+            {
+                ++entry;
+            }
+        }
     }
 }
 
 bool ThinTypeRelay::AddBlockInFlight(CNode *pfrom, const uint256 &hash, const std::string thinType)
 {
     LOCK(cs_inflight);
-    if (IsBlockInFlight(pfrom, thinType))
+    if (AreTooManyBlocksInFlight())
         return false;
 
-    mapThinTypeBlocksInFlight.insert(
-        std::pair<const NodeId, CThinTypeBlockInFlight>(pfrom->GetId(), {hash, GetTime(), false, thinType}));
-
-    return true;
+    // this insert returns a pair <iterator,bool> where the bool denotes whether the insertion took place
+    auto key = mapThinTypeBlocksInFlight.find(pfrom->GetId());
+    if (key != mapThinTypeBlocksInFlight.end())
+    {
+        return key->second.emplace(CThinTypeBlockInFlight{hash, GetTime(), false, thinType}).second;
+    }
+    auto result = mapThinTypeBlocksInFlight.emplace(pfrom->GetId(), std::set<CThinTypeBlockInFlight>());
+    // strong guarantee, if emplace fails there are no changes made to the map
+    if (result.second == false)
+    {
+        return false;
+    }
+    return result.first->second.emplace(CThinTypeBlockInFlight{hash, GetTime(), false, thinType}).second;
 }
 
-void ThinTypeRelay::ClearBlockInFlight(CNode *pfrom, const uint256 &hash)
+void ThinTypeRelay::ClearBlockInFlight(NodeId id, const uint256 &hash)
 {
     LOCK(cs_inflight);
-    std::pair<std::multimap<const NodeId, CThinTypeBlockInFlight>::iterator,
-        std::multimap<const NodeId, CThinTypeBlockInFlight>::iterator>
-        range = mapThinTypeBlocksInFlight.equal_range(pfrom->GetId());
-    while (range.first != range.second)
+    auto key = mapThinTypeBlocksInFlight.find(id);
+    if (key != mapThinTypeBlocksInFlight.end())
     {
-        if (range.first->second.hash == hash)
+        for (auto entry = key->second.begin(); entry != key->second.end();)
         {
-            range.first = mapThinTypeBlocksInFlight.erase(range.first);
-        }
-        else
-        {
-            range.first++;
+            if (entry->hash == hash)
+            {
+                // it is safe to erase elements while iterating through sets since c++14
+                entry = key->second.erase(entry);
+                // set entry uniqueness is based on hash + thinType so dont break here to make sure
+                // that all entries with this block hash regardless of thinType are cleared
+            }
+            else
+            {
+                ++entry;
+            }
         }
     }
+}
+
+void ThinTypeRelay::ClearAllBlocksInFlight(NodeId id)
+{
+    LOCK(cs_inflight);
+    auto key = mapThinTypeBlocksInFlight.find(id);
+    if (key != mapThinTypeBlocksInFlight.end())
+    {
+        key->second.clear();
+    }
+}
+
+void ThinTypeRelay::SetSentGrapheneBlocks(NodeId id, CGrapheneBlock &grapheneBlock)
+{
+    LOCK(cs_graphene_sender);
+    mapGrapheneSentBlocks[id] = std::make_shared<CGrapheneBlock>(grapheneBlock);
+}
+
+std::shared_ptr<CGrapheneBlock> ThinTypeRelay::GetSentGrapheneBlocks(NodeId id)
+{
+    LOCK(cs_graphene_sender);
+
+    auto it = mapGrapheneSentBlocks.find(id);
+    if (it != mapGrapheneSentBlocks.end())
+        return it->second;
+    else
+        return std::shared_ptr<CGrapheneBlock>();
+}
+
+void ThinTypeRelay::ClearSentGrapheneBlocks(NodeId id)
+{
+    LOCK(cs_graphene_sender);
+    mapGrapheneSentBlocks.erase(id);
 }
 
 void ThinTypeRelay::CheckForDownloadTimeout(CNode *pfrom)
 {
     LOCK(cs_inflight);
-    if (mapThinTypeBlocksInFlight.size() == 0)
-        return;
-
-    std::pair<std::multimap<const NodeId, CThinTypeBlockInFlight>::iterator,
-        std::multimap<const NodeId, CThinTypeBlockInFlight>::iterator>
-        range = mapThinTypeBlocksInFlight.equal_range(pfrom->GetId());
-    while (range.first != range.second)
+    auto key = mapThinTypeBlocksInFlight.find(pfrom->GetId());
+    if (key != mapThinTypeBlocksInFlight.end())
     {
-        // Use a timeout of 6 times the retry inverval before disconnecting.  This way only a max of 6
-        // re-requested thinblocks or graphene blocks could be in memory at any one time.
-        if (!range.first->second.fReceived &&
-            (GetTime() - range.first->second.nRequestTime) >
-                (int)MAX_THINTYPE_BLOCKS_IN_FLIGHT * blkReqRetryInterval / 1000000)
+        for (auto &entry : (*key).second)
         {
-            if (!pfrom->fWhitelisted && Params().NetworkIDString() != "regtest")
+            // Use a timeout of 6 times the retry inverval before disconnecting.  This way only a max of 6
+            // re-requested thinblocks or graphene blocks could be in memory at any one time.
+            if (!entry.fReceived &&
+                (GetTime() - entry.nRequestTime) > (int)MAX_THINTYPE_BLOCKS_IN_FLIGHT * blkReqRetryInterval / 1000000)
             {
-                LOG(THIN | GRAPHENE | CMPCT,
-                    "ERROR: Disconnecting peer %s due to thinblock download timeout exceeded (%d secs)\n",
-                    pfrom->GetLogName(), (GetTime() - range.first->second.nRequestTime));
-                pfrom->fDisconnect = true;
-                return;
+                if (!pfrom->fWhitelisted && Params().NetworkIDString() != "regtest")
+                {
+                    LOG(THIN | GRAPHENE | CMPCT,
+                        "ERROR: Disconnecting peer %s due to thinblock download timeout exceeded (%d secs)\n",
+                        pfrom->GetLogName(), (GetTime() - entry.nRequestTime));
+                    pfrom->fDisconnect = true;
+                    return;
+                }
             }
         }
-
-        range.first++;
     }
 }
 
@@ -249,10 +346,15 @@ void ThinTypeRelay::RequestBlock(CNode *pfrom, const uint256 &hash)
 
 std::shared_ptr<CBlockThinRelay> ThinTypeRelay::SetBlockToReconstruct(CNode *pfrom, const uint256 &hash)
 {
-    // Make sure we are starting with a fresh instance.
     LOCK(cs_reconstruct);
-    ClearBlockToReconstruct(pfrom);
-
+    // If another thread has already created an instance then return it.
+    // Currently we can only have one block hash in flight per node so make sure it's the same hash.
+    std::shared_ptr<CBlockThinRelay> existing_entry = GetBlockToReconstruct(pfrom, hash);
+    if (existing_entry != nullptr)
+    {
+        return existing_entry;
+    }
+    // Otherwise, start with a fresh instance.
     // Store and empty block which can be used later
     std::shared_ptr<CBlockThinRelay> pblock;
     pblock = std::make_shared<CBlockThinRelay>(CBlockThinRelay());
@@ -261,108 +363,62 @@ std::shared_ptr<CBlockThinRelay> ThinTypeRelay::SetBlockToReconstruct(CNode *pfr
     pblock->thinblock = std::make_shared<CThinBlock>(CThinBlock());
     pblock->xthinblock = std::make_shared<CXThinBlock>(CXThinBlock());
     pblock->cmpctblock = std::make_shared<CompactBlock>(CompactBlock());
-
-    mapBlocksReconstruct.insert(
-        std::make_pair(pfrom->GetId(), std::make_pair(pblock->GetBlockHeader().GetHash(), pblock)));
+    pblock->grapheneblock = std::make_shared<CGrapheneBlock>(CGrapheneBlock());
+    // unless we run out of memory, emplace should never fail
+    auto newKey = mapBlocksReconstruct.emplace(pfrom->GetId(), std::map<uint256, std::shared_ptr<CBlockThinRelay> >());
+    newKey.first->second.emplace(hash, pblock);
     return pblock;
 }
 
-std::shared_ptr<CBlockThinRelay> ThinTypeRelay::GetBlockToReconstruct(CNode *pfrom)
+std::shared_ptr<CBlockThinRelay> ThinTypeRelay::GetBlockToReconstruct(CNode *pfrom, const uint256 &hash)
 {
     // Retrieve a current instance of a block being reconstructed. This is typically used
     // when we have received the response of a re-request for more transactions.
     LOCK(cs_reconstruct);
-    auto iter = mapBlocksReconstruct.find(pfrom->GetId());
-    if (iter != mapBlocksReconstruct.end())
+    auto key_node = mapBlocksReconstruct.find(pfrom->GetId());
+    if (key_node != mapBlocksReconstruct.end())
     {
-        return iter->second.second;
-    }
-    else
-        return nullptr;
-}
-
-void ThinTypeRelay::ClearBlockToReconstruct(CNode *pfrom)
-{
-    LOCK(cs_reconstruct);
-    mapBlocksReconstruct.erase(pfrom->GetId());
-}
-
-bool ThinTypeRelay::ClearLargestBlockAndDisconnect(CNode *pfrom)
-{
-    CNode *pLargestNode = nullptr;
-    uint64_t nLargestBytes = 0;
-    std::shared_ptr<CBlockThinRelay> pLargestBlock = nullptr;
-
-    LOCK(cs_vNodes);
-    for (CNode *pnode : vNodes)
-    {
-        std::shared_ptr<CBlockThinRelay> pblock = thinrelay.GetBlockToReconstruct(pnode);
-        if (pblock == nullptr)
-            continue;
-
-        uint64_t nBytes = pblock->nCurrentBlockSize;
-        if ((pnode->fDisconnect == false) && ((pLargestNode == nullptr) || (nBytes > nLargestBytes)))
+        auto key_hash = key_node->second.find(hash);
+        if (key_hash != key_node->second.end())
         {
-            pLargestNode = pnode;
-            pLargestBlock = pblock;
-            nLargestBytes = nBytes;
+            return key_hash->second;
         }
     }
-
-    if (pLargestNode != nullptr)
-    {
-        thinrelay.ClearAllBlockData(pLargestNode, pLargestBlock);
-        pLargestNode->fDisconnect = true;
-
-        // If the our node is currently using up the most thinblock bytes then return true so that we
-        // can stop processing this thinblock and let the disconnection happen.
-        if (pfrom == pLargestNode)
-            return true;
-    }
-
-    return false;
+    return nullptr;
 }
 
-uint64_t ThinTypeRelay::AddTotalBlockBytes(uint64_t bytes, std::shared_ptr<CBlockThinRelay> &pblock)
+void ThinTypeRelay::ClearBlockToReconstruct(NodeId id, const uint256 &hash)
+{
+    LOCK(cs_reconstruct);
+    auto key = mapBlocksReconstruct.find(id);
+    if (key != mapBlocksReconstruct.end())
+    {
+        key->second.erase(hash);
+    }
+}
+
+void ThinTypeRelay::ClearAllBlocksToReconstruct(NodeId id)
+{
+    LOCK(cs_reconstruct);
+    auto key = mapBlocksReconstruct.find(id);
+    if (key != mapBlocksReconstruct.end())
+    {
+        // we could just erase the entire id key in the outer map, but then we would have to reallocate
+        // space for that node in the event we get another block from them.
+        // only clearing the inner map will take more memory but less cpu time
+        key->second.clear();
+    }
+}
+
+void ThinTypeRelay::AddBlockBytes(uint64_t bytes, std::shared_ptr<CBlockThinRelay> pblock)
 {
     pblock->nCurrentBlockSize += bytes;
-    uint64_t ret = nTotalBlockBytes.fetch_add(bytes) + bytes;
-
-    return ret;
 }
 
-void ThinTypeRelay::DeleteTotalBlockBytes(uint64_t bytes)
+uint64_t ThinTypeRelay::GetMaxAllowedBlockSize() { return maxMessageSizeMultiplier * excessiveBlockSize; }
+void ThinTypeRelay::ClearAllBlockData(CNode *pnode, const uint256 &hash)
 {
-    if (bytes <= nTotalBlockBytes)
-    {
-        nTotalBlockBytes.fetch_sub(bytes);
-    }
+    // Clear the entries for block to reconstruct and block in flight
+    ClearBlockToReconstruct(pnode->GetId(), hash);
+    ClearBlockInFlight(pnode->GetId(), hash);
 }
-
-// After a thintype block is finished processing or if for some reason we have to pre-empt the rebuilding
-// of a thintype block then we clear out the thinblock bytes from the total.
-void ThinTypeRelay::ClearBlockBytes(std::shared_ptr<CBlockThinRelay> &pblock)
-{
-    // Remove bytes from counter
-    if (pblock != nullptr)
-        DeleteTotalBlockBytes(pblock->nCurrentBlockSize);
-
-    LOG(THIN | CMPCT | GRAPHENE, "Total in memory blockbytes after clearing a thintype block is %ld bytes\n",
-        GetTotalBlockBytes());
-}
-
-void ThinTypeRelay::ClearAllBlockData(CNode *pnode, std::shared_ptr<CBlockThinRelay> &pblock)
-{
-    // We must make sure to clear the block data first before clearing the thinblock in flight.
-    uint256 hash = pblock->GetBlockHeader().GetHash();
-    ClearBlockBytes(pblock);
-    ClearBlockToReconstruct(pnode);
-    if (pblock != nullptr)
-        pblock->SetNull();
-
-    // Now clear the block in flight.
-    ClearBlockInFlight(pnode, hash);
-}
-
-void ThinTypeRelay::ResetTotalBlockBytes() { nTotalBlockBytes.store(0); }
-uint64_t ThinTypeRelay::GetTotalBlockBytes() { return nTotalBlockBytes.load(); }

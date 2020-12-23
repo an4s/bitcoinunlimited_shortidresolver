@@ -31,6 +31,7 @@ import pdb
 import os
 import time
 import shutil
+import psutil
 import signal
 import sys
 import subprocess
@@ -46,7 +47,15 @@ if sourcePath != outOfSourceBuildPath:
     sys.path.append(outOfSourceBuildPath)
 
 from tests_config import *
-from test_classes import RpcTest, Disabled, Skip
+from test_classes import RpcTest, Disabled, Skip, WhenElectrumFound
+
+def inTravis():
+    return (os.environ.get("TRAVIS", None) == "true")
+
+def inGitLabCI():
+    # https://docs.gitlab.com/ee/ci/variables/
+    return (os.environ.get("CI_SERVER", None) == "yes")
+
 
 BOLD = ("","")
 if os.name == 'posix':
@@ -55,6 +64,8 @@ if os.name == 'posix':
     BOLD = ('\033[0m', '\033[1m')
 
 RPC_TESTS_DIR = SRCDIR + '/qa/rpc-tests/'
+
+CORE_ANALYSIS_SCRIPT = SRCDIR + '/contrib/devtools/coreanalysis.gdb'
 
 #If imported values are not defined then set to zero (or disabled)
 if 'ENABLE_WALLET' not in vars():
@@ -86,13 +97,17 @@ private_single_opts = ('-h',
                        '-list',
                        '-extended',
                        '-extended-only',
+                       '-electrum-only',
                        '-only-extended',
+                       '-only-electrum',
                        '-force-enable',
                        '-win')
 private_double_opts = ('--list',
                        '--extended',
                        '--extended-only',
+                       '--electrum-only',
                        '--only-extended',
+                       '--only-electrum',
                        '--force-enable',
                        '--win')
 framework_opts = ('--tracerpc',
@@ -100,6 +115,7 @@ framework_opts = ('--tracerpc',
                   '--noshutdown',
                   '--nocleanup',
                   '--no-ipv6-rpc-listen',
+                  '--gitlab',
                   '--srcdir',
                   '--tmppfx',
                   '--coveragedir',
@@ -180,14 +196,16 @@ if ENABLE_ZMQ:
 
 #Tests
 testScripts = [ RpcTest(t) for t in [
+    Disabled('sigchecks_inputstandardness_activation', 'Already activated, and mempool bad sigcheck mempool cleanup removed so test will fail'),
+    'txindex',
     Disabled('schnorr-activation', 'Need to be updated to work with BU'),
     'schnorrsig',
-    Disabled('segwit-recovery-activation','Need to be updated to work with BU'),
+    'segwit_recovery',
     'bip135basic',
     'ctor',
     'mining_ctor',
     Disabled('nov152018_forkactivation','Nov 2018 already activated'),
-     Disabled('blockstorage','fixme'),
+    'blockstorage',
     'miningtest',
     'cashlibtest',
     'tweak',
@@ -214,6 +232,9 @@ testScripts = [ RpcTest(t) for t in [
     'mempool_reorg',
     'mempool_limit',
     'mempool_persist',
+    'mempool_validate',
+    'mempoolsync',
+    'mempool_push',
     'httpbasics',
     'multi_rpc',
     'zapwallettxes',
@@ -233,19 +254,25 @@ testScripts = [ RpcTest(t) for t in [
     Disabled('invalidblockrequest', "TODO"),
     'invalidtxrequest',
     'abandonconflict',
-    'p2p-versionbits-warning',
+    Disabled('p2p-versionbits-warning', "Need to resolve issue with false positive warnings on mainnet"),
     'importprunedfunds',
     'compactblocks_1',
     'compactblocks_2',
     'graphene_optimized',
     'graphene_versions',
+    'graphene_stage2',
     'thinblocks',
     Disabled('checkdatasig_activation', "CDSV has been already succesfully activated, keep test around as a template for other OP activation"),
+    'xversion_old',
     'xversion',
     'sighashmatch',
     'getlogcategories',
     'getrawtransaction',
-    Disabled('electrum_basics', "Needs to be skipped if electrs is not built")
+    'rpc_getblockstats',
+    'minimaldata',
+    'schnorrmultisig',
+    'uptime',
+    'op_reversebytes'
 ] ]
 
 testScriptsExt = [ RpcTest(t) for t in [
@@ -257,7 +284,7 @@ testScriptsExt = [ RpcTest(t) for t in [
     'excessive --extensive',
     'parallel --extensive',
     'bip65-cltv',
-    'bip68-sequence',
+    'bip68_sequence',
     Disabled('bipdersig-p2p', "keep as an example of testing fork activation"),
     'bipdersig',
     'bip135-grace',
@@ -277,6 +304,18 @@ testScriptsExt = [ RpcTest(t) for t in [
     'maxuploadtarget'
 ] ]
 
+testScriptsElectrum = [ RpcTest(WhenElectrumFound(t)) for t in [
+    'electrum_basics',
+    'electrum_blockchain_address',
+    'electrum_cashaccount',
+    'electrum_reorg',
+    'electrum_scripthash_gethistory',
+    'electrum_server_features',
+    'electrum_shutdownonerror',
+    'electrum_subscriptions',
+    'electrum_transaction_get',
+] ]
+
 #Enable ZMQ tests
 if ENABLE_ZMQ == 1:
     testScripts.append(RpcTest('zmq_test'))
@@ -289,6 +328,7 @@ def show_wrapper_options():
     print("  -extended/--extended  run the extended set of tests")
     print("  -only-extended / -extended-only\n" + \
           "  --only-extended / --extended-only\n" + \
+          "  --only-electrum / --electrum-only\n" + \
           "                        run ONLY the extended tests")
     print("  -list / --list        only list test names")
     print("  -win / --win          signal running on Windows and run those tests")
@@ -306,13 +346,19 @@ def runtests():
 
     force_enable = option_passed('force-enable') or '-f' in opts
     run_only_extended = option_passed('only-extended') or option_passed('extended-only')
+    run_only_electrum = option_passed('only-electrum') or option_passed('electrum-only')
+    if run_only_electrum and (run_only_extended or option_passed('extended')):
+        raise Exception("electrum only and extended are not compatible options")
 
     if option_passed('list'):
-        if run_only_extended:
+        if run_only_electrum:
+            for t in testScriptsElectrum:
+                print(t)
+        elif run_only_extended:
             for t in testScriptsExt:
                 print(t)
         else:
-            for t in testScripts:
+            for t in testScripts + testScriptsElectrum:
                 print(t)
             if option_passed('extended'):
                 for t in testScriptsExt:
@@ -339,7 +385,7 @@ def runtests():
             for o in opts:
                 if not o.startswith('-'):
                     found = False
-                    for t in testScripts + testScriptsExt:
+                    for t in testScripts + testScriptsElectrum + testScriptsExt:
                         t_rep = str(t).split(' ')
                         if (t_rep[0] == o or t_rep[0] == o + '.py') and len(t_rep) > 1:
                             # it is a test with args - check all args match what was passed, otherwise don't add this test
@@ -366,10 +412,13 @@ def runtests():
 
         # if no explicit tests specified, use the lists
         if not len(tests_to_run):
-            if run_only_extended:
+            if run_only_electrum:
+                tests_to_run = testScriptsElectrum
+            elif run_only_extended:
                 tests_to_run = testScriptsExt
             else:
                 tests_to_run += testScripts
+                tests_to_run += testScriptsElectrum
                 if run_extended:
                     tests_to_run += testScriptsExt
 
@@ -389,6 +438,10 @@ def runtests():
                     trimmed_tests_to_run.append(t)
             tests_to_run = trimmed_tests_to_run
 
+        # if all specified tests are disabled just quit
+        if len(tests_to_run) == 0:
+            quit()
+
         if len(tests_to_run) > 1 and run_parallel:
             # Populate cache
             subprocess.check_output([RPC_TESTS_DIR + 'create_cache.py'] + [flags]+
@@ -403,20 +456,31 @@ def runtests():
         all_passed = True
 
         for _ in range(len(tests_to_run)):
-            (name, stdout, stderr, stderr_filtered, passed, duration) = job_queue.get_next()
+            (name, retCode, coreOutput, stdout, stderr, stderr_filtered, passed, duration) = job_queue.get_next()
             test_passed.append(passed)
             all_passed = all_passed and passed
             time_sum += duration
-
-            print("\n"+"#"*50)
-            print(BOLD[1] + name + BOLD[0] + ":")
-            print("-"*50+'\nstdout:\n' if not stdout == '' else '', stdout)
-            print("-"*50+'\nstderr:\n' if not stderr == '' else '', stderr)
-            #print('stderr_filtered:\n' if not stderr_filtered == '' else '', repr(stderr_filtered))
-            if stderr!="" or stdout!="":
-                print("-"*50)
             results += "%s | %s | %s s\n" % (name.ljust(max_len_name), str(passed).ljust(6), duration)
-            print("Pass: %s%s%s, Duration: %s s\n" % (BOLD[1], passed, BOLD[0], duration))
+
+            print("")
+            if inTravis():
+                print("travis_fold:start:%s_%s" % (name, passed))
+            print(BOLD[1] + name + BOLD[0] + ": Pass: %s%s%s, Duration: %s s" % (BOLD[1], passed, BOLD[0], duration))
+            print("#"*50)
+            print("- " + retCode)
+            if stdout != "":
+                print('- stdout '+("-"*50)+"\n", stdout)
+            if stderr != "":
+                print('- stderr '+("-"*50)+"\n", stderr)
+            if coreOutput != "":
+                if inTravis():  # if in travis we already folded this
+                    print(coreOutput)
+                else: # so no need for another header
+                    print('- core dump '+("-"*50)+"\n", coreOutput)
+            #print('stderr_filtered:\n' if not stderr_filtered == '' else '', repr(stderr_filtered))
+            print("#"*25)
+            if inTravis():
+                print("travis_fold:end:%s_%s" % (name, passed))
 
         results += BOLD[1] + "\n%s | %s | %s s (accumulated)" % ("ALL".ljust(max_len_name), str(all_passed).ljust(6), time_sum) + BOLD[0]
         print(results)
@@ -455,8 +519,8 @@ class RPCTestHandler:
         self.num_running = 0
         # In case there is a graveyard of zombie bitcoinds, we can apply a
         # pseudorandom offset to hopefully jump over them.
-        # (625 is PORT_RANGE/MAX_NODES)
-        self.portseed_offset = int(time.time() * 1000) % 625
+        # 3750 is PORT_RANGE/MAX_NODES defined in util, but awkward to import into rpc-test.py
+        self.portseed_offset = int(time.time() * 1000) % 3750
         self.jobs = []
 
     def get_next(self):
@@ -473,8 +537,12 @@ class RPCTestHandler:
                               time.time(),
                               subprocess.Popen((RPC_TESTS_DIR + t).split() + self.flags.split() + port_seed,
                                                universal_newlines=True,
+                                               stdin=subprocess.DEVNULL,
                                                stdout=subprocess.PIPE,
-                                               stderr=subprocess.PIPE),
+                                               stderr=subprocess.PIPE,
+                                               close_fds=True,
+                                               restore_signals=True,
+                                               start_new_session=True),
                               log_stdout, log_stderr, got_outputs))
         if not self.jobs:
             raise IndexError('pop from empty list')
@@ -483,10 +551,12 @@ class RPCTestHandler:
             time.sleep(.5)
             for j in self.jobs:
                 (name, time0, proc, log_stdout, log_stderr, got_outputs) = j
-                if os.getenv('TRAVIS') == 'true' and int(time.time() - time0) > 20 * 60:
-                    # In travis, timeout individual tests after 20 minutes (to stop tests hanging and not
+                if ((inGitLabCI() or inTravis()) and int(time.time() - time0) > 20 * 60):
+                    # In external CI services, timeout individual tests after 20 minutes (to stop tests hanging and not
                     # providing useful output.
                     proc.send_signal(signal.SIGINT)
+
+                # print("handling " + str(proc))
 
                 def comms(timeout):
                     stdout_data, stderr_data = proc.communicate(timeout=timeout)
@@ -514,10 +584,60 @@ class RPCTestHandler:
                     got_outputs[0] = True
                 except subprocess.TimeoutExpired:
                     pass
+                except ValueError:
+                    # There is a bug in communicate that causes this exception if the child process has closed any pipes but is still running
+                    # see: https://bugs.python.org/issue35182
+                    pass
 
-                if proc.poll() is not None:
-                    if not got_outputs[0]:
-                        comms(50)
+                # it won't ever communicate() fully because child didn't close sockets
+                try:
+                    psproc = psutil.Process(proc.pid)
+                    if psproc.status() == psutil.STATUS_ZOMBIE:
+                        got_outputs[0] = True
+                except AttributeError:
+                    pass
+                except FileNotFoundError:
+                    pass # its ok means process exited cleanly
+                except psutil.NoSuchProcess:
+                    pass
+
+                if got_outputs[0]:
+                    retval = proc.returncode if proc.returncode != None else proc.poll()
+                    if retval is None:
+                        print("%s: should be impossible, got output from communicate but process is alive" % proc.args[0])
+                        dumpLogs = True
+
+                    coreOutput = ""
+                    try:
+                        if inGitLabCI():
+                            coreDir = os.path.join(os.environ.get("CI_PROJECT_DIR", None), "cores")
+                        else:
+                            coreDir = "/tmp/cores"
+                        cores = os.listdir(coreDir)
+                        for core in cores:
+                            print("Trying to analyze core file: " + str(core))
+                            fullCoreFile = os.path.join(coreDir, core)
+                            bitcoindBin = os.environ["BITCOIND"]
+                            path, fil = os.path.split(bitcoindBin)
+                            if os.path.isfile(CORE_ANALYSIS_SCRIPT):
+                                popenList = ["gdb", "-core", fullCoreFile, bitcoindBin, "-x", CORE_ANALYSIS_SCRIPT, "-batch"]
+                            else:
+                                popenList = ["gdb", "-core", fullCoreFile, bitcoindBin, "-ex", "thread apply all bt", "-ex", "set pagination 0", "-batch"]
+                            gdb = subprocess.Popen(popenList, universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                            (out, err) = gdb.communicate(None, 60)
+                            fold_start = ("\ntravis_fold:start:%s\nCore dump analysis\n" % core) if inTravis() else ""
+                            fold_end = ("\ntravis_fold:end:%s\n" % core) if inTravis() else ""
+                            coreOutput = fold_start + out + "\n-------\n" + err + fold_end
+                            # Now delete this file so we don't dump it repeatedly.  Better would be to move it somewhere for export out of the container.
+                            if inGitLabCI():
+                                newPath = os.path.join(os.environ.get("CI_PROJECT_DIR", None), "saved-cores")
+                                shutil.move(fullCoreFile, os.path.join(newPath, str(core) + "-" + str(name)))
+                            else:
+                                os.remove(fullCoreFile)
+                    except Exception as e:
+                        print("Exception trying to show core files in " + coreDir + " :" + str(e))
+
+                    returnCode = "Process %s return code: %d" % (" ".join(proc.args),retval)
                     log_stdout.seek(0), log_stderr.seek(0)
                     stdout = log_stdout.read()
                     stderr = log_stderr.read()
@@ -525,12 +645,15 @@ class RPCTestHandler:
 
                     # This is a list of expected messages on stderr. If they appear, they do not
                     # necessarily indicate final failure of a test.
+
+                    # These 2 are due to accidental port conflicts caused by running multiple tests simultaneously.
                     stderr_filtered = stderr.replace("Error: Unable to start HTTP server. See debug log for details.", "")
-                    stderr_filtered = re.sub(r"Error: Unable to bind to 0.0.0.0:[0-9]+ on this computer\. Bitcoin Unlimited Cash Edition is probably already running\.",
+                    stderr_filtered = stderr.replace("Error: Unable to start RPC services. See debug log for details.", "")
+
+                    stderr_filtered = re.sub(r"Error: Unable to bind to 0.0.0.0:[0-9]+ on this computer\. BCH Unlimited is probably already running\.",
                                              "", stderr_filtered)
                     invalid_index = re.compile(r'.*?\n.*?EXCEPTION.*?\n.*?invalid index for tx.*?\n.*?ProcessMessages.*?\n', re.MULTILINE)
                     stderr_filtered = invalid_index.sub("", stderr_filtered)
-
                     stderr_filtered = stderr_filtered.replace("Error: Failed to listen on any port. Use -listen=0 if you want this.", "")
                     stderr_filtered = stderr_filtered.replace("Error: Failed to listen on all P2P ports. Failing as requested by -bindallorfail.", "")
                     stderr_filtered = stderr_filtered.replace(" ", "")
@@ -538,7 +661,7 @@ class RPCTestHandler:
                     passed = stderr_filtered == "" and proc.returncode == 0
                     self.num_running -= 1
                     self.jobs.remove(j)
-                    return name, stdout, stderr, stderr_filtered, passed, int(time.time() - time0)
+                    return name, returnCode, coreOutput, stdout, stderr, stderr_filtered, passed, int(time.time() - time0)
             print('.', end='', flush=True)
 
 class RPCCoverage(object):
