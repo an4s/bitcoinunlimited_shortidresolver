@@ -9,6 +9,7 @@
 #include <string>
 #include <inttypes.h>
 #include <stdio.h>
+#include <init.h>
 
 
 #define UNIX_TIMESTAMP \
@@ -23,6 +24,9 @@ static std::string strDataDir;
 static std::string directory;
 static std::string invRXdir;
 static std::string txdir;
+static std::string cmpctblkdir;
+static std::string reqTxdir;
+static std::string mempoolFileDir;
 static std::string addrLoggerdir;
 static std::string cpudir;
 static int64_t addrLoggerTimeoutSecs = 1;
@@ -31,18 +35,73 @@ extern CTxMemPool mempool;
 
 void dumpMemPool(std::string fileName = "", INVTYPE type = FALAFEL_SENT, INVEVENT event = BEFORE, int counter = 0);
 
+bool createDir(std::string dirName)
+{
+    boost::filesystem::path dir(dirName);
+    if(!(boost::filesystem::exists(dir)))
+    {
+        if(fPrintToConsole)
+            std::cout << "Directory <" << dir << "> doesn't exist; creating directory" << std::endl;
+        if(boost::filesystem::create_directory(dir))
+        {
+            if(fPrintToConsole)
+                std::cout << "Directory <" << dir << "> created successfully" << std::endl;
+        }
+        else
+        {
+            if(fPrintToConsole)
+                std::cout << "Directory <" << dir << "> not created" << std::endl;
+            return false;
+        }
+    }
+    return true;
+}
+
 /*
  * Initialize log file system that records events in Bitcoin
  */
 bool initLogger()
 {
     // paths to different directories
-    strDataDir = GetDataDir().string();
-    directory  = strDataDir + "/expLogFiles/";
-    invRXdir   = directory + "/received/";
-    txdir      = directory + "/txs/";
+    strDataDir     = GetDataDir().string();
+    directory      = strDataDir + "/expLogFiles/";
+    invRXdir       = directory  + "/received/";
+    txdir          = directory  + "/txs/";
+    cmpctblkdir    = directory  + "/cmpctblk/";
+    reqTxdir       = directory  + "/getblocktxn/";
+    mempoolFileDir = directory  + "/mempool/";
 
     // create directories if they do not exist
+
+    // - create main directory if it does not exist
+    if(!createDir(directory))
+        return false;
+
+    // - create directory to record information about received inv messages
+    //   if it does not exist
+    if(!createDir(invRXdir))
+        return false;
+
+    // - create directory to record information about received tx & inv
+    //   if it does not exist
+    if(!createDir(txdir))
+        return false;
+
+    // - create directory to record information about received compact blocks
+    //   if it does not exist
+    if(!createDir(cmpctblkdir))
+        return false;
+
+    // - create directory to record information about reqiested missing txs
+    //   if it does not exist
+    if(!createDir(reqTxdir))
+        return false;
+
+    // - create directory to record information about mempool when block is received
+    //   if it does not exist
+    if(!createDir(mempoolFileDir))
+        return false;
+/*
     // - create main directory if it does not exist
     boost::filesystem::path dir(directory);
     if(!(boost::filesystem::exists(dir)))
@@ -101,7 +160,7 @@ bool initLogger()
             return false;
         }
     }
-
+*/
     return true;
 }
 
@@ -176,12 +235,19 @@ std::string createTimeStamp()
 /*
  * Log information about transactions in a compact block
  */
-int logFile(CompactBlock&Cblock, std::string from, std::string fileName)
+void logFile(CompactBlock & Cblock, std::string from, std::string fileName)
 {
     std::string timeString = createTimeStamp();
     if(fileName == "") fileName = directory + "logNode_" + nodeID + ".txt";
     else fileName = directory + fileName;
-    std::string compactBlock = directory + std::to_string(inc) + "_cmpctblock.txt";
+    std::string blockHash = Cblock.header.GetHash().ToString();
+    std::string compactBlock = cmpctblkdir + blockHash;
+    if(boost::filesystem::exists(compactBlock))
+    {
+        std::cout << "<" + compactBlock + "> already exists.. shutting down";
+        StartShutdown();
+        return;
+    }
     std::vector<uint64_t> txid;
     std::ofstream fnOut;
     std::ofstream fnCmpct;
@@ -190,10 +256,10 @@ int logFile(CompactBlock&Cblock, std::string from, std::string fileName)
     fnCmpct.open(compactBlock, std::ofstream::out);
 
     fnOut << timeString << "CMPCTRECIVED - compact block received from " << from << std::endl;
-    fnOut << timeString << "CMPCTBLKHASH - " << Cblock.header.GetHash().ToString() << std::endl;
+    fnOut << timeString << "CMPCTBLKHASH - " << blockHash << std::endl;
     txid = Cblock.getTXID();
 
-    fnCmpct << Cblock.header.GetHash().ToString() << std::endl;
+    fnCmpct << blockHash << std::endl;
 
     for(unsigned int i = 0; i < txid.size(); i++)
     {
@@ -203,7 +269,7 @@ int logFile(CompactBlock&Cblock, std::string from, std::string fileName)
     fnOut << createTimeStamp() << "CMPCTSAVED - " << compactBlock << " file created" << std::endl;
 
     if(debug){
-        std::cout << "inc: " << inc << std::endl;
+        // std::cout << "inc: " << inc << std::endl;
         std::cout << "fileName: " << fileName << " --- cmpctblock file: " << compactBlock << std::endl;
         std::cout << timeString << "CMPCTRECIVED - compact block received from " << from << std::endl;
     }
@@ -212,31 +278,36 @@ int logFile(CompactBlock&Cblock, std::string from, std::string fileName)
     fnOut.close();
 
     dumpMemPool();
-    inc++;
+    // inc++;
 
-    return inc - 1;
+    // return inc - 1;
 }
 
-void logFile(CompactReRequest&req,std::string fileName)
+void logFile(std::vector<uint32_t> req, std::string blockHash, std::string fileName)
 {
     std::string timeString = createTimeStamp();
     if(fileName == "") fileName = directory + "logNode_" + nodeID + ".txt";
     else fileName = directory + fileName;
-    std::string reqFile = directory + std::to_string(inc-1) + "_getblocktxn.txt";
-    std::vector<uint64_t> txid;
+    std::string reqFile = reqTxdir + blockHash;
+    if(boost::filesystem::exists(reqFile))
+    {
+        std::cout << "<" + reqFile + "> already exists.. shutting down";
+        StartShutdown();
+        return;
+    }
     std::ofstream fnOut;
     std::ofstream fnReq;
 
     fnOut.open(fileName, std::ofstream::app);
     fnReq.open(reqFile, std::ofstream::out);
 
-    fnOut << timeString << "FAILCMPCT - getblocktxn message sent for cmpctblock #" << inc-1 << std::endl;
-    fnOut << timeString << "REQSENT - cmpctblock #" << inc-1 << " is missing " << req.indexes.size() << " tx"<< std::endl;
+    fnOut << timeString << "FAILCMPCT - getblocktxn message sent for cmpctblock: " << blockHash << std::endl;
+    fnOut << timeString << "REQSENT - cmpctblock " << blockHash << " is missing " << req.size() << " tx" << std::endl;
 
-    fnReq << timeString << "indexes requested for missing tx from cmpctblock #" << inc-1 << std::endl;
-    for(unsigned int i = 0; i < req.indexes.size(); i++)
+    fnReq << timeString << "indexes requested for missing tx from cmpctblock: " << blockHash << std::endl;
+    for(unsigned int i = 0; i < req.size(); i++)
     {
-        fnReq << req.indexes[i] << std::endl;
+        fnReq << req[i] << std::endl;
     }
 
     fnOut << timeString << "REQSAVED -  " << reqFile << " file created" << std::endl;
@@ -425,12 +496,10 @@ void logFile(CTransaction tx, std::string from, std::string fileName)
 void dumpMemPool(std::string fileName, INVTYPE type, INVEVENT event, int counter)
 {
     std::string timeString = createTimeStamp();
-    if(fileName == "") fileName = directory + "logNode_" + nodeID + ".txt";
-    else fileName = directory + fileName;
     std::ofstream fnOut;
     std::string sysCmd;
     std::string mempoolFile;
-    fnOut.open(fileName,std::ofstream::app);
+    fnOut.open(directory + "logNode_" + nodeID + ".txt", std::ofstream::app);
     // dump mempool before or after an inv message is received
     // (to use with finding how the inv message affects the mempool)
     if(type == FALAFEL_RECEIVED)
@@ -440,7 +509,13 @@ void dumpMemPool(std::string fileName, INVTYPE type, INVEVENT event, int counter
     }
     else
     {
-	    mempoolFile = directory + std::to_string(inc) + "_mempoolFile.txt";
+	    mempoolFile = mempoolFileDir + fileName;
+        if(boost::filesystem::exists(mempoolFile))
+        {
+            std::cout << "<" + mempoolFile + "> already exists.. shutting down";
+            StartShutdown();
+            return;
+        }
 
 	    fnOut << timeString << "DMPMEMPOOL --- Dumping mempool to file: " << mempoolFile << std::endl;
     }
