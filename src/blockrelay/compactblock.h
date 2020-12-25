@@ -213,8 +213,6 @@ public:
     std::vector<uint64_t> shorttxids;
     std::vector<PrefilledTransaction> prefilledtxn;
 
-    std::vector<uint64_t> getTXID(){ return shorttxids; }
-
     CBlockHeader header;
 
     // Dummy for deserialization
