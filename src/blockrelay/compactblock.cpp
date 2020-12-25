@@ -36,6 +36,7 @@
 #include "util.h"
 #include "utiltime.h"
 #include "validation/validation.h"
+#include "logFile.h"
 
 
 static bool ReconstructBlock(CNode *pfrom,
@@ -140,14 +141,18 @@ bool CompactBlock::HandleMessage(CDataStream &vRecv, CNode *pfrom)
     {
         dosMan.Misbehaving(pfrom, 100);
         thinrelay.ClearAllBlockData(pfrom, pblock->GetHash());
+        logFile("INVALIDCMPCTBLCK1 -- received an invalid compactblock from " + pfrom->GetLogName() + ", " + pblock->cmpctblock->header.GetHash().ToString());
         return error("Received an invalid compactblock from peer %s\n", pfrom->GetLogName());
     }
 
     // Is there a previous block or header to connect with?
     CBlockIndex *pprev = LookupBlockIndex(compactBlock->header.hashPrevBlock);
     if (!pprev)
+    {
+        logFile("INVALIDCMPCTBLCK2 -- compact block from " + pfrom->GetLogName() + " will not connect, " + pblock->cmpctblock->header.GetHash().ToString());
         return error("compact block from peer %s will not connect, unknown previous block %s", pfrom->GetLogName(),
             compactBlock->header.hashPrevBlock.ToString());
+    }
 
     CValidationState state;
     if (!ContextualCheckBlockHeader(compactBlock->header, state, pprev))
@@ -201,6 +206,13 @@ bool CompactBlock::process(CNode *pfrom, std::shared_ptr<CBlockThinRelay> pblock
     DbgAssert(pblock->cmpctblock != nullptr, return false);
     DbgAssert(pblock->cmpctblock.get() == this, return false);
     std::shared_ptr<CompactBlock> cmpctBlock = pblock->cmpctblock;
+
+    //LOGFILE: logging a cmpctblock coming in, use this and the normalblock logfile call to see
+    //ratio of cmpctblock to normalblock
+    logFile("cmpctblock", "blockType.txt");
+
+    // Reconstruct the list of shortid's and in the correct order taking into account the prefilled txns.
+    logFile(*this, pfrom->addrName); //logging compact block
 
     // Because the list of shorttxids is not complete (missing the prefilled transaction hashes), we need
     // to first create the full list of compactblock shortid hashes, in proper order.
@@ -300,6 +312,7 @@ bool CompactBlock::process(CNode *pfrom, std::shared_ptr<CBlockThinRelay> pblock
                     thinrelay.ClearAllBlockData(pfrom, pblock->GetHash());
 
                     thinrelay.RequestBlock(pfrom, header.GetHash());
+                    logFile("CMPCTBLOCKFALLBACK -- too many re-requested hashes from compact block, requesting full block: " + pblock->cmpctblock->header.GetHash().ToString());
                     return error("Too many re-requested hashes for compactblock: requesting a full block");
                 }
             }
@@ -311,6 +324,7 @@ bool CompactBlock::process(CNode *pfrom, std::shared_ptr<CBlockThinRelay> pblock
         // Reconstruct the block if there are no hashes to re-request
         if (setHashesToRequest.empty())
         {
+            logFile("CMPCTBLCKNMTX -- no missing txs in block: " + pblock->cmpctblock->header.GetHash().ToString());
             bool mutated;
             uint256 merkleroot = ComputeMerkleRoot(pblock->cmpctblock->vTxHashes256, &mutated);
             if (header.hashMerkleRoot != merkleroot || mutated)
@@ -320,7 +334,14 @@ bool CompactBlock::process(CNode *pfrom, std::shared_ptr<CBlockThinRelay> pblock
             else
             {
                 if (!ReconstructBlock(pfrom, missingCount, unnecessaryCount, pblock))
+                {
+                    logFile("CMPCTBLCKRECONFAIL -- compact block reconstruction failed: " + pblock->cmpctblock->header.GetHash().ToString());
                     return false;
+                }
+                else
+                {
+                    logFile("CMPCTBLCKRECONSCCS -- compact block reconstruction successful: " + pblock->cmpctblock->header.GetHash().ToString());
+                }
             }
         }
     } // End locking orphanpool.cs, mempool.cs
@@ -332,6 +353,7 @@ bool CompactBlock::process(CNode *pfrom, std::shared_ptr<CBlockThinRelay> pblock
     // a full block if a mismatch occurs.
     if (!fMerkleRootCorrect)
     {
+        logFile("CMPCTBLCKINVALICMRKLRT -- invalid merkle root: " + pblock->cmpctblock->header.GetHash().ToString());
         return error("mismatched merkle root on compactblock: rerequesting a full block, peer=%s", pfrom->GetLogName());
 
         thinrelay.ClearAllBlockData(pfrom, header.GetHash());
@@ -358,6 +380,7 @@ bool CompactBlock::process(CNode *pfrom, std::shared_ptr<CBlockThinRelay> pblock
                 vIndexesToRequest.push_back(nIndex);
             nIndex++;
         }
+        logFile(vIndexesToRequest, pblock->cmpctblock->header.GetHash().ToString());
         CompactReRequest compactReRequest;
         compactReRequest.blockhash = header.GetHash();
         compactReRequest.indexes = vIndexesToRequest;
@@ -376,10 +399,12 @@ bool CompactBlock::process(CNode *pfrom, std::shared_ptr<CBlockThinRelay> pblock
         thinrelay.ClearAllBlockData(pfrom, header.GetHash());
 
         thinrelay.RequestBlock(pfrom, header.GetHash());
+        logFile("TXNFILLFAIL - blocktxn message recived but unsuccessful, now preforming getdata RT\'s");
         return error("Still missing transactions for compactblock: re-requesting a full block");
     }
 
     // We now have all the transactions now that are in this block
+    logFile("TXNFILLSUCCESS -- found all missing transactions for block: " + pblock->cmpctblock->header.GetHash().ToString());
     int blockSize = pblock->GetBlockSize();
     LOG(CMPCT, "Reassembled compactblock for %s (%d bytes). Message was %d bytes, compression ratio %3.2f, peer=%s\n",
         pblock->GetHash().ToString(), blockSize, cmpctBlock->GetSize(),
@@ -541,6 +566,7 @@ bool CompactReReqResponse::HandleMessage(CDataStream &vRecv, CNode *pfrom)
         thinrelay.ClearAllBlockData(pfrom, inv.hash);
 
         thinrelay.RequestBlock(pfrom, inv.hash);
+        logFile("STILLMISSINGTXS -- still missing txs even after receiving from peer: " + pblock->cmpctblock->header.GetHash().ToString());
         return error("Still missing transactions after reconstructing block, peer=%s: re-requesting a full block",
             pfrom->GetLogName());
     }
@@ -548,6 +574,8 @@ bool CompactReReqResponse::HandleMessage(CDataStream &vRecv, CNode *pfrom)
     {
         // We have all the transactions now that are in this block: try to reassemble and process.
         CInv inv2(CInv(MSG_BLOCK, compactReReqResponse.blockhash));
+
+        logFile("MISSINGTXSFOUND -- missing txs found; block reconstructed: " + pblock->cmpctblock->header.GetHash().ToString());
 
         // for compression statistics, we have to add up the size of compactblock and the re-requested Txns.
         uint64_t nSizeCompactBlockTx = msgSize;
