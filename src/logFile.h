@@ -71,7 +71,6 @@ void AddrLoggerThread();
 bool initProcessCPUUsageLogger();
 void CPUUsageLoggerThread();
 std::string createTimeStamp();
-void logFile();
 
 void logFile(std::string info, std::string fileName = ""); //logging a simple statement with timestamp
 void logFile(CompactBlock & Cblock, std::string from, std::string fileName = "");//info from cmpctBlock
