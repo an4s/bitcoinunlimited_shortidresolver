@@ -30,6 +30,7 @@
 #include "validationinterface.h"
 #include "version.h"
 #include "xversionkeys.h"
+#include "logFile.h"
 
 extern std::atomic<int64_t> nTimeBestReceived;
 extern std::atomic<int> nPreferredDownload;
@@ -1808,6 +1809,8 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
             // this could be an attack block of some kind.
             DbgAssert(nCheckBlockSize == pblock->GetBlockSize(), return true);
         }
+
+        logFile("normalblock: " + pblock->GetHash().ToString(), "blockType.txt");
 
         CInv inv(MSG_BLOCK, pblock->GetHash());
         LOG(BLK, "received block %s peer=%d\n", inv.hash.ToString(), pfrom->id);

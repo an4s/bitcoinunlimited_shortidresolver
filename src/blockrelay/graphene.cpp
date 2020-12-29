@@ -631,6 +631,8 @@ bool CGrapheneBlock::process(CNode *pfrom, std::string strCommand, std::shared_p
     std::set<uint64_t> setHashesToRequest;
     std::vector<uint256> vSenderFilterPositiveHahses;
 
+    logFile("grapheneblock: " + pblock->grapheneblock->header.GetHash().ToString(), "blockType.txt");
+
     bool fMerkleRootCorrect = true;
     {
         FillTxMapFromPools(mapPartialTxHash);

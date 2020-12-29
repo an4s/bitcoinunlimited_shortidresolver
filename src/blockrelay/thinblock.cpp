@@ -30,6 +30,7 @@
 #include "utiltime.h"
 #include "validation/validation.h"
 #include "xversionkeys.h"
+#include "logFile.h"
 
 static bool ReconstructBlock(CNode *pfrom,
     int &missingCount,
@@ -134,6 +135,8 @@ bool CThinBlock::process(CNode *pfrom, std::shared_ptr<CBlockThinRelay> pblock)
     DbgAssert(pblock->thinblock != nullptr, return false);
     DbgAssert(pblock->thinblock.get() == this, return false);
     unsigned int &nWaitingForTxns = pblock->thinblock->nWaitingFor;
+
+    logFile("thinblock: " + pblock->thinblock->header.GetHash().ToString(), "blockType.txt");
 
     // Check that the merkleroot matches the merkleroot calculated from the hashes provided.
     bool mutated;
@@ -607,6 +610,8 @@ bool CXThinBlock::process(CNode *pfrom, std::string strCommand, std::shared_ptr<
     DbgAssert(pblock->xthinblock != nullptr, return false);
     DbgAssert(pblock->xthinblock.get() == this, return false);
     std::shared_ptr<CXThinBlock> thinBlock = pblock->xthinblock;
+
+    logFile("xthinblock: " + pblock->xthinblock->header.GetHash().ToString(), "blockType.txt");
 
     // Create the mapMissingTx from all the supplied tx's in the xthinblock
     for (const CTransaction &tx : vMissingTx)

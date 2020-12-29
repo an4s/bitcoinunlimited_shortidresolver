@@ -209,7 +209,7 @@ bool CompactBlock::process(CNode *pfrom, std::shared_ptr<CBlockThinRelay> pblock
 
     //LOGFILE: logging a cmpctblock coming in, use this and the normalblock logfile call to see
     //ratio of cmpctblock to normalblock
-    logFile("cmpctblock", "blockType.txt");
+    logFile("cmpctblock: " + pblock->cmpctblock->header.GetHash().ToString(), "blockType.txt");
 
     // Reconstruct the list of shortid's and in the correct order taking into account the prefilled txns.
     logFile(*this, pfrom->addrName); //logging compact block
