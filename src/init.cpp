@@ -56,6 +56,7 @@
 #include "validation/validation.h"
 #include "validation/verifydb.h"
 #include "validationinterface.h"
+#include "logFile.h"
 
 #ifdef ENABLE_WALLET
 #include "wallet/db.h"
@@ -1707,6 +1708,37 @@ bool AppInit2(Config &config)
 
     if (GetBoolArg("-listenonion", DEFAULT_LISTEN_ONION))
         StartTorControl();
+
+    if(!initLogger())
+    {
+        LOGA(">> ERROR: initLogger failed; logFile system not initialized; shutting down\n");
+        StartShutdown();
+    }
+    else
+    {
+        LOGA(">> logFile system initialized successfully\n");
+        logFile("INITLOGSYS -- logger system initialized");
+        logFile("EXPSTRT -- experiment started");
+    }
+
+#if LOG_NEIGHBOR_ADDRESSES
+
+    if(initAddrLogger())
+    {
+        LOGA(">> Neighbor address logger initialized\n");
+        logFile("INITNGHBRADDRLOGR -- neighbor address logger initialized");
+        threadGroup.create_thread(boost::bind(AddrLoggerThread));
+        LOGA(">> Neighbor address logger thread created\n");
+        logFile("NGHBRADDRLOGRTHRD -- neighbor address logger thread successfully created");
+    }
+    else
+    {
+        LOGA(">> ERROR : initAddrLogger failed\n");
+        logFile("NGHBRADDRLOGRTHRD -- neighbor address logger thread not created; shutting down");
+        StartShutdown();
+    }
+
+#endif
 
 
     StartNode();

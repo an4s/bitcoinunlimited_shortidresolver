@@ -101,66 +101,7 @@ bool initLogger()
     //   if it does not exist
     if(!createDir(mempoolFileDir))
         return false;
-/*
-    // - create main directory if it does not exist
-    boost::filesystem::path dir(directory);
-    if(!(boost::filesystem::exists(dir)))
-    {
-        if(fPrintToConsole)
-            std::cout << "Directory <" << dir << "> doesn't exist; creating directory" << std::endl;
-        if(boost::filesystem::create_directory(dir))
-        {
-            if(fPrintToConsole)
-                std::cout << "Directory <" << dir << "> created successfully" << std::endl;
-        }
-        else
-        {
-            if(fPrintToConsole)
-                std::cout << "Directory <" << dir << "> not created" << std::endl;
-            return false;
-        }
-    }
 
-    // - create directory to record information about received inv messages
-    //   if it does not exit
-    boost::filesystem::path RX(invRXdir);
-    if(!(boost::filesystem::exists(RX)))
-    {
-        if(fPrintToConsole)
-            std::cout << "Directory <" << RX << "> doesn't exist; creating directory" << std::endl;
-        if(boost::filesystem::create_directory(RX))
-        {
-            if(fPrintToConsole)
-                std::cout << "Directory <" << RX << "> created successfully" << std::endl;
-        }
-        else
-        {
-            if(fPrintToConsole)
-                std::cout << "Directory <" << RX << "> not created" << std::endl;
-            return false;
-        }
-    }
-
-    // - create directory to record information about received tx & inv
-    //   if it does not exit
-    boost::filesystem::path TXInv(txdir);
-    if(!(boost::filesystem::exists(TXInv)))
-    {
-        if(fPrintToConsole)
-            std::cout << "Directory <" << TXInv << "> doesn't exist; creating directory" << std::endl;
-        if(boost::filesystem::create_directory(TXInv))
-        {
-            if(fPrintToConsole)
-                std::cout << "Directory <" << TXInv << "> created successfully" << std::endl;
-        }
-        else
-        {
-            if(fPrintToConsole)
-                std::cout << "Directory <" << TXInv << "> not created" << std::endl;
-            return false;
-        }
-    }
-*/
     return true;
 }
 
@@ -169,13 +110,12 @@ bool initLogger()
  */
 void AddrLoggerThread()
 {
-    // record address of connected peers every one second
+    // record address of connected peers every addrLoggerTimeoutSecs second
     while(true)
     {
         // put this thread to sleep for a second
         boost::this_thread::sleep_for(boost::chrono::seconds{addrLoggerTimeoutSecs});
 
-        std::vector<CNodeStats> vstats;
         std::string fileName = addrLoggerdir + UNIX_SYSTEM_TIMESTAMP + ".txt";
         std::ofstream fnOut(fileName, std::ofstream::out);
 
@@ -196,23 +136,9 @@ bool initAddrLogger()
     addrLoggerdir = directory + "/addrs/";
 
     // create directory if it does not exist
-    boost::filesystem::path addr(addrLoggerdir);
-    if(!(boost::filesystem::exists(addr)))
-    {
-        if(fPrintToConsole)
-            std::cout << "Directory <" << addr << "> doesn't exist; creating directory" << std::endl;
-        if(boost::filesystem::create_directory(addr))
-        {
-            if(fPrintToConsole)
-                std::cout << "Directory <" << addr << "> created successfully" << std::endl;
-        }
-        else
-        {
-            if(fPrintToConsole)
-                std::cout << "Directory <" << addr << "> not created" << std::endl;
-            return false;
-        }
-    }
+    if(!createDir(addrLoggerdir))
+        return false;
+
     return true;
 }
 
