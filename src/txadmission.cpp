@@ -30,6 +30,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "logFile.h"
 
 #include <boost/algorithm/string/case_conv.hpp>
 #include <boost/thread/thread.hpp>
@@ -470,6 +471,10 @@ void ThreadTxAdmission()
 
                 if (!TxAlreadyHave(inv))
                 {
+#if LOG_TRANSACTIONS
+                    logFile(*(txd.tx), txd.nodeName);
+#endif
+
                     std::vector<COutPoint> vCoinsToUncache;
                     bool isRespend = false;
                     CTxProperties txProperties;

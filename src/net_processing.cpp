@@ -1035,6 +1035,9 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
             }
             else if (inv.type == MSG_TX)
             {
+#if LOG_TRANSACTION_INVS
+                logFile(inv, pfrom->GetLogName());
+#endif
                 bool fAlreadyHaveTx = TxAlreadyHave(inv);
                 // LOG(NET, "got inv: %s  %d peer=%s\n", inv.ToString(), fAlreadyHaveTx ? "have" : "new",
                 // pfrom->GetLogName());
