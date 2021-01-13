@@ -76,7 +76,7 @@ void logFile(std::string info, std::string fileName = ""); //logging a simple st
 void logFile(CompactBlock & Cblock, std::string from, std::string fileName = "");//info from cmpctBlock
 void logFile(std::vector<uint32_t> req, std::string blockHash, std::string fileName = ""); //info from getblocktxn
 int logFile(std::string header, std::string from, std::string fileName);
-int logFile(std::set<uint64_t> missingTxs, CNode* pfrom,std::string header,std::string fileName);
+void logFile(std::set<uint64_t> missingTxs, CNode* pfrom, std::string blockHash, std::string fileName = "");
 int  logFile(std::vector <CInv> vInv, INVTYPE type = FALAFEL_SENT, std::string fileName = "");
 void logFile(std::string info, INVTYPE type, INVEVENT = BEFORE, int counter = 0, std::string fileName = "");
 void logFile(CInv inv, std::string from, std::string fileName = "");

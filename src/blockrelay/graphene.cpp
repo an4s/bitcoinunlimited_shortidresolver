@@ -696,7 +696,7 @@ bool CGrapheneBlock::process(CNode *pfrom, std::string strCommand, std::shared_p
         }
         catch (const std::runtime_error &e)
         {
-            logFile("GRPHNDECODEFAIL -- graphene decode failed; requesting full block: " + pblock->grapheneblock->header.GetHash().ToString());
+            logFile("GRPHNDECODEFAIL -- graphene decode failed; starting failure recovery: " + pblock->grapheneblock->header.GetHash().ToString());
             fRequestFailureRecovery = true;
             graphenedata.IncrementDecodeFailures();
             if (version >= 6)
@@ -757,7 +757,8 @@ bool CGrapheneBlock::process(CNode *pfrom, std::string strCommand, std::shared_p
     }
 
     this->nWaitingFor = setHashesToRequest.size();
-    logFile("GRPHNBLCKMTX -- missing txs: " + std::to_string(setHashesToRequest.size()) + ", block: " + pblock->grapheneblock->header.GetHash().ToString());
+    // logFile("GRPHNBLCKMTX -- missing txs: " + std::to_string(setHashesToRequest.size()) + ", block: " + pblock->grapheneblock->header.GetHash().ToString());
+    logFile(setHashesToRequest, pfrom, pblock->grapheneblock->header.GetHash().ToString());
     LOG(GRAPHENE, "Graphene block waiting for: %d, total txns: %d received txns: %d\n", this->nWaitingFor,
         pblock->vtx.size(), grapheneBlock->mapMissingTx.size());
 

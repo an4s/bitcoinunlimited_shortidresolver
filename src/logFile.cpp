@@ -25,12 +25,13 @@ static std::string directory;
 static std::string invRXdir;
 static std::string txdir;
 static std::string cmpctblkdir;
-static std::string reqTxdir;
+static std::string cmpctReqTxdir;
+static std::string grphnReqTxdir;
 static std::string mempoolFileDir;
 static std::string addrLoggerdir;
 static std::string cpudir;
 static int64_t addrLoggerTimeoutSecs = 1;
-static int inc = 0;
+// static int inc = 0;
 extern CTxMemPool mempool;
 
 void dumpMemPool(std::string fileName = "", INVTYPE type = FALAFEL_SENT, INVEVENT event = BEFORE, int counter = 0);
@@ -68,7 +69,8 @@ bool initLogger()
     invRXdir       = directory  + "/received/";
     txdir          = directory  + "/txs/";
     cmpctblkdir    = directory  + "/cmpctblk/";
-    reqTxdir       = directory  + "/getblocktxn/";
+    cmpctReqTxdir  = directory  + "/getblocktxn/";
+    grphnReqTxdir  = directory  + "/grapheneBlockTx/";
     mempoolFileDir = directory  + "/mempool/";
 
     // create directories if they do not exist
@@ -92,9 +94,14 @@ bool initLogger()
     if(!createDir(cmpctblkdir))
         return false;
 
-    // - create directory to record information about reqiested missing txs
+    // - create directory to record information about reqiested missing txs (compact blocks)
     //   if it does not exist
-    if(!createDir(reqTxdir))
+    if(!createDir(cmpctReqTxdir))
+        return false;
+
+    // - create directory to record information about reqiested missing txs (graphene blocks)
+    //   if it does not exist
+    if(!createDir(grphnReqTxdir))
         return false;
 
     // - create directory to record information about mempool when block is received
@@ -111,7 +118,7 @@ bool initLogger()
 void AddrLoggerThread()
 {
     // record address of connected peers every addrLoggerTimeoutSecs second
-    while(true)
+    while(!ShutdownRequested())
     {
         // put this thread to sleep for a second
         boost::this_thread::sleep_for(boost::chrono::seconds{addrLoggerTimeoutSecs});
@@ -121,7 +128,11 @@ void AddrLoggerThread()
 
         // log stat for each connected node (CHECK THAT THIS IS BEHAVING AS INTENDED)
         for(CNode * pNode : vNodes)
-            fnOut << pNode->addr.ToStringIP() << std::endl;
+        {
+            fnOut << pNode->addr.ToStringIP() << ", " << pNode->GrapheneCapable() << std::endl;
+            // if(!pNode->GrapheneCapable())
+            //     pNode->fDisconnect = true;
+        }
 
         fnOut.close();
     }
@@ -170,7 +181,7 @@ void logFile(CompactBlock & Cblock, std::string from, std::string fileName)
     std::string compactBlock = cmpctblkdir + blockHash;
     if(boost::filesystem::exists(compactBlock))
     {
-        std::cout << "<" + compactBlock + "> already exists.. shutting down";
+        std::cout << "In " << __func__ << ": " << __LINE__ << ": <" + compactBlock + "> already exists.. shutting down";
         StartShutdown();
         return;
     }
@@ -203,7 +214,7 @@ void logFile(CompactBlock & Cblock, std::string from, std::string fileName)
     fnCmpct.close();
     fnOut.close();
 
-    dumpMemPool();
+    dumpMemPool(blockHash);
     // inc++;
 
     // return inc - 1;
@@ -214,10 +225,10 @@ void logFile(std::vector<uint32_t> req, std::string blockHash, std::string fileN
     std::string timeString = createTimeStamp();
     if(fileName == "") fileName = directory + "logNode_" + nodeID + ".txt";
     else fileName = directory + fileName;
-    std::string reqFile = reqTxdir + blockHash;
+    std::string reqFile = cmpctReqTxdir + blockHash;
     if(boost::filesystem::exists(reqFile))
     {
-        std::cout << "<" + reqFile + "> already exists.. shutting down";
+        std::cout << "In " << __func__ << ": " << __LINE__ << ": <" + reqFile + "> already exists.. shutting down";
         StartShutdown();
         return;
     }
@@ -248,9 +259,11 @@ void logFile(std::vector<uint32_t> req, std::string blockHash, std::string fileN
     fnReq.close();
 }
 
+// TODO: remove
 /*
  * Log the header, ip of peer and dump the mempool for a graphene block
  */
+#if 0
 int logFile(std::string header, std::string from, std::string fileName)
 {
     std::string timeString = createTimeStamp();
@@ -269,16 +282,25 @@ int logFile(std::string header, std::string from, std::string fileName)
 
     return inc - 1;
 }
+#endif
 
 /*
  * Log missing transactions in a graphene block
  */
-int logFile(std::set<uint64_t> missingTxs, CNode* pfrom,std::string header,std::string fileName)
+void logFile(std::set<uint64_t> missingTxs, CNode* pfrom, std::string blockHash, std::string fileName)
 {
     std::string timeString = createTimeStamp();
     if(fileName == "") fileName = directory + "logNode_" + nodeID + ".txt";
     else fileName = directory + fileName;
-    std::string grapheneBlock = directory + std::to_string(inc) + "_grapheneblock.txt";
+    std::string grapheneBlock = grphnReqTxdir + blockHash;
+
+    if(boost::filesystem::exists(grapheneBlock))
+    {
+        std::cout << "In " << __func__ << ": " << __LINE__ << ": <" + grapheneBlock + "> already exists.. shutting down";
+        StartShutdown();
+        return;
+    }
+
     std::ofstream fnGraphene;
     std::ofstream fnOut;
 
@@ -286,11 +308,11 @@ int logFile(std::set<uint64_t> missingTxs, CNode* pfrom,std::string header,std::
     fnGraphene.open(grapheneBlock, std::ofstream::out);
 
     if(missingTxs.size() > 0)
-        fnOut << timeString << "GRMISSINGTX - Missing " << missingTxs.size() << " transactions from graphene block: " << header << std::endl;
+        fnOut << timeString << "GRMISSINGTX - Missing " << missingTxs.size() << " transactions from graphene block: " << blockHash << std::endl;
     else
-        fnOut << timeString << "GRNOMISSINGTXS - All txs needed to reconstruct this graphene block were found in our mempool: " << header << std::endl;
+        fnOut << timeString << "GRNOMISSINGTXS - All txs needed to reconstruct this graphene block were found in our mempool: " << blockHash << std::endl;
 
-    fnGraphene << header << std::endl;
+    // fnGraphene << header << std::endl;
     fnGraphene << std::to_string(pfrom->gr_shorttxidk0) << "\n" << std::to_string(pfrom->gr_shorttxidk1) << std::endl;
 
     for(auto itr : missingTxs)
@@ -298,10 +320,7 @@ int logFile(std::set<uint64_t> missingTxs, CNode* pfrom,std::string header,std::
         fnGraphene << itr << std::endl;
     }
 
-    inc++;
     fnGraphene.close();
-
-    return inc - 1;
 }
 
 void logFile(std::string info, INVTYPE type, INVEVENT event, int counter, std::string fileName)
