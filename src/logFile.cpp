@@ -34,7 +34,7 @@ static int64_t addrLoggerTimeoutSecs = 1;
 // static int inc = 0;
 extern CTxMemPool mempool;
 
-void dumpMemPool(std::string fileName = "", INVTYPE type = FALAFEL_SENT, INVEVENT event = BEFORE, int counter = 0);
+void dumpMemPool(std::string fileName = "", std::string from = "", INVTYPE type = FALAFEL_SENT, INVEVENT event = BEFORE, int counter = 0);
 
 bool createDir(std::string dirName)
 {
@@ -179,12 +179,23 @@ void logFile(CompactBlock & Cblock, std::string from, std::string fileName)
     else fileName = directory + fileName;
     std::string blockHash = Cblock.header.GetHash().ToString();
     std::string compactBlock = cmpctblkdir + blockHash;
-    if(boost::filesystem::exists(compactBlock))
+
+    if(!createDir(compactBlock))
     {
-        std::cout << "In " << __func__ << ": " << __LINE__ << ": <" + compactBlock + "> already exists.. shutting down";
+        logFile("ERROR -- couldn't create directory <" + compactBlock + ">...");
         StartShutdown();
         return;
     }
+
+    compactBlock += '/' + from;
+
+    if(boost::filesystem::exists(compactBlock))
+    {
+        logFile("ERROR -- In <" + std::string(__func__) + ">: " + std::to_string(__LINE__) + ": <" + compactBlock + "> already exists.. shutting down");
+        StartShutdown();
+        return;
+    }
+
     std::vector<uint64_t> txid;
     std::ofstream fnOut;
     std::ofstream fnCmpct;
@@ -214,21 +225,31 @@ void logFile(CompactBlock & Cblock, std::string from, std::string fileName)
     fnCmpct.close();
     fnOut.close();
 
-    dumpMemPool(blockHash);
+    dumpMemPool(blockHash, from);
     // inc++;
 
     // return inc - 1;
 }
 
-void logFile(std::vector<uint32_t> req, std::string blockHash, std::string fileName)
+void logFile(std::vector<uint32_t> req, std::string blockHash, std::string from, std::string fileName)
 {
     std::string timeString = createTimeStamp();
     if(fileName == "") fileName = directory + "logNode_" + nodeID + ".txt";
     else fileName = directory + fileName;
     std::string reqFile = cmpctReqTxdir + blockHash;
+
+    if(!createDir(reqFile))
+    {
+        logFile("ERROR -- couldn't create directory <" + reqFile + ">...");
+        StartShutdown();
+        return;
+    }
+
+    reqFile += '/' + from;
+
     if(boost::filesystem::exists(reqFile))
     {
-        std::cout << "In " << __func__ << ": " << __LINE__ << ": <" + reqFile + "> already exists.. shutting down";
+        logFile("ERROR -- In <" + std::string(__func__) + ">: " + std::to_string(__LINE__) + ": <" + reqFile + "> already exists.. shutting down");
         StartShutdown();
         return;
     }
@@ -294,9 +315,18 @@ void logFile(std::set<uint64_t> missingTxs, CNode* pfrom, std::string blockHash,
     else fileName = directory + fileName;
     std::string grapheneBlock = grphnReqTxdir + blockHash;
 
+    if(!createDir(grapheneBlock))
+    {
+        logFile("ERROR -- couldn't create directory <" + grapheneBlock + ">...");
+        StartShutdown();
+        return;
+    }
+
+    grapheneBlock += '/' + pfrom->addrName;
+
     if(boost::filesystem::exists(grapheneBlock))
     {
-        std::cout << "In " << __func__ << ": " << __LINE__ << ": <" + grapheneBlock + "> already exists.. shutting down";
+        logFile("ERROR -- In <" + std::string(__func__) + ">: " + std::to_string(__LINE__) + ": <" + grapheneBlock + "> already exists.. shutting down");
         StartShutdown();
         return;
     }
@@ -327,7 +357,7 @@ void logFile(std::string info, INVTYPE type, INVEVENT event, int counter, std::s
 {
 	if(info == "mempool")
 	{
-		dumpMemPool(fileName, type, event, counter);
+		dumpMemPool(fileName, "", type, event, counter);
 		return;
 	}
 }
@@ -438,7 +468,7 @@ void logFile(CTransaction tx, std::string from, std::string fileName)
 /*
  * Dump current state of the mempool to a file
  */
-void dumpMemPool(std::string fileName, INVTYPE type, INVEVENT event, int counter)
+void dumpMemPool(std::string fileName, std::string from, INVTYPE type, INVEVENT event, int counter)
 {
     std::string timeString = createTimeStamp();
     std::ofstream fnOut;
@@ -455,9 +485,19 @@ void dumpMemPool(std::string fileName, INVTYPE type, INVEVENT event, int counter
     else
     {
 	    mempoolFile = mempoolFileDir + fileName;
+
+        if(!createDir(mempoolFile))
+        {
+            logFile("ERROR -- couldn't create directory <" + mempoolFile + ">...");
+            StartShutdown();
+            return;
+        }
+
+        mempoolFile += '/' + from;
+
         if(boost::filesystem::exists(mempoolFile))
         {
-            std::cout << "<" + mempoolFile + "> already exists.. shutting down";
+            logFile("ERROR -- In <" + std::string(__func__) + ">: " + std::to_string(__LINE__) + ": <" + mempoolFile + "> already exists.. shutting down");
             StartShutdown();
             return;
         }

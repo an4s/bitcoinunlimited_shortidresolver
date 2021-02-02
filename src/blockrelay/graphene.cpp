@@ -230,7 +230,7 @@ bool CGrapheneBlockTx::HandleMessage(CDataStream &vRecv, CNode *pfrom)
     CInv inv(MSG_GRAPHENEBLOCK, grapheneBlockTx.blockhash);
     if (grapheneBlockTx.vMissingTx.empty())
     {
-        logFile("GRPHNBLCKMTXRECOVERYFAIL -- failed to recover missing transactions in block: " + pblock->grapheneblock->header.GetHash().ToString());
+        logFile("GRPHNBLCKMTXRECOVERYFAIL -- failed to recover missing transactions in block: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->addrName);
         // Normal effect if the IBLT decode on the other side completely failed
         std::shared_ptr<CBlockThinRelay> backup = std::make_shared<CBlockThinRelay>(*pblock);
         RequestFailoverBlock(pfrom, backup);
@@ -243,7 +243,7 @@ bool CGrapheneBlockTx::HandleMessage(CDataStream &vRecv, CNode *pfrom)
             "Incorrectly constructed grblocktx  data received, hash is NULL.  Banning peer=%s", pfrom->GetLogName());
     }
 
-    logFile("GRPHNBLCKMTXRECV -- received missing txs for graphene block: " + pblock->grapheneblock->header.GetHash().ToString());
+    logFile("GRPHNBLCKMTXRECV -- received missing txs for graphene block: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->addrName);
     LOG(GRAPHENE, "Received grblocktx for %s peer=%s\n", inv.hash.ToString(), pfrom->GetLogName());
     {
         // Do not process unrequested grblocktx unless from an expedited node.
@@ -284,7 +284,7 @@ bool CGrapheneBlockTx::HandleMessage(CDataStream &vRecv, CNode *pfrom)
     // request a failover block instead.
     if (grapheneBlockTx.vMissingTx.size() < grapheneBlock->nWaitingFor)
     {
-        logFile("GRPHNBLCKSTILLMTX -- still missing transactions from block; requesting full block: " + pblock->grapheneblock->header.GetHash().ToString());
+        logFile("GRPHNBLCKSTILLMTX -- still missing transactions from block; requesting full block: " + pblock->grapheneblock->header.GetHash().ToString()  + " from " + pfrom->addrName);
         RequestFailoverBlock(pfrom, backup);
         return error("Still missing transactions from those returned by sender, peer=%s: re-requesting failover block",
             pfrom->GetLogName());
@@ -292,7 +292,7 @@ bool CGrapheneBlockTx::HandleMessage(CDataStream &vRecv, CNode *pfrom)
 
     grapheneBlock->AddNewTransactions(grapheneBlockTx.vMissingTx, pfrom);
 
-    logFile("GRPHNBLCKMTXFOUND -- found missing txs for block: " + pblock->grapheneblock->header.GetHash().ToString());
+    logFile("GRPHNBLCKMTXFOUND -- found missing txs for block: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->addrName);
     LOG(GRAPHENE, "Got %d Re-requested txs from peer=%s\n", grapheneBlockTx.vMissingTx.size(), pfrom->GetLogName());
 
     std::map<uint64_t, CTransactionRef> mapPartialTxHash;
@@ -326,10 +326,12 @@ bool CGrapheneBlockTx::HandleMessage(CDataStream &vRecv, CNode *pfrom)
     if (!grapheneBlock->ValidateAndRecontructBlock(
             grapheneBlockTx.blockhash, pblock, mapPartialTxHash, strCommand, pfrom, vRecv))
     {
-        logFile("GRPHNBLCKFAIL -- graphene block validation and reconstruction failed after getting missing transactions: " + pblock->grapheneblock->header.GetHash().ToString());
+        logFile("GRPHNBLCKMTXRECONFAIL -- graphene block validation and reconstruction failed after getting missing transactions: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->addrName);
         RequestFailoverBlock(pfrom, backup);
         return error("Graphene ValidateAndRecontructBlock failed");
     }
+
+    logFile("GRPHNBLCKMTXRECONSCCS -- graphene block successfully reconstructed after receiving missing transactions: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->addrName);
 
     return true;
 }
@@ -613,7 +615,7 @@ bool CGrapheneBlock::process(CNode *pfrom, std::string strCommand, std::shared_p
     DbgAssert(pblock->grapheneblock.get() == this, return false);
     std::shared_ptr<CGrapheneBlock> grapheneBlock = pblock->grapheneblock;
 
-    logFile("GRPHNBLCKRECV -- received graphene block " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->GetLogName());
+    logFile("GRPHNBLCKRECV -- received graphene block " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->addrName);
 
     pblock->nVersion = header.nVersion;
     pblock->nBits = header.nBits;
@@ -696,7 +698,7 @@ bool CGrapheneBlock::process(CNode *pfrom, std::string strCommand, std::shared_p
         }
         catch (const std::runtime_error &e)
         {
-            logFile("GRPHNDECODEFAIL -- graphene decode failed; starting failure recovery: " + pblock->grapheneblock->header.GetHash().ToString());
+            logFile("GRPHNDECODEFAIL -- graphene decode failed; starting failure recovery: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->addrName);
             fRequestFailureRecovery = true;
             graphenedata.IncrementDecodeFailures();
             if (version >= 6)
@@ -714,7 +716,7 @@ bool CGrapheneBlock::process(CNode *pfrom, std::string strCommand, std::shared_p
         // Reconstruct the block if there are no hashes to re-request
         if (setHashesToRequest.empty() && !fRequestFailureRecovery)
         {
-            logFile("GRPHNBLCKNMTX -- no missing txs in graphene block: " + pblock->grapheneblock->header.GetHash().ToString());
+            logFile("GRPHNBLCKNMTX -- no missing txs in graphene block: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->addrName);
             bool mutated;
             uint256 merkleroot = ComputeMerkleRoot(grapheneBlock->vTxHashes256, &mutated);
             if (header.hashMerkleRoot != merkleroot || mutated)
@@ -723,12 +725,12 @@ bool CGrapheneBlock::process(CNode *pfrom, std::string strCommand, std::shared_p
             {
                 if (!ReconstructBlock(pfrom, pblock, mapPartialTxHash))
                 {
-                    logFile("GRPHNBLCKRECONFAIL -- grahene block reconstruction failed: " + pblock->grapheneblock->header.GetHash().ToString());
+                    logFile("GRPHNBLCKRECONFAIL -- grahene block reconstruction failed: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->addrName);
                     return false;
                 }
                 else
                 {
-                    logFile("GRPHNBLCKRECONSCCS -- grahene block reconstruction success: " + pblock->grapheneblock->header.GetHash().ToString());
+                    logFile("GRPHNBLCKRECONSCCS -- grahene block reconstruction success: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->addrName);
                 }
             }
         }
@@ -739,7 +741,7 @@ bool CGrapheneBlock::process(CNode *pfrom, std::string strCommand, std::shared_p
     // This must be checked outside of the above section or deadlock may occur.
     if (fRequestFailureRecovery)
     {
-        logFile("GRPHNBLCKREQFAILREC -- requesting failure recovery for block: " + pblock->grapheneblock->header.GetHash().ToString());
+        logFile("GRPHNBLCKREQFAILREC -- requesting failure recovery for block: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->addrName);
         RequestFailureRecovery(pfrom, grapheneBlock, vSenderFilterPositiveHahses);
         return true;
     }
@@ -750,7 +752,7 @@ bool CGrapheneBlock::process(CNode *pfrom, std::string strCommand, std::shared_p
     // a failover block if a mismatch occurs.
     if (!fMerkleRootCorrect)
     {
-        logFile("GRPHNBLCKBADMERKLE -- bad merkle root in graphene block: " + pblock->grapheneblock->header.GetHash().ToString());
+        logFile("GRPHNBLCKBADMERKLE -- bad merkle root in graphene block: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->addrName);
         RequestFailoverBlock(pfrom, pblock);
         return error(
             "Mismatched merkle root on grapheneblock: requesting failover block, peer=%s", pfrom->GetLogName());
@@ -758,7 +760,7 @@ bool CGrapheneBlock::process(CNode *pfrom, std::string strCommand, std::shared_p
 
     this->nWaitingFor = setHashesToRequest.size();
     // logFile("GRPHNBLCKMTX -- missing txs: " + std::to_string(setHashesToRequest.size()) + ", block: " + pblock->grapheneblock->header.GetHash().ToString());
-    logFile(setHashesToRequest, pfrom, pblock->grapheneblock->header.GetHash().ToString());
+    // logFile(setHashesToRequest, pfrom, pblock->grapheneblock->header.GetHash().ToString());
     LOG(GRAPHENE, "Graphene block waiting for: %d, total txns: %d received txns: %d\n", this->nWaitingFor,
         pblock->vtx.size(), grapheneBlock->mapMissingTx.size());
 
@@ -766,9 +768,12 @@ bool CGrapheneBlock::process(CNode *pfrom, std::string strCommand, std::shared_p
     // This must be done outside of the mempool.cs lock or may deadlock.
     if (setHashesToRequest.size() > 0)
     {
+        logFile("GRPHNBLCKMTX -- missing txs: " + std::to_string(setHashesToRequest.size()) + ", block: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->addrName);
+        logFile(setHashesToRequest, pfrom, pblock->grapheneblock->header.GetHash().ToString());
         grapheneBlock->nWaitingFor = setHashesToRequest.size();
         CRequestGrapheneBlockTx grapheneBlockTx(header.GetHash(), setHashesToRequest);
         pfrom->PushMessage(NetMsgType::GET_GRAPHENETX, grapheneBlockTx);
+        logFile("GRPHNBLCKMTXREQSENT -- sending request for missing transactions for graphene block: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->addrName);
 
         // Update run-time statistics of graphene block bandwidth savings
         graphenedata.UpdateInBoundReRequestedTx(grapheneBlock->nWaitingFor);
@@ -1496,7 +1501,7 @@ bool HandleGrapheneBlockRecoveryResponse(CDataStream &vRecv, CNode *pfrom, const
     DbgAssert(pblock->grapheneblock != nullptr, return false);
     CGrapheneBlock grapheneBlock = *(pblock->grapheneblock);
 
-    logFile("GRPHNBLCKFAILRECRES -- attempting graphene block failure recovery upon response: " + pblock->grapheneblock->header.GetHash().ToString());
+    logFile("GRPHNBLCKFAILRECRES -- attempting graphene block failure recovery upon response: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->addrName);
 
     CIblt localIblt((*recoveryResponse.pRevisedIblt));
     localIblt.reset();
@@ -1561,7 +1566,7 @@ bool HandleGrapheneBlockRecoveryResponse(CDataStream &vRecv, CNode *pfrom, const
     }
     catch (const std::runtime_error &error)
     {
-        logFile("GRPHNBLCKFAILRECFAIL -- graphene block failure recovery failed; requesting failover: " + pblock->grapheneblock->header.GetHash().ToString());
+        logFile("GRPHNBLCKFAILRECFAIL -- graphene block reconcile after failure recovery failed; requesting failover: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->addrName);
         // Graphene set still could not be reconciled
         LOG(GRAPHENE, "Could not reconcile failure recovery Graphene set from peer=%s; requesting failover block\n",
             pfrom->GetLogName());
@@ -1569,7 +1574,7 @@ bool HandleGrapheneBlockRecoveryResponse(CDataStream &vRecv, CNode *pfrom, const
         return true;
     }
 
-    logFile("GRPHNBLCKFAILRECSCCS -- graphene block failure recovery succesful: " + pblock->grapheneblock->header.GetHash().ToString());
+    logFile("GRPHNBLCKFAILRECSCCS -- graphene block reconcile after failure recovery succesful: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->addrName);
     LOG(GRAPHENE, "Successfully reconciled failure recovery Graphene set from peer=%s\n", pfrom->GetLogName());
 
     std::set<uint64_t> setHashesToRequest = pblock->grapheneblock->UpdateResolvedTxsAndIdentifyMissing(
@@ -1579,10 +1584,12 @@ bool HandleGrapheneBlockRecoveryResponse(CDataStream &vRecv, CNode *pfrom, const
     // If there are missing transactions, we must request them here
     if (setHashesToRequest.size() > 0)
     {
-        logFile("GRPHNBLCKFAILRECMTX -- missing txs: " + std::to_string(setHashesToRequest.size()) + "; block: " + pblock->grapheneblock->header.GetHash().ToString());
+        logFile("GRPHNBLCKFAILRECMTX -- missing txs: " + std::to_string(setHashesToRequest.size()) + "; block: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->addrName);
+        logFile(setHashesToRequest, pfrom, pblock->grapheneblock->header.GetHash().ToString());
         pblock->grapheneblock->nWaitingFor = setHashesToRequest.size();
         CRequestGrapheneBlockTx grapheneBlockTx(recoveryResponse.blockhash, setHashesToRequest);
         pfrom->PushMessage(NetMsgType::GET_GRAPHENETX, grapheneBlockTx);
+        logFile("GRPHNBLCKFAILRECMTXREQSENT -- sending request for missing transactions for graphene block: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->addrName);
 
         // Update run-time statistics of graphene block bandwidth savings
         graphenedata.UpdateInBoundReRequestedTx(grapheneBlock.nWaitingFor);
@@ -1593,13 +1600,13 @@ bool HandleGrapheneBlockRecoveryResponse(CDataStream &vRecv, CNode *pfrom, const
     if (!pblock->grapheneblock->ValidateAndRecontructBlock(
             recoveryResponse.blockhash, pblock, mapTxFromPools, NetMsgType::GRAPHENE_RECOVERY, pfrom, vRecv))
     {
-        logFile("GRPHNBLCKFAILRECRECONFAIL -- graphene block reconstruction failed; requesting failover: " + pblock->grapheneblock->header.GetHash().ToString());
+        logFile("GRPHNBLCKFAILRECRECONFAIL -- graphene block reconstruction failed; requesting failover: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->addrName);
         RequestFailoverBlock(pfrom, pblock);
         return error("Graphene ValidateAndRecontructBlock failed");
     }
     else
     {
-        logFile("GRPHNBLCKFAILRECRECONSCCS -- graphene block reconstruction successful: " + pblock->grapheneblock->header.GetHash().ToString());
+        logFile("GRPHNBLCKFAILRECRECONSCCS -- graphene block reconstruction successful: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->addrName);
     }
 
     return true;

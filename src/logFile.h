@@ -74,7 +74,7 @@ std::string createTimeStamp();
 
 void logFile(std::string info, std::string fileName = ""); //logging a simple statement with timestamp
 void logFile(CompactBlock & Cblock, std::string from, std::string fileName = "");//info from cmpctBlock
-void logFile(std::vector<uint32_t> req, std::string blockHash, std::string fileName = ""); //info from getblocktxn
+void logFile(std::vector<uint32_t> req, std::string blockHash, std::string from, std::string fileName = ""); //info from getblocktxn
 int logFile(std::string header, std::string from, std::string fileName);
 void logFile(std::set<uint64_t> missingTxs, CNode* pfrom, std::string blockHash, std::string fileName = "");
 int  logFile(std::vector <CInv> vInv, INVTYPE type = FALAFEL_SENT, std::string fileName = "");
