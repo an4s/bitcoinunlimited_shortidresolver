@@ -713,6 +713,9 @@ bool CGrapheneBlock::process(CNode *pfrom, std::string strCommand, std::shared_p
             }
         }
 
+        if(!fRequestFailureRecovery)
+            logFile("GRPHNDECODESCCS -- graphene decode successful: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->addrName);
+
         // Reconstruct the block if there are no hashes to re-request
         if (setHashesToRequest.empty() && !fRequestFailureRecovery)
         {
