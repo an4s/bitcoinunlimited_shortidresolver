@@ -1719,6 +1719,9 @@ bool AppInit2(Config &config)
         LOGA(">> logFile system initialized successfully\n");
         logFile("INITLOGSYS -- logger system initialized");
         logFile("EXPSTRT -- experiment started");
+        if(IsThinBlocksEnabled())    logFile("XTHINBLCKENBLD -- xthin blocks enabled");
+        if(IsCompactBlocksEnabled()) logFile("CMPCTBLCKENBLD -- compact blocks enabled");
+        if(IsGrapheneBlockEnabled()) logFile("GRPHNBLCKENBLD -- graphene blocks enabled");
     }
 
 #if LOG_NEIGHBOR_ADDRESSES
