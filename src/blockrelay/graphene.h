@@ -501,7 +501,7 @@ bool HandleGrapheneBlockRequest(CDataStream &vRecv, CNode *pfrom, const CChainPa
 bool HandleGrapheneBlockRecoveryResponse(CDataStream &vRecv, CNode *pfrom, const CChainParams &chainparams);
 bool HandleGrapheneBlockRecoveryRequest(CDataStream &vRecv, CNode *pfrom, const CChainParams &chainparams);
 CMemPoolInfo GetGrapheneMempoolInfo();
-void RequestFailureRecovery(CNode *pfrom,
+int RequestFailureRecovery(CNode *pfrom,
     std::shared_ptr<CGrapheneBlock> pblock,
     std::vector<uint256> vSenderFilterPositiveHahses);
 void RequestFailoverBlock(CNode *pfrom, std::shared_ptr<CBlockThinRelay> pblock);

@@ -27,6 +27,7 @@ static std::string txdir;
 static std::string cmpctblkdir;
 static std::string cmpctReqTxdir;
 static std::string grphnReqTxdir;
+static std::string normalblkTxDir;
 static std::string mempoolFileDir;
 static std::string addrLoggerdir;
 static std::string cpudir;
@@ -70,8 +71,9 @@ bool initLogger()
     txdir          = directory  + "/txs/";
     cmpctblkdir    = directory  + "/cmpctblk/";
     cmpctReqTxdir  = directory  + "/getblocktxn/";
-    grphnReqTxdir  = directory  + "/grapheneBlockTx/";
+    grphnReqTxdir  = directory  + "/grapheneblocktxs/";
     mempoolFileDir = directory  + "/mempool/";
+    normalblkTxDir = directory  + "/normalblocktxs/";
 
     // create directories if they do not exist
 
@@ -107,6 +109,11 @@ bool initLogger()
     // - create directory to record information about mempool when block is received
     //   if it does not exist
     if(!createDir(mempoolFileDir))
+        return false;
+
+    // - create directory to record transactions in a normal block
+    //   if it does not exist
+    if(!createDir(normalblkTxDir))
         return false;
 
     return true;
@@ -191,8 +198,8 @@ void logFile(CompactBlock & Cblock, std::string from, std::string fileName)
 
     if(boost::filesystem::exists(compactBlock))
     {
-        logFile("ERROR -- In <" + std::string(__func__) + ">: " + std::to_string(__LINE__) + ": <" + compactBlock + "> already exists.. shutting down");
-        StartShutdown();
+        logFile("WARN -- In <" + std::string(__func__) + ">: " + std::to_string(__LINE__) + ": <" + compactBlock + "> already exists.. possible duplicate.. skipping");
+        // StartShutdown();
         return;
     }
 
@@ -203,8 +210,11 @@ void logFile(CompactBlock & Cblock, std::string from, std::string fileName)
     fnOut.open(fileName, std::ofstream::app);
     fnCmpct.open(compactBlock, std::ofstream::out);
 
-    fnOut << timeString << "CMPCTRECIVED - compact block received from " << from << std::endl;
-    fnOut << timeString << "CMPCTBLKHASH - " << blockHash << std::endl;
+    fnOut << timeString << "CMPCTRECIVED - compact block received; hash: " << blockHash
+          << "; from " << from << "; prefilledtxns: " << Cblock.prefilledtxn.size()
+          << "; shorttxids: " << Cblock.shorttxids.size()
+          << "; block size: " << Cblock.GetSize() << " (bytes)" << std::endl;
+
     txid = Cblock.getTXID();
 
     fnCmpct << blockHash << std::endl;
@@ -231,7 +241,7 @@ void logFile(CompactBlock & Cblock, std::string from, std::string fileName)
     // return inc - 1;
 }
 
-void logFile(std::vector<uint32_t> req, std::string blockHash, std::string from, std::string fileName)
+void logFile(std::vector<uint32_t> req, std::string blockHash, std::string from, uint64_t reqSize, std::string fileName)
 {
     std::string timeString = createTimeStamp();
     if(fileName == "") fileName = directory + "logNode_" + nodeID + ".txt";
@@ -249,8 +259,8 @@ void logFile(std::vector<uint32_t> req, std::string blockHash, std::string from,
 
     if(boost::filesystem::exists(reqFile))
     {
-        logFile("ERROR -- In <" + std::string(__func__) + ">: " + std::to_string(__LINE__) + ": <" + reqFile + "> already exists.. shutting down");
-        StartShutdown();
+        logFile("WARN -- In <" + std::string(__func__) + ">: " + std::to_string(__LINE__) + ": <" + reqFile + "> already exists.. possible duplicate.. skipping");
+        // StartShutdown();
         return;
     }
     std::ofstream fnOut;
@@ -259,7 +269,7 @@ void logFile(std::vector<uint32_t> req, std::string blockHash, std::string from,
     fnOut.open(fileName, std::ofstream::app);
     fnReq.open(reqFile, std::ofstream::out);
 
-    fnOut << timeString << "FAILCMPCT - getblocktxn message sent for cmpctblock: " << blockHash << std::endl;
+    fnOut << timeString << "FAILCMPCT - getblocktxn message of size " << reqSize << " (bytes) sent for cmpctblock: " << blockHash << std::endl;
     fnOut << timeString << "REQSENT - cmpctblock " << blockHash << " is missing " << req.size() << " tx" << std::endl;
 
     fnReq << timeString << "indexes requested for missing tx from cmpctblock: " << blockHash << std::endl;
@@ -278,6 +288,46 @@ void logFile(std::vector<uint32_t> req, std::string blockHash, std::string from,
 
     fnOut.close();
     fnReq.close();
+}
+
+/*
+ * Log transactions in a normal block to file
+ */
+void logFile(std::vector<CTransactionRef> vtx, std::string blockHash, std::string from, std::string fileName)
+{
+    std::string timeString = createTimeStamp();
+    if(fileName == "") fileName = directory + "logNode_" + nodeID + ".txt";
+    else fileName = directory + fileName;
+    std::string txFile = normalblkTxDir + blockHash;
+
+    if(!createDir(txFile))
+    {
+        logFile("ERROR -- couldn't create directory <" + txFile + ">...");
+        StartShutdown();
+        return;
+    }
+
+    txFile += '/' + from;
+
+    if(boost::filesystem::exists(txFile))
+    {
+        logFile("WARN -- In <" + std::string(__func__) + ">: " + std::to_string(__LINE__) + ": <" + txFile + "> already exists.. possible duplicate.. skipping");
+        // StartShutdown();
+        return;
+    }
+
+    std::ofstream fnOut;
+    std::ofstream fnTx;
+
+    fnOut.open(fileName, std::ofstream::app);
+    fnTx.open(txFile, std::ofstream::out);
+
+    fnOut << timeString << "NORMALBLCKTXS -- txs of block: " << blockHash << " saved to file <" << txFile << ">" << std::endl;
+    for(CTransactionRef tx : vtx)
+        fnTx << tx->GetHash().ToString() << std::endl;
+
+    fnOut.close();
+    fnTx.close();
 }
 
 // TODO: remove
@@ -326,8 +376,8 @@ void logFile(std::set<uint64_t> missingTxs, CNode* pfrom, std::string blockHash,
 
     if(boost::filesystem::exists(grapheneBlock))
     {
-        logFile("ERROR -- In <" + std::string(__func__) + ">: " + std::to_string(__LINE__) + ": <" + grapheneBlock + "> already exists.. shutting down");
-        StartShutdown();
+        logFile("WARN -- In <" + std::string(__func__) + ">: " + std::to_string(__LINE__) + ": <" + grapheneBlock + "> already exists.. possible duplicate.. skipping");
+        // StartShutdown();
         return;
     }
 
@@ -497,8 +547,8 @@ void dumpMemPool(std::string fileName, std::string from, INVTYPE type, INVEVENT 
 
         if(boost::filesystem::exists(mempoolFile))
         {
-            logFile("ERROR -- In <" + std::string(__func__) + ">: " + std::to_string(__LINE__) + ": <" + mempoolFile + "> already exists.. shutting down");
-            StartShutdown();
+            logFile("WARN -- In <" + std::string(__func__) + ">: " + std::to_string(__LINE__) + ": <" + mempoolFile + "> already exists.. possible duplicate.. skipping");
+            // StartShutdown();
             return;
         }
 

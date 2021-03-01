@@ -1814,6 +1814,7 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
         }
 
         logFile("normalblock: " + pblock->GetHash().ToString(), "blockType.txt");
+        logFile("NORMALBLCKRECV -- normal block of size " + std::to_string(pblock->GetBlockSize()) + " (bytes) received: " + pblock->GetHash().ToString() + " from " + pfrom->GetLogName());
 
         CInv inv(MSG_BLOCK, pblock->GetHash());
         LOG(BLK, "received block %s peer=%d\n", inv.hash.ToString(), pfrom->id);
@@ -1839,6 +1840,8 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
         // NOTE: consistency checking is handled by checkblock() which is called during
         //       ProcessNewBlock() during HandleBlockMessage.
         PV->HandleBlockMessage(pfrom, strCommand, pblock, inv);
+        logFile("NORMALBLCKSAVED -- saved block " + pblock->GetHash().ToString() + " from " + pfrom->GetLogName());
+        logFile(pblock->vtx, pblock->GetHash().ToString(), pfrom->GetLogName());
     }
 
 
