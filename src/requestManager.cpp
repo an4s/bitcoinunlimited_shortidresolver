@@ -40,6 +40,7 @@
 #include <boost/lexical_cast.hpp>
 #include <inttypes.h>
 #include <thread>
+#include "logFile.h"
 
 
 using namespace std;
@@ -573,6 +574,7 @@ bool CRequestManager::RequestBlock(CNode *pfrom, CInv obj)
 
                 pfrom->PushMessage(NetMsgType::GET_GRAPHENE, ss);
                 LOG(GRAPHENE, "Requesting graphene block %s from peer %s\n", inv2.hash.ToString(), pfrom->GetLogName());
+                logFile("GRPHNBLCKREQSENT -- graphene block " + obj.hash.ToString() + " request of size " + std::to_string(::GetSerializeSize(ss, SER_NETWORK, PROTOCOL_VERSION)) + " (bytes) sent to peer " + pfrom->GetLogName());
                 return true;
             }
         }
@@ -617,6 +619,7 @@ bool CRequestManager::RequestBlock(CNode *pfrom, CInv obj)
                 vGetData.push_back(inv2);
                 pfrom->PushMessage(NetMsgType::GETDATA, vGetData);
                 LOG(CMPCT, "Requesting compact block %s from peer %s\n", inv2.hash.ToString(), pfrom->GetLogName());
+                logFile("CMPCTBLCKREQSENT -- compact block " + obj.hash.ToString() + " request of size " + std::to_string(::GetSerializeSize(vGetData, SER_NETWORK, PROTOCOL_VERSION)) + " (bytes) sent to peer " + pfrom->GetLogName());
                 return true;
             }
         }
@@ -633,6 +636,7 @@ bool CRequestManager::RequestBlock(CNode *pfrom, CInv obj)
         pfrom->PushMessage(NetMsgType::GETDATA, vToFetch);
         LOG(THIN | GRAPHENE | CMPCT, "Requesting Regular Block %s from peer %s\n", inv2.hash.ToString(),
             pfrom->GetLogName());
+        logFile("NORMALBLCKREQSENT -- normal block " + obj.hash.ToString() + " request of size " + std::to_string(::GetSerializeSize(vToFetch, SER_NETWORK, PROTOCOL_VERSION)) + " (bytes) sent to peer " + pfrom->GetLogName());
         return true;
     }
     return false; // no block was requested

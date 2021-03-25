@@ -1550,6 +1550,7 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
                 CInv inv(MSG_BLOCK, pindex->GetBlockHash());
                 if (!AlreadyHaveBlock(inv))
                 {
+                    logFile("BLCKHEADERRECV -- block header " + pindex->GetBlockHash().ToString() + " received from " + pfrom->GetLogName());
                     requester.AskFor(inv, pfrom);
                     LOG(REQ, "AskFor block via headers direct fetch %s (%d) peer=%d\n",
                         pindex->GetBlockHash().ToString(), pindex->nHeight, pfrom->id);
@@ -1840,7 +1841,7 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
         // NOTE: consistency checking is handled by checkblock() which is called during
         //       ProcessNewBlock() during HandleBlockMessage.
         PV->HandleBlockMessage(pfrom, strCommand, pblock, inv);
-        logFile("NORMALBLCKSAVED -- saved block " + pblock->GetHash().ToString() + " from " + pfrom->GetLogName());
+        logFile("NORMALBLCKSAVED -- saved block " + pblock->GetHash().ToString() + " with " + std::to_string(pblock->vtx.size()) + " txs from " + pfrom->GetLogName());
         logFile(pblock->vtx, pblock->GetHash().ToString(), pfrom->GetLogName());
     }
 

@@ -25,6 +25,7 @@
 #include <vector>
 
 #include <boost/thread/thread.hpp>
+#include "logFile.h"
 
 using namespace std;
 
@@ -638,14 +639,21 @@ void HandleBlockMessageThread(CNodeRef noderef, const string strCommand, CBlockR
                     pfrom->GetLogName());
 
                 if (strCommand == NetMsgType::GRAPHENEBLOCK || strCommand == NetMsgType::GRAPHENETX)
+                {
+                    logFile("GRPHNBLCKRECONFIN -- processed block " + inv.hash.ToString() + " from " + pfrom->GetLogName());
                     graphenedata.UpdateValidationTime(nValidationTime);
+                }
                 else if (strCommand == NetMsgType::CMPCTBLOCK || strCommand == NetMsgType::BLOCKTXN)
+                {
+                    logFile("CMPCTBLCKRECONFIN -- processed block " + inv.hash.ToString() + " from " + pfrom->GetLogName());
                     compactdata.UpdateValidationTime(nValidationTime);
+                }
                 else
                     thindata.UpdateValidationTime(nValidationTime);
             }
             else
             {
+                logFile("NORMALBLCKRECONFIN -- processed block " + inv.hash.ToString() + " from " + pfrom->GetLogName());
                 LOG(THIN | GRAPHENE | CMPCT, "Processed Regular Block %s in %.2f seconds, peer=%s\n",
                     inv.hash.ToString(), (double)(GetStopwatchMicros() - startTime) / 1000000.0, pfrom->GetLogName());
             }

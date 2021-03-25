@@ -699,6 +699,10 @@ bool CGrapheneBlock::process(CNode *pfrom, std::string strCommand, std::shared_p
         catch (const std::runtime_error &e)
         {
             logFile("GRPHNDECODEFAIL -- graphene decode failed; starting failure recovery: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->GetLogName());
+            if(std::string(e.what()) == "Graphene set IBLT did not decode")
+                logFile("GRPHNBLCKIBLTPEELFAIL -- IBLT peeling failed for block " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->GetLogName());
+            else
+                logFile("GRPHNBLCKIBLTRECONFAIL -- " + std::string(e.what()) + " for block " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->GetLogName());
             fRequestFailureRecovery = true;
             graphenedata.IncrementDecodeFailures();
             if (version >= 6)
