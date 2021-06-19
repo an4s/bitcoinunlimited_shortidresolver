@@ -615,7 +615,7 @@ bool CGrapheneBlock::process(CNode *pfrom, std::string strCommand, std::shared_p
     DbgAssert(pblock->grapheneblock.get() == this, return false);
     std::shared_ptr<CGrapheneBlock> grapheneBlock = pblock->grapheneblock;
 
-    logFile("GRPHNBLCKRECV -- received graphene block " + pblock->grapheneblock->header.GetHash().ToString() + " of size " + std::to_string(pblock->grapheneblock->GetSize()) + " (bytes) from " + pfrom->GetLogName());
+    logFile("GRPHNBLCKRECV -- received graphene block " + pblock->grapheneblock->header.GetHash().ToString() + " of size " + std::to_string(pblock->grapheneblock->GetSize()) + " (bytes) with BFPR = " + std::to_string(pblock->grapheneblock->fpr) + " from " + pfrom->GetLogName());
 
     pblock->nVersion = header.nVersion;
     pblock->nBits = header.nBits;

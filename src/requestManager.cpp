@@ -574,7 +574,7 @@ bool CRequestManager::RequestBlock(CNode *pfrom, CInv obj)
 
                 pfrom->PushMessage(NetMsgType::GET_GRAPHENE, ss);
                 LOG(GRAPHENE, "Requesting graphene block %s from peer %s\n", inv2.hash.ToString(), pfrom->GetLogName());
-                logFile("GRPHNBLCKREQSENT -- graphene block " + obj.hash.ToString() + " request of size " + std::to_string(::GetSerializeSize(ss, SER_NETWORK, PROTOCOL_VERSION)) + " (bytes) sent to peer " + pfrom->GetLogName());
+                logFile("GRPHNBLCKREQSENT -- graphene block " + obj.hash.ToString() + " request of size " + std::to_string(::GetSerializeSize(ss, SER_NETWORK, PROTOCOL_VERSION)) + " (bytes), mempool size " + std::to_string(receiverMemPoolInfo.nTx) + " txs sent to peer " + pfrom->GetLogName());
                 return true;
             }
         }
