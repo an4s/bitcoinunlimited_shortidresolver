@@ -640,7 +640,7 @@ void HandleBlockMessageThread(CNodeRef noderef, const string strCommand, CBlockR
 
                 if (strCommand == NetMsgType::GRAPHENEBLOCK || strCommand == NetMsgType::GRAPHENETX)
                 {
-                    logFile("GRPHNBLCKRECONFIN -- processed block " + inv.hash.ToString() + " from " + pfrom->GetLogName());
+                    logFile("GRPHNBLCKRECONFIN -- processed block " + inv.hash.ToString() + " containing " + std::to_string(pblock->vtx.size()) + " txs from " + pfrom->GetLogName());
                     graphenedata.UpdateValidationTime(nValidationTime);
                 }
                 else if (strCommand == NetMsgType::CMPCTBLOCK || strCommand == NetMsgType::BLOCKTXN)
