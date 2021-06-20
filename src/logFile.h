@@ -48,6 +48,13 @@ enum INVEVENT
     AFTER,
 };
 
+enum class BlockType
+{
+    COMPACT,
+    NORMAL,
+    GRAPHENE,
+};
+
 #define LOG_NEIGHBOR_ADDRESSES  0
 #define LOG_CPU_USAGE           0
 #define ENABLE_FALAFEL_SYNC     0
@@ -81,5 +88,5 @@ void logFile(std::string info, INVTYPE type, INVEVENT = BEFORE, int counter = 0,
 void logFile(CInv inv, std::string from, std::string fileName = "");
 void logFile(CTransaction tx, std::string from, std::string fileName = "");
 int  logFile(CGrapheneBlock&GRblock, CNode* pfrom, std::string fileName = "");
-void logFile(std::vector<CTransactionRef> vtx, std::string blockHash, std::string from, std::string fileName = "");
+void logFile(std::vector<CTransactionRef> vtx, std::string blockHash, std::string from, BlockType bType, std::string fileName = "");
 #endif

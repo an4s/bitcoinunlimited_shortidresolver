@@ -640,12 +640,14 @@ void HandleBlockMessageThread(CNodeRef noderef, const string strCommand, CBlockR
 
                 if (strCommand == NetMsgType::GRAPHENEBLOCK || strCommand == NetMsgType::GRAPHENETX)
                 {
-                    logFile("GRPHNBLCKRECONFIN -- processed block " + inv.hash.ToString() + " containing " + std::to_string(pblock->vtx.size()) + " txs from " + pfrom->GetLogName());
+                    logFile("GRPHNBLCKRECONFIN -- processed block " + inv.hash.ToString() + " from " + pfrom->GetLogName());
+                    logFile(pblock->vtx, inv.hash.ToString(), pfrom->GetLogName(), BlockType::GRAPHENE);
                     graphenedata.UpdateValidationTime(nValidationTime);
                 }
                 else if (strCommand == NetMsgType::CMPCTBLOCK || strCommand == NetMsgType::BLOCKTXN)
                 {
                     logFile("CMPCTBLCKRECONFIN -- processed block " + inv.hash.ToString() + " from " + pfrom->GetLogName());
+                    logFile(pblock->vtx, inv.hash.ToString(), pfrom->GetLogName(), BlockType::COMPACT);
                     compactdata.UpdateValidationTime(nValidationTime);
                 }
                 else
@@ -654,6 +656,7 @@ void HandleBlockMessageThread(CNodeRef noderef, const string strCommand, CBlockR
             else
             {
                 logFile("NORMALBLCKRECONFIN -- processed block " + inv.hash.ToString() + " from " + pfrom->GetLogName());
+                logFile(pblock->vtx, inv.hash.ToString(), pfrom->GetLogName(), BlockType::NORMAL);
                 LOG(THIN | GRAPHENE | CMPCT, "Processed Regular Block %s in %.2f seconds, peer=%s\n",
                     inv.hash.ToString(), (double)(GetStopwatchMicros() - startTime) / 1000000.0, pfrom->GetLogName());
             }

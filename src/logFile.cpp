@@ -27,7 +27,7 @@ static std::string txdir;
 static std::string cmpctblkdir;
 static std::string cmpctReqTxdir;
 static std::string grphnReqTxdir;
-static std::string normalblkTxDir;
+static std::string blockTxDir;
 static std::string mempoolFileDir;
 static std::string addrLoggerdir;
 static std::string cpudir;
@@ -73,7 +73,7 @@ bool initLogger()
     cmpctReqTxdir  = directory  + "/getblocktxn/";
     grphnReqTxdir  = directory  + "/grapheneblockreqtxs/";
     mempoolFileDir = directory  + "/mempool/";
-    normalblkTxDir = directory  + "/normalblocktxs/";
+    blockTxDir     = directory  + "/blocktxs/";
 
     // create directories if they do not exist
 
@@ -113,7 +113,7 @@ bool initLogger()
 
     // - create directory to record transactions in a normal block
     //   if it does not exist
-    if(!createDir(normalblkTxDir))
+    if(!createDir(blockTxDir))
         return false;
 
     return true;
@@ -293,12 +293,23 @@ void logFile(std::vector<uint32_t> req, std::string blockHash, std::string from,
 /*
  * Log transactions in a normal block to file
  */
-void logFile(std::vector<CTransactionRef> vtx, std::string blockHash, std::string from, std::string fileName)
+void logFile(std::vector<CTransactionRef> vtx, std::string blockHash, std::string from, BlockType bType, std::string fileName)
 {
     std::string timeString = createTimeStamp();
     if(fileName == "") fileName = directory + "logNode_" + nodeID + ".txt";
     else fileName = directory + fileName;
-    std::string txFile = normalblkTxDir + blockHash;
+
+    std::string op = bType == BlockType::COMPACT ? "CMPCT" : bType == BlockType::GRAPHENE ? "GRPHN" : "NORMAL";
+    std::string txDir = blockTxDir + op;
+
+    if(!createDir(txDir))
+    {
+        logFile("ERROR -- couldn't create directory <" + txDir + ">...");
+        StartShutdown();
+        return;
+    }
+
+    std::string txFile = txDir + blockHash;
 
     if(!createDir(txFile))
     {
@@ -322,7 +333,7 @@ void logFile(std::vector<CTransactionRef> vtx, std::string blockHash, std::strin
     fnOut.open(fileName, std::ofstream::app);
     fnTx.open(txFile, std::ofstream::out);
 
-    fnOut << timeString << "NORMALBLCKTXS -- txs of block: " << blockHash << " saved to file <" << txFile << ">" << std::endl;
+    fnOut << timeString << op << "BLCKTXS -- " << vtx.size() << " txs of block: " << blockHash << " saved to file <" << txFile << ">" << std::endl;
     for(CTransactionRef tx : vtx)
         fnTx << tx->GetHash().ToString() << std::endl;
 

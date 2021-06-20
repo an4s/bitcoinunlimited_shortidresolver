@@ -1842,7 +1842,6 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
         //       ProcessNewBlock() during HandleBlockMessage.
         PV->HandleBlockMessage(pfrom, strCommand, pblock, inv);
         logFile("NORMALBLCKSAVED -- saved block " + pblock->GetHash().ToString() + " with " + std::to_string(pblock->vtx.size()) + " txs from " + pfrom->GetLogName());
-        logFile(pblock->vtx, pblock->GetHash().ToString(), pfrom->GetLogName());
     }
 
 
