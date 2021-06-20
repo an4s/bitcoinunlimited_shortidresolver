@@ -353,7 +353,7 @@ bool CompactBlock::process(CNode *pfrom, std::shared_ptr<CBlockThinRelay> pblock
     // a full block if a mismatch occurs.
     if (!fMerkleRootCorrect)
     {
-        logFile("CMPCTBLCKINVALICMRKLRT -- invalid merkle root: " + pblock->cmpctblock->header.GetHash().ToString() + " from " + pfrom->GetLogName());
+        logFile("CMPCTBLCKINVALIDMRKLRT -- invalid merkle root: " + pblock->cmpctblock->header.GetHash().ToString() + " from " + pfrom->GetLogName());
 
         thinrelay.ClearAllBlockData(pfrom, header.GetHash());
         thinrelay.RequestBlock(pfrom, header.GetHash());

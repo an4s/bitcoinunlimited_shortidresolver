@@ -639,6 +639,8 @@ bool CGrapheneBlock::process(CNode *pfrom, std::string strCommand, std::shared_p
     {
         FillTxMapFromPools(mapPartialTxHash);
 
+        logFile("GRPHNBLCKNUMADDTX -- block: " + pblock->grapheneblock->header.GetHash().ToString() + ", additional txs: " + std::to_string(vAdditionalTxs.size()) + ", from " + pfrom->GetLogName());
+
         // Add full transactions included in the block
         CTransactionRef coinbase = nullptr;
         for (auto &tx : vAdditionalTxs)
@@ -764,6 +766,9 @@ bool CGrapheneBlock::process(CNode *pfrom, std::string strCommand, std::shared_p
         return error(
             "Mismatched merkle root on grapheneblock: requesting failover block, peer=%s", pfrom->GetLogName());
     }
+
+    // logFile("GRPHNBLCKTXCOUNT -- block " + pblock->grapheneblock->header.GetHash().ToString() + ", " + std::to_string(pblock->vtx.size()) + ", from " + pfrom->GetLogName());
+    logFile(pblock->vtx, pblock->grapheneblock->header.GetHash().ToString(), pfrom->GetLogName(), BlockType::GRAPHENE);
 
     this->nWaitingFor = setHashesToRequest.size();
     // logFile("GRPHNBLCKMTX -- missing txs: " + std::to_string(setHashesToRequest.size()) + ", block: " + pblock->grapheneblock->header.GetHash().ToString());
@@ -1587,6 +1592,9 @@ bool HandleGrapheneBlockRecoveryResponse(CDataStream &vRecv, CNode *pfrom, const
     std::set<uint64_t> setHashesToRequest = pblock->grapheneblock->UpdateResolvedTxsAndIdentifyMissing(
         mapTxFromPools, blockCheapHashes, NegotiateGrapheneVersion(pfrom));
     pblock->grapheneblock->SituateCoinbase(coinbase);
+
+    // logFile("GRPHNBLCKTXCOUNT -- block " + pblock->grapheneblock->header.GetHash().ToString() + ", " + std::to_string(pblock->vtx.size()) + ", from " + pfrom->GetLogName());
+    logFile(pblock->vtx, pblock->grapheneblock->header.GetHash().ToString(), pfrom->GetLogName(), BlockType::GRAPHENE);
 
     // If there are missing transactions, we must request them here
     if (setHashesToRequest.size() > 0)

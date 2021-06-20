@@ -300,7 +300,7 @@ void logFile(std::vector<CTransactionRef> vtx, std::string blockHash, std::strin
     else fileName = directory + fileName;
 
     std::string op = bType == BlockType::COMPACT ? "CMPCT" : bType == BlockType::GRAPHENE ? "GRPHN" : "NORMAL";
-    std::string txDir = blockTxDir + op;
+    std::string txDir = blockTxDir + "/" + op;
 
     if(!createDir(txDir))
     {
