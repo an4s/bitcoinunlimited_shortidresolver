@@ -641,8 +641,13 @@ void HandleBlockMessageThread(CNodeRef noderef, const string strCommand, CBlockR
                 if (strCommand == NetMsgType::GRAPHENEBLOCK || strCommand == NetMsgType::GRAPHENETX)
                 {
                     logFile("GRPHNBLCKRECONFIN -- processed block " + inv.hash.ToString() + " from " + pfrom->GetLogName());
-                    // logFile(pblock->vtx, inv.hash.ToString(), pfrom->GetLogName(), BlockType::GRAPHENE);
+                    logFile(pblock->vtx, inv.hash.ToString(), pfrom->GetLogName(), BlockType::GRAPHENE);
                     graphenedata.UpdateValidationTime(nValidationTime);
+                }
+                else if (strCommand == NetMsgType::GRAPHENE_RECOVERY)
+                {
+                    logFile("GRPHNBLCKFAILRECRECONFIN -- processed block " + inv.hash.ToString() + " from " + pfrom->GetLogName());
+                    logFile(pblock->vtx, inv.hash.ToString(), pfrom->GetLogName(), BlockType::GRAPHENE);
                 }
                 else if (strCommand == NetMsgType::CMPCTBLOCK || strCommand == NetMsgType::BLOCKTXN)
                 {

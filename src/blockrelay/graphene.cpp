@@ -767,8 +767,9 @@ bool CGrapheneBlock::process(CNode *pfrom, std::string strCommand, std::shared_p
             "Mismatched merkle root on grapheneblock: requesting failover block, peer=%s", pfrom->GetLogName());
     }
 
+    // TODO
     // logFile("GRPHNBLCKTXCOUNT -- block " + pblock->grapheneblock->header.GetHash().ToString() + ", " + std::to_string(pblock->vtx.size()) + ", from " + pfrom->GetLogName());
-    logFile(pblock->vtx, pblock->grapheneblock->header.GetHash().ToString(), pfrom->GetLogName(), BlockType::GRAPHENE);
+    // logFile(pblock->vtx, pblock->grapheneblock->header.GetHash().ToString(), pfrom->GetLogName(), BlockType::GRAPHENE);
 
     this->nWaitingFor = setHashesToRequest.size();
     // logFile("GRPHNBLCKMTX -- missing txs: " + std::to_string(setHashesToRequest.size()) + ", block: " + pblock->grapheneblock->header.GetHash().ToString());
@@ -1541,6 +1542,8 @@ bool HandleGrapheneBlockRecoveryResponse(CDataStream &vRecv, CNode *pfrom, const
         return false;
     }
 
+    logFile("GRPHNBLCKRECRESADDTXS -- block: " + pblock->grapheneblock->header.GetHash().ToString() + ", additional txs: " + std::to_string(recoveryResponse.vMissingTxs.size()) + " from " + pfrom->GetLogName());
+
     // Insert latest transactions just sent over
     for (auto &tx : recoveryResponse.vMissingTxs)
     {
@@ -1593,8 +1596,9 @@ bool HandleGrapheneBlockRecoveryResponse(CDataStream &vRecv, CNode *pfrom, const
         mapTxFromPools, blockCheapHashes, NegotiateGrapheneVersion(pfrom));
     pblock->grapheneblock->SituateCoinbase(coinbase);
 
+    // TODO
     // logFile("GRPHNBLCKTXCOUNT -- block " + pblock->grapheneblock->header.GetHash().ToString() + ", " + std::to_string(pblock->vtx.size()) + ", from " + pfrom->GetLogName());
-    logFile(pblock->vtx, pblock->grapheneblock->header.GetHash().ToString(), pfrom->GetLogName(), BlockType::GRAPHENE);
+    // logFile(pblock->vtx, pblock->grapheneblock->header.GetHash().ToString(), pfrom->GetLogName(), BlockType::GRAPHENE);
 
     // If there are missing transactions, we must request them here
     if (setHashesToRequest.size() > 0)

@@ -309,7 +309,7 @@ void logFile(std::vector<CTransactionRef> vtx, std::string blockHash, std::strin
         return;
     }
 
-    std::string txFile = txDir + blockHash;
+    std::string txFile = txDir + "/" + blockHash;
 
     if(!createDir(txFile))
     {
