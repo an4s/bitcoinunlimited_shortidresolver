@@ -71,7 +71,7 @@ bool initLogger()
     txdir          = directory  + "/txs/";
     cmpctblkdir    = directory  + "/cmpctblk/";
     cmpctReqTxdir  = directory  + "/getblocktxn/";
-    grphnReqTxdir  = directory  + "/grapheneblocktxs/";
+    grphnReqTxdir  = directory  + "/grapheneblockreqtxs/";
     mempoolFileDir = directory  + "/mempool/";
     normalblkTxDir = directory  + "/normalblocktxs/";
 

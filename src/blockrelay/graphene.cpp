@@ -615,7 +615,7 @@ bool CGrapheneBlock::process(CNode *pfrom, std::string strCommand, std::shared_p
     DbgAssert(pblock->grapheneblock.get() == this, return false);
     std::shared_ptr<CGrapheneBlock> grapheneBlock = pblock->grapheneblock;
 
-    logFile("GRPHNBLCKRECV -- received graphene block " + pblock->grapheneblock->header.GetHash().ToString() + " of size " + std::to_string(pblock->grapheneblock->GetSize()) + " (bytes), BFPR = " + std::to_string(pblock->grapheneblock->fpr) + ", a = " + std::to_string(pblock->grapheneblock->pGrapheneSet->GetIblt()->GetHashTableSize()) + " from " + pfrom->GetLogName());
+    logFile("GRPHNBLCKRECV -- received graphene block " + pblock->grapheneblock->header.GetHash().ToString() + " of size " + std::to_string(pblock->grapheneblock->GetSize()) + " (bytes), containing " + std::to_string(pblock->vtx.size()) + "txs, BFPR = " + std::to_string(pblock->grapheneblock->fpr) + ", a = " + std::to_string(pblock->grapheneblock->pGrapheneSet->GetIblt()->GetHashTableSize()) + " from " + pfrom->GetLogName());
 
     pblock->nVersion = header.nVersion;
     pblock->nBits = header.nBits;
@@ -1508,7 +1508,7 @@ bool HandleGrapheneBlockRecoveryResponse(CDataStream &vRecv, CNode *pfrom, const
     DbgAssert(pblock->grapheneblock != nullptr, return false);
     CGrapheneBlock grapheneBlock = *(pblock->grapheneblock);
 
-    logFile("GRPHNBLCKFAILRECRES -- attempting graphene block failure recovery upon response: " + pblock->grapheneblock->header.GetHash().ToString() + "; size: " + std::to_string(::GetSerializeSize(recoveryResponse, SER_NETWORK, PROTOCOL_VERSION)) + " (bytes); from " + pfrom->GetLogName());
+    logFile("GRPHNBLCKFAILRECRES -- attempting graphene block failure recovery upon response: " + pblock->grapheneblock->header.GetHash().ToString() + "; size: " + std::to_string(::GetSerializeSize(recoveryResponse, SER_NETWORK, PROTOCOL_VERSION)) + " (bytes); fpr = " + std::to_string(grapheneBlock.fpr) + "; a =" + std::to_string(grapheneBlock.pGrapheneSet->GetIblt()->GetHashTableSize())  + " from " + pfrom->GetLogName());
 
     CIblt localIblt((*recoveryResponse.pRevisedIblt));
     localIblt.reset();
