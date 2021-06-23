@@ -293,6 +293,7 @@ bool CGrapheneBlockTx::HandleMessage(CDataStream &vRecv, CNode *pfrom)
     grapheneBlock->AddNewTransactions(grapheneBlockTx.vMissingTx, pfrom);
 
     logFile("GRPHNBLCKMTXFOUND -- found missing txs for block: " + pblock->grapheneblock->header.GetHash().ToString() + " from " + pfrom->GetLogName());
+    logFile(grapheneBlockTx.vMissingTx, pblock->grapheneblock->header.GetHash().ToString(), pfrom->GetLogName());
     LOG(GRAPHENE, "Got %d Re-requested txs from peer=%s\n", grapheneBlockTx.vMissingTx.size(), pfrom->GetLogName());
 
     std::map<uint64_t, CTransactionRef> mapPartialTxHash;
@@ -1542,7 +1543,7 @@ bool HandleGrapheneBlockRecoveryResponse(CDataStream &vRecv, CNode *pfrom, const
         return false;
     }
 
-    logFile("GRPHNBLCKRECRESADDTXS -- block: " + pblock->grapheneblock->header.GetHash().ToString() + ", additional txs: " + std::to_string(recoveryResponse.vMissingTxs.size()) + " from " + pfrom->GetLogName());
+    logFile("GRPHNBLCKFAILRECRESNUMADDTX -- block: " + pblock->grapheneblock->header.GetHash().ToString() + ", additional txs: " + std::to_string(recoveryResponse.vMissingTxs.size()) + ", from " + pfrom->GetLogName());
 
     // Insert latest transactions just sent over
     for (auto &tx : recoveryResponse.vMissingTxs)

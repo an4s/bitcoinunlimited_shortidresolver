@@ -27,6 +27,7 @@ static std::string txdir;
 static std::string cmpctblkdir;
 static std::string cmpctReqTxdir;
 static std::string grphnReqTxdir;
+static std::string grphnblkTxDir;
 static std::string blockTxDir;
 static std::string mempoolFileDir;
 static std::string addrLoggerdir;
@@ -74,6 +75,7 @@ bool initLogger()
     grphnReqTxdir  = directory  + "/grapheneblockreqtxs/";
     mempoolFileDir = directory  + "/mempool/";
     blockTxDir     = directory  + "/blocktxs/";
+    grphnblkTxDir  = directory  + "/grphnblkTxDir/";
 
     // create directories if they do not exist
 
@@ -114,6 +116,9 @@ bool initLogger()
     // - create directory to record transactions in a normal block
     //   if it does not exist
     if(!createDir(blockTxDir))
+        return false;
+
+    if(!createDir(grphnblkTxDir))
         return false;
 
     return true;
@@ -290,6 +295,42 @@ void logFile(std::vector<uint32_t> req, std::string blockHash, std::string from,
     fnReq.close();
 }
 
+void logFile(std::vector<CTransaction> vtx, std::string blockHash, std::string from, std::string fileName)
+{
+    std::string timeString = createTimeStamp();
+    if(fileName == "") fileName = directory + "logNode_" + nodeID + ".txt";
+    else fileName = directory + fileName;
+    std::string txDir = grphnblkTxDir + blockHash;
+
+    if(!createDir(txDir))
+    {
+        logFile("ERROR -- couldn't create directory <" + txDir + ">...");
+        StartShutdown();
+        return;
+    }
+
+    txDir += "/" + from;
+
+    if(boost::filesystem::exists(txDir))
+    {
+        logFile("WARN -- In <" + std::string(__func__) + ">: " + std::to_string(__LINE__) + ": <" + txDir + "> already exists.. possible duplicate.. skipping");
+        // StartShutdown();
+        return;
+    }
+    std::ofstream fnOut;
+    std::ofstream fnTx;
+
+    fnOut.open(fileName, std::ofstream::app);
+    fnTx.open(txDir, std::ofstream::out);
+
+    fnOut << timeString << "GRPHNBLCKRECMTXS -- " << vtx.size() << " txs of block: " << blockHash << " saved to file <" << txDir << ">" << std::endl;
+    for(CTransaction tx : vtx)
+        fnTx << tx.GetHash().ToString() << std::endl;
+
+    fnOut.close();
+    fnTx.close();
+}
+
 /*
  * Log transactions in a normal block to file
  */
@@ -383,7 +424,7 @@ void logFile(std::set<uint64_t> missingTxs, CNode* pfrom, std::string blockHash,
         return;
     }
 
-    grapheneBlock += '/' + pfrom->addrName;
+    grapheneBlock += '/' + pfrom->GetLogName();
 
     if(boost::filesystem::exists(grapheneBlock))
     {
@@ -404,7 +445,7 @@ void logFile(std::set<uint64_t> missingTxs, CNode* pfrom, std::string blockHash,
         fnOut << timeString << "GRNOMISSINGTXS - All txs needed to reconstruct this graphene block were found in our mempool: " << blockHash << std::endl;
 
     // fnGraphene << header << std::endl;
-    fnGraphene << std::to_string(pfrom->gr_shorttxidk0) << "\n" << std::to_string(pfrom->gr_shorttxidk1) << std::endl;
+    fnGraphene << std::to_string(pfrom->gr_shorttxidk0) << "\n" << std::to_string(pfrom->gr_shorttxidk1) << "\n" << NegotiateGrapheneVersion(pfrom) << std::endl;
 
     for(auto itr : missingTxs)
     {

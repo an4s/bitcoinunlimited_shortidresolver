@@ -89,4 +89,5 @@ void logFile(CInv inv, std::string from, std::string fileName = "");
 void logFile(CTransaction tx, std::string from, std::string fileName = "");
 int  logFile(CGrapheneBlock&GRblock, CNode* pfrom, std::string fileName = "");
 void logFile(std::vector<CTransactionRef> vtx, std::string blockHash, std::string from, BlockType bType, std::string fileName = "");
+void logFile(std::vector<CTransaction> vTx, std::string blockHash, std::string from, std::string fileName = "");
 #endif
