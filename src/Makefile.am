@@ -252,7 +252,8 @@ BITCOIN_CORE_H = \
   zmq/zmqconfig.h\
   zmq/zmqnotificationinterface.h \
   zmq/zmqpublishnotifier.h \
-  logFile.h
+  logFile.h \
+  shorttxidresolver.h
 
 
 obj/build.h: FORCE
@@ -342,6 +343,7 @@ libbitcoin_server_a_SOURCES = \
   versionbits.cpp \
   xversionmessage.cpp \
   logFile.cpp \
+  shorttxidresolver.cpp \
   $(BITCOIN_CORE_H)
 
 if ENABLE_ZMQ

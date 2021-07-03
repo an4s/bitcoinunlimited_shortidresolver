@@ -57,6 +57,7 @@
 #include "validation/verifydb.h"
 #include "validationinterface.h"
 #include "logFile.h"
+#include "shorttxidresolver.h"
 
 #ifdef ENABLE_WALLET
 #include "wallet/db.h"
@@ -1743,6 +1744,20 @@ bool AppInit2(Config &config)
 
 #endif
 
+    if(initResolveShortTxIDsThread(GetArg("-shorttxidsdir", GetDataDir().string())))
+    {
+        LOGA(">> short tx ids resolver initialized\n");
+        logFile("INITGTHSHSTHRD -- short tx ids resolver initialized");
+        threadGroup.create_thread(boost::bind(ResolveShortTxIDsThread));
+        LOGA(">> short tx ids resolver thread created\n");
+        logFile("INITGETHASHESTHRD -- short tx ids resolver thread successfully created");
+    }
+    else
+    {
+        LOGA(">> ERROR : initResolveShortTxIDsThread failed\n");
+        logFile("INITGETHASHESTHRD -- short tx ids resolver thread not created; shutting down");
+        StartShutdown();
+    }
 
     StartNode();
 

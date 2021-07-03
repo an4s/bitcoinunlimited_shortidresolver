@@ -256,7 +256,8 @@ static void addConfigurationLocationOptions(AllowedArgs &allowedArgs)
             "conf=<file>", requiredStr, strprintf(_("Specify configuration file (default: %s)"), BITCOIN_CONF_FILENAME))
         .addArg(
             "forks=<file>", requiredStr, strprintf(_("Specify fork deployment file (default: %s)"), FORKS_CSV_FILENAME))
-        .addArg("datadir=<dir>", requiredStr, _("Specify data directory"));
+        .addArg("datadir=<dir>", requiredStr, _("Specify data directory"))
+        .addArg("shorttxidsdir=<dir>", requiredStr, _("Specify short hash directory"));
 }
 
 static void addGeneralOptions(AllowedArgs &allowedArgs, HelpMessageMode mode)
