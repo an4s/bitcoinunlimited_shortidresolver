@@ -1,3 +1,8 @@
+# What is this repo?
+A modified version of the Bitcoin Unlimited software that resolves short tx ids to full transaction hashes. The files (similar in structure to [this](https://github.com/an4s/BU-Python-GetShortTxID/tree/master/test_data/blockshorttxids) directory) can be placed in the data directory or the path to the directory containing files can be provided as the `-shorttxidsdir` argument to `bitcoind` or `bitcoin-qt`.
+
+---
+
 [Website](https://www.bitcoinunlimited.info)  | [Download](https://www.bitcoinunlimited.info/download) | [Setup](README.md)   |   [Miner](doc/miner.md)  |  [ElectronCash](doc/bu-electrum-integration.md)  |  [UnconfirmedChains](doc/unconfirmedTxChainLimits.md)
 
 [![Build Status](https://gitlab.com/bitcoinunlimited/BCHUnlimited/badges/dev/pipeline.svg?key_text=Build%20Status%20%28dev%29&key_width=110)](https://gitlab.com/bitcoinunlimited/BCHUnlimited/-/pipelines)
